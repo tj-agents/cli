@@ -101,7 +101,15 @@ install_binary() {
 check_deps() {
     [ "$mode" = "uninstall" ] && return
     if command -v fzf >/dev/null 2>&1; then
-        say ok "fzf $(fzf --version | cut -d' ' -f1)"
+        local v
+        v="$(fzf --version | cut -d' ' -f1)"
+        # cr's preview pane needs --preview-wrap-sign, added in fzf 0.54.
+        if [ "$(printf '%s\n0.54\n' "$v" | sort -V | head -1)" != "0.54" ]; then
+            say warning "fzf $v is older than 0.54 - cr needs a newer one (https://github.com/junegunn/fzf/releases)"
+            status=1
+        else
+            say ok "fzf $v"
+        fi
     else
         say missing "fzf - install it with your package manager (Arch: pacman -S fzf, Debian/Ubuntu: apt install fzf)"
         status=1

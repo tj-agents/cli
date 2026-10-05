@@ -10,7 +10,7 @@ with two everyday commands:
 
 ## Install
 
-You need [fzf](https://github.com/junegunn/fzf) and either a Rust toolchain (to build) or the
+You need [fzf](https://github.com/junegunn/fzf) 0.54 or newer and either a Rust toolchain (to build) or the
 [GitHub CLI](https://cli.github.com) (to download a prebuilt release).
 
 **Linux**
