@@ -1,0 +1,61 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      - run: cargo test --locked
+
+      # The installer must succeed, and a second run must find nothing left to change.
+      - name: install twice (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          sudo apt-get install -y fzf
+          export HOME="$RUNNER_TEMP/home" TJ_BIN_DIR="$RUNNER_TEMP/home/bin"
+          mkdir -p "$HOME" && export PATH="$TJ_BIN_DIR:$PATH"
+          linux/install.sh
+          linux/install.sh | tee second.log
+          ! grep -E '^(installed|updated|removed) ' second.log
+          linux/install.sh --check
+          bash -ic 'type f && type cr'
+          linux/install.sh --uninstall
+          ! linux/install.sh --check
+      - name: install twice (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          choco install fzf -y --no-progress
+          $bin = Join-Path $env:RUNNER_TEMP 'tjbin'
+          windows/install.ps1 -BinDir $bin
+          if ($LASTEXITCODE) { exit 1 }
+          $second = windows/install.ps1 -BinDir $bin
+          $second
+          if ($second -match '^(installed|updated|removed) ') { throw 'second install changed something' }
+          windows/install.ps1 -BinDir $bin -Check
+          if ($LASTEXITCODE) { exit 1 }
+          pwsh -Command "`$env:Path += ';$bin'; . `$PROFILE.CurrentUserAllHosts; Get-Command f, cr -ErrorAction Stop"
+          windows/install.ps1 -BinDir $bin -Uninstall
+          windows/install.ps1 -BinDir $bin -Check
+          if (-not $LASTEXITCODE) { throw '--check passed after uninstall' }
+          exit 0

@@ -1,0 +1,32 @@
+[package]
+name = "tj-cli"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Fast cross-platform shell tools for agentic programming: cr (resume Claude/Codex sessions) and f (fuzzy cd)."
+repository = "https://github.com/tj-agents/cli"
+publish = false
+
+[[bin]]
+name = "tj"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+clap = { version = "4", features = ["derive"] }
+dirs = "6"
+rayon = "1"
+regex = "1"
+serde_json = "1"
+terminal_size = "0.4"
+walkdir = "2"
+which = "8"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

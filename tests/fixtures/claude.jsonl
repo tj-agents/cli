@@ -1,0 +1,9 @@
+{"type":"system","subtype":"init","cwd":"/work/repo","gitBranch":"main","sessionId":"s1"}
+{"type":"user","isMeta":true,"message":{"role":"user","content":"injected context"},"cwd":"/work/repo"}
+{"type":"user","message":{"role":"user","content":"<command-name>/clear</command-name>"}}
+{"type":"user","message":{"role":"user","content":"fix the AB#12345 login bug"}}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"thinking","thinking":"hmm"},{"type":"text","text":"The login handler\nlooks wrong."}]}}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Read","input":{"file_path":"/work/repo/src/login.rs"}}]}}
+{"type":"user","message":{"role":"user","content":[{"tool_use_id":"t1","type":"tool_result","content":"secret file body"}]}}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Done."}]}}
+not json, a torn final line

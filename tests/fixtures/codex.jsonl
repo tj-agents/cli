@@ -1,0 +1,7 @@
+{"timestamp":"2026-10-01T10:00:00Z","type":"session_meta","payload":{"session_id":"abc-123","cwd":"/work/repo","source":"cli"}}
+{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"# AGENTS.md instructions for /work\n<INSTRUCTIONS>be nice</INSTRUCTIONS>"}]}}
+{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"why is the build red"}]}}
+{"type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"cargo test\"}","call_id":"c1"}}
+{"type":"response_item","payload":{"type":"function_call_output","call_id":"c1","output":"running 3 tests\ntest result: FAILED"}}
+{"type":"event_msg","payload":{"type":"token_count"}}
+{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"One test fails."}]}}
