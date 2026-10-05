@@ -31,7 +31,10 @@ jobs:
         if: runner.os == 'Linux'
         shell: bash
         run: |
-          sudo apt-get install -y fzf
+          # Ubuntu's packaged fzf is too old for cr; take the upstream release.
+          curl -fsSL https://github.com/junegunn/fzf/releases/download/v0.73.1/fzf-0.73.1-linux_amd64.tar.gz | sudo tar -xz -C /usr/local/bin fzf
+          # The sandbox HOME below would hide rustup's toolchains, so pin them first.
+          export RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}" CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
           export HOME="$RUNNER_TEMP/home" TJ_BIN_DIR="$RUNNER_TEMP/home/bin"
           mkdir -p "$HOME" && export PATH="$TJ_BIN_DIR:$PATH"
           linux/install.sh
