@@ -15,6 +15,9 @@ $ErrorActionPreference = 'Stop'
 if ($IsLinux -or $IsMacOS) { throw 'install.ps1 is for Windows - use ./install.sh on Linux and macOS' }
 $repo = Split-Path -Parent $PSScriptRoot
 $target = Join-Path $BinDir 'tj.exe'
+$watcher = Join-Path $BinDir 'tj-watch.exe'
+$profileScript = Join-Path $BinDir 'tj.ps1'
+$startupShortcut = Join-Path ([Environment]::GetFolderPath('Startup')) 'tj-watch.lnk'
 $begin = '# >>> tj-agents/cli >>>'
 $end = '# <<< tj-agents/cli <<<'
 $script:status = 0
@@ -38,22 +41,27 @@ function Set-Block([string]$File, [string]$Body) {
     Say updated $File
 }
 
-function Install-Binary {
+function Install-Binaries {
     if ($Uninstall) {
         if (Test-Path -LiteralPath $target) { Remove-Item -LiteralPath $target -Force; Say removed $target }
         else { Say ok "$target (not installed)" }
+        if (Test-Path -LiteralPath $watcher) { Remove-Item -LiteralPath $watcher -Force; Say removed $watcher }
+        else { Say ok "$watcher (not installed)" }
         return
     }
     if ($Check) {
         if (Test-Path -LiteralPath $target) { Say ok "$target ($(& $target --version))" }
         else { Say missing $target; $script:status = 1 }
+        if (Test-Path -LiteralPath $watcher) { Say ok $watcher }
+        else { Say missing $watcher; $script:status = 1 }
         return
     }
 
     if (Get-Command cargo -ErrorAction SilentlyContinue) {
-        & cargo build --release --locked --quiet --manifest-path (Join-Path $repo 'Cargo.toml')
+        & cargo build --release --locked --quiet --manifest-path (Join-Path $repo 'Cargo.toml') --bin tj --bin tj-watch
         if ($LASTEXITCODE -ne 0) { throw 'cargo build failed' }
         $built = Join-Path $repo 'target\release\tj.exe'
+        $builtWatcher = Join-Path $repo 'target\release\tj-watch.exe'
     }
     elseif (Get-Command gh -ErrorAction SilentlyContinue) {
         $tmp = Join-Path ([IO.Path]::GetTempPath()) ('tj-' + [guid]::NewGuid().ToString('N'))
@@ -62,15 +70,62 @@ function Install-Binary {
         if ($LASTEXITCODE -ne 0) { throw 'gh release download failed' }
         Expand-Archive -LiteralPath (Join-Path $tmp 'tj-x86_64-pc-windows-msvc.zip') -DestinationPath $tmp -Force
         $built = Join-Path $tmp 'tj.exe'
+        $builtWatcher = Join-Path $tmp 'tj-watch.exe'
     }
     else { throw 'install needs either cargo (to build) or gh (to download a release)' }
 
-    $same = (Test-Path -LiteralPath $target) -and
-        ((Get-FileHash -LiteralPath $built).Hash -eq (Get-FileHash -LiteralPath $target).Hash)
-    if ($same) { Say ok $target; return }
     if (-not (Test-Path -LiteralPath $BinDir)) { [void](New-Item -ItemType Directory -Path $BinDir -Force) }
-    Copy-Item -LiteralPath $built -Destination $target -Force
-    Say installed "$target ($(& $target --version))"
+    foreach ($binary in @(@($built, $target), @($builtWatcher, $watcher))) {
+        $same = (Test-Path -LiteralPath $binary[1]) -and
+            ((Get-FileHash -LiteralPath $binary[0]).Hash -eq (Get-FileHash -LiteralPath $binary[1]).Hash)
+        if ($same) { Say ok $binary[1]; continue }
+        Copy-Item -LiteralPath $binary[0] -Destination $binary[1] -Force
+        Say installed $binary[1]
+    }
+}
+
+function Install-ProfileScript {
+    if ($Uninstall) {
+        if (Test-Path -LiteralPath $profileScript) { Remove-Item -LiteralPath $profileScript -Force; Say removed $profileScript }
+        else { Say ok "$profileScript (not installed)" }
+        return
+    }
+    if ($Check) {
+        if (Test-Path -LiteralPath $profileScript) { Say ok $profileScript }
+        else { Say missing $profileScript; $script:status = 1 }
+        return
+    }
+    $source = Join-Path $repo 'windows\tj.ps1'
+    $same = (Test-Path -LiteralPath $profileScript) -and
+        ((Get-FileHash -LiteralPath $source).Hash -eq (Get-FileHash -LiteralPath $profileScript).Hash)
+    if ($same) { Say ok $profileScript; return }
+    if (-not (Test-Path -LiteralPath $BinDir)) { [void](New-Item -ItemType Directory -Path $BinDir -Force) }
+    Copy-Item -LiteralPath $source -Destination $profileScript -Force
+    Say installed $profileScript
+}
+
+function Set-WatcherStartup {
+    if ($Uninstall) {
+        if (Test-Path -LiteralPath $startupShortcut) { Remove-Item -LiteralPath $startupShortcut -Force; Say removed $startupShortcut }
+        else { Say ok "$startupShortcut (not installed)" }
+        return
+    }
+    $valid = $false
+    if (Test-Path -LiteralPath $startupShortcut) {
+        $shell = New-Object -ComObject WScript.Shell
+        $valid = $shell.CreateShortcut($startupShortcut).TargetPath -eq $watcher
+    }
+    if ($valid) { Say ok $startupShortcut; return }
+    if ($Check) { Say missing $startupShortcut; $script:status = 1; return }
+    if (-not (Test-Path -LiteralPath (Split-Path -Parent $startupShortcut))) {
+        [void](New-Item -ItemType Directory -Path (Split-Path -Parent $startupShortcut) -Force)
+    }
+    $shell = New-Object -ComObject WScript.Shell
+    $shortcut = $shell.CreateShortcut($startupShortcut)
+    $shortcut.TargetPath = $watcher
+    $shortcut.WorkingDirectory = $BinDir
+    $shortcut.Save()
+    Say installed $startupShortcut
 }
 
 # The user PATH lives in the registry; this process's PATH is updated too so the rest of the script
@@ -103,7 +158,8 @@ function Test-Fzf {
     else { Say missing 'fzf - install it with: winget install junegunn.fzf'; $script:status = 1 }
 }
 
-Install-Binary
+Install-Binaries
+Install-ProfileScript
 if ($IsWindows -or $PSVersionTable.PSEdition -eq 'Desktop') { Set-UserPath }
 Test-Fzf
 
@@ -113,8 +169,10 @@ $profiles = @(Join-Path $documents 'PowerShell\profile.ps1')
 if ($PSVersionTable.PSEdition -eq 'Desktop' -or (Test-Path (Join-Path $documents 'WindowsPowerShell'))) {
     $profiles += Join-Path $documents 'WindowsPowerShell\profile.ps1'
 }
-$line = 'if (Get-Command tj -ErrorAction SilentlyContinue) { Invoke-Expression (& tj init pwsh | Out-String) }'
+$quotedProfileScript = $profileScript.Replace("'", "''")
+$line = "if (Test-Path -LiteralPath '$quotedProfileScript') { . '$quotedProfileScript' }"
 foreach ($p in $profiles) { Set-Block $p $line }
+Set-WatcherStartup
 
 if (-not $Check -and -not $Uninstall) { ''; 'Done. Open a new terminal and try: f, cr' }
 exit $script:status

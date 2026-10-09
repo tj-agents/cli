@@ -27,6 +27,10 @@ pub fn cache_dir() -> Result<PathBuf> {
     Ok(dirs::cache_dir().context("cannot determine the cache directory")?.join("tj"))
 }
 
+pub fn state_dir() -> Result<PathBuf> {
+    Ok(dirs::state_dir().or_else(dirs::data_local_dir).context("cannot determine the state directory")?.join("tj"))
+}
+
 /// A path as a comparable string: forward slashes, no trailing slash, and case-folded on Windows
 /// where the filesystem is case-insensitive. Git, the shell and transcripts disagree on all three.
 pub fn norm(path: &str) -> String {
