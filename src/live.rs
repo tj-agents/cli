@@ -41,6 +41,7 @@ pub enum LiveError {
         #[source]
         source: anyhow::Error,
     },
+    #[cfg(windows)]
     #[error("cannot inspect process {pid}")]
     Process {
         pid: u32,
