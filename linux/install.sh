@@ -10,6 +10,9 @@ set -euo pipefail
 repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 bin_dir="${TJ_BIN_DIR:-$HOME/.local/bin}"
 target="$bin_dir/tj"
+watcher="$bin_dir/tj-watch"
+unit_file="$HOME/.config/systemd/user/tj-watch.service"
+desktop_file="$HOME/.config/autostart/tj-watch.desktop"
 mode="install"
 case "${1:-}" in
     --check) mode="check" ;;
@@ -65,17 +68,20 @@ wire() {
 install_binary() {
     if [ "$mode" = "uninstall" ]; then
         if [ -e "$target" ]; then rm -f "$target"; say removed "$target"; else say ok "$target (not installed)"; fi
+        if [ -e "$watcher" ]; then rm -f "$watcher"; say removed "$watcher"; else say ok "$watcher (not installed)"; fi
         return
     fi
     if [ "$mode" = "check" ]; then
         if [ -x "$target" ]; then say ok "$target ($("$target" --version))"; else say missing "$target"; status=1; fi
+        if [ -x "$watcher" ]; then say ok "$watcher"; else say missing "$watcher"; status=1; fi
         return
     fi
 
     local built
     if command -v cargo >/dev/null 2>&1; then
-        cargo build --release --locked --quiet --manifest-path "$repo/Cargo.toml"
+        cargo build --release --locked --quiet --manifest-path "$repo/Cargo.toml" --bin tj --bin tj-watch
         built="$repo/target/release/tj"
+        built_watcher="$repo/target/release/tj-watch"
     elif command -v gh >/dev/null 2>&1; then
         local tmp
         tmp="$(mktemp -d)"
@@ -83,18 +89,75 @@ install_binary() {
         gh release download --repo tj-agents/cli --pattern 'tj-x86_64-unknown-linux-gnu.tar.gz' --dir "$tmp" --clobber
         tar -xzf "$tmp/tj-x86_64-unknown-linux-gnu.tar.gz" -C "$tmp"
         built="$tmp/tj"
+        built_watcher="$tmp/tj-watch"
     else
         echo "install needs either cargo (to build) or gh (to download a release)" >&2
         exit 1
     fi
 
-    if [ -x "$target" ] && cmp -s "$built" "$target"; then
-        say ok "$target"
+    mkdir -p "$bin_dir"
+    for binary in "$built:$target" "$built_watcher:$watcher"; do
+        source="${binary%%:*}"
+        destination="${binary#*:}"
+        if [ -x "$destination" ] && cmp -s "$source" "$destination"; then
+            say ok "$destination"
+        else
+            cp "$source" "$destination.new" && chmod 755 "$destination.new" && mv -f "$destination.new" "$destination"
+            say installed "$destination"
+        fi
+    done
+}
+
+set_watcher_startup() {
+    if [ "$mode" = "uninstall" ]; then
+        if systemctl --user show-environment >/dev/null 2>&1; then
+            systemctl --user disable --now tj-watch.service >/dev/null 2>&1 || true
+            systemctl --user daemon-reload
+        fi
+        if [ -e "$unit_file" ]; then rm -f "$unit_file"; say removed "$unit_file"; else say ok "$unit_file (not installed)"; fi
+        if [ -e "$desktop_file" ]; then rm -f "$desktop_file"; say removed "$desktop_file"; else say ok "$desktop_file (not installed)"; fi
+        return
+    fi
+
+    if systemctl --user show-environment >/dev/null 2>&1; then
+        local body
+        body="[Unit]
+Description=tj session watcher
+
+[Service]
+ExecStart=$watcher
+Restart=on-failure
+
+[Install]
+WantedBy=default.target"
+        if [ -f "$unit_file" ] && [ "$(cat "$unit_file")" = "$body" ] && systemctl --user is-enabled tj-watch.service >/dev/null 2>&1; then
+            say ok "$unit_file"
+        elif [ "$mode" = "check" ]; then
+            say missing "$unit_file"; status=1
+        else
+            mkdir -p "$(dirname "$unit_file")"
+            printf '%s\n' "$body" >"$unit_file"
+            systemctl --user daemon-reload
+            systemctl --user enable --now tj-watch.service
+            say installed "$unit_file"
+        fi
+        return
+    fi
+
+    local desktop
+    desktop="[Desktop Entry]
+Type=Application
+Name=tj watch
+Exec=$watcher
+Terminal=false"
+    if [ -f "$desktop_file" ] && [ "$(cat "$desktop_file")" = "$desktop" ]; then
+        say ok "$desktop_file"
+    elif [ "$mode" = "check" ]; then
+        say missing "$desktop_file"; status=1
     else
-        mkdir -p "$bin_dir"
-        # Copy then rename, so a running `tj` is never left with a half-written binary.
-        cp "$built" "$target.new" && chmod 755 "$target.new" && mv -f "$target.new" "$target"
-        say installed "$target ($("$target" --version))"
+        mkdir -p "$(dirname "$desktop_file")"
+        printf '%s\n' "$desktop" >"$desktop_file"
+        say installed "$desktop_file"
     fi
 }
 
@@ -122,6 +185,7 @@ check_deps() {
 
 install_binary
 check_deps
+set_watcher_startup
 
 posix='command -v tj >/dev/null 2>&1 && eval "$(tj init bash)"'
 wire "$HOME/.bashrc" "$posix"

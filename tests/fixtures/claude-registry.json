@@ -1,0 +1,11 @@
+{
+  "pid": 4242,
+  "sessionId": "claude-session-id",
+  "cwd": "C:\\work\\project",
+  "name": "Recover this work",
+  "procStart": "133445566778899000",
+  "pidDomain": "win32:HOST",
+  "kind": "interactive",
+  "status": "active",
+  "updatedAt": "2026-10-09T12:00:00.000Z"
+}
