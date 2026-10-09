@@ -236,6 +236,7 @@ fn launch_linux_terminal(sessions: &[live::Session]) -> Result<(), RecoverError>
                 command.arg(&session.cwd);
                 command.arg("--");
             }
+            LinuxTerminal::Kitty => return launch_kitty_session(sessions),
             LinuxTerminal::Program(name) if name == "gnome-terminal" => {
                 command.arg(format!("--working-directory={}", session.cwd.display()));
                 command.arg(format!("--title={}", session_title(session)));
