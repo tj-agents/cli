@@ -1,0 +1,5 @@
+{
+  "standing_authorization": "auto",
+  "instruction": "Tommy, 2026-10-09: enable auto merging without the agent having to ask, as long as reviews and required checks pass, for both Claude and Codex in my tj-agents repos only.",
+  "hold_label": "human-gate"
+}
