@@ -1,12 +1,15 @@
 # tj
 
-Fast shell tools for agentic programming, on Windows and Linux. It's a single Rust binary, `tj`,
-with two everyday commands:
+Fast shell tools for agentic programming, on Windows and Linux. It installs `tj` plus the console-less
+`tj-watch` companion used at login,
+ with four everyday commands:
 
 | Command | What it does |
 | --- | --- |
 | `cr` | Search your Claude Code or Codex sessions by **anything said in them**, preview how each one ended, and press Enter to resume it in the folder it was started from. |
 | `f` | Fuzzy-jump to a project folder. `f core` goes straight to the best match; plain `f` opens a picker. |
+| `watch` | Record the agent sessions that are live now, so they can be recovered after a crash or reboot. Runs automatically after installation. |
+| `recover` | Reopen the most recent crash-closed group of Claude Code and Codex sessions in their original folders. |
 
 ## Install
 
@@ -43,6 +46,8 @@ for everything else, so re-running it after a `git pull` is how you upgrade. It:
    command -v tj >/dev/null 2>&1 && eval "$(tj init bash)"
    # <<< tj-agents/cli <<<
    ```
+4. starts `tj watch` at login: a console-less Startup shortcut on Windows, or a `systemd --user`
+   unit on Linux (falling back to a desktop autostart entry when user systemd is unavailable).
 
 | | Linux | Windows |
 | --- | --- | --- |
@@ -84,6 +89,24 @@ never inside the agents' own config folders.
 
 Codex subagent transcripts (guardian reviews and the like) are left out, because they resume into
 their parent session.
+
+## Recovering sessions after a crash
+
+`tj watch` starts automatically at login and samples only the session state that Claude Code and Codex
+already maintain. It does not enumerate processes. After a reboot, terminal crash, or other abrupt stop,
+run:
+
+```text
+tj recover
+```
+
+It opens the latest group that vanished together in terminal tabs, using each session's original working
+directory. A session that was closed by itself is treated as deliberate and is not reopened. If a directory
+has since been deleted, `tj` names it and skips it.
+
+Use `tj recover --list` to see the exact group and resume commands without opening terminals. If no watcher
+state exists yet, `tj` can recover only dead Claude registry entries; Codex sessions cannot be identified
+without the watcher.
 
 ## `f`: jump to a project
 
@@ -135,4 +158,6 @@ run changes anything. To publish prebuilt binaries, push a tag such as `v0.2.0`.
 | `src/cr/render.rs` | the Tab preview pane |
 | `src/cr/index.rs` | the incremental on-disk index |
 | `src/cr/scope.rs` | repo and worktree scoping |
+| `src/live.rs` | probing live Claude Code and Codex sessions without process enumeration |
+| `src/watch.rs` / `src/recover.rs` | watcher state, recovery selection and terminal reopening |
 | `src/init.rs` | `tj init`, which prints the functions from `linux/` and `windows/` |
