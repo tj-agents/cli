@@ -110,7 +110,7 @@ install_binary() {
 
 set_watcher_startup() {
     if [ "$mode" = "uninstall" ]; then
-        if systemctl --user show-environment >/dev/null 2>&1; then
+        if systemctl --user is-system-running >/dev/null 2>&1; then
             systemctl --user disable --now tj-watch.service >/dev/null 2>&1 || true
             systemctl --user daemon-reload
         fi
@@ -119,7 +119,7 @@ set_watcher_startup() {
         return
     fi
 
-    if systemctl --user show-environment >/dev/null 2>&1; then
+    if systemctl --user is-system-running >/dev/null 2>&1; then
         local body
         body="[Unit]
 Description=tj session watcher
