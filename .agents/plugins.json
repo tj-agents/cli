@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "marketplaces": {
+    "tj-agents": {
+      "repository": "tj-agents/marketplace"
+    }
+  },
+  "plugins": [
+    "base@tj-agents",
+    "engineering@tj-agents",
+    "machine@tj-agents",
+    "personal@tj-agents"
+  ]
+}
