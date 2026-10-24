@@ -1,0 +1,7 @@
+{
+  "agents_may_merge": false,
+  "required_checks": [
+    "test (ubuntu-latest)",
+    "test (windows-latest)"
+  ]
+}
