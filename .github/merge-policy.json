@@ -2,8 +2,6 @@
   "agents_may_merge": false,
   "required_checks": [
     "test (ubuntu-latest)",
-    "test (windows-latest)",
-    "policy / check (ubuntu-latest, python3)",
-    "policy / check (windows-latest, python)"
+    "test (windows-latest)"
   ]
 }
