@@ -17,8 +17,11 @@ with frontend and dedicated-wrapper PID/creation identities plus a native termin
 and kitty, the wrapper must descend from the re-enumerated native pane/window root and the frontend
 must descend from that wrapper. For Windows Terminal, startup must have resolved one title to one UIA
 automation ID and recorded `tab_binding` with that ID, the observed title, and
-`windows-uia-unique-title-at-launch`; close uses the automation ID only. It never discovers a target
-from a model, title, command name, registry, or transcript.
+`windows-uia-unique-title-at-launch`. Immediately before Windows mutation, the close helper launches an
+isolated probe which attaches only to the verified frontend console, sets a random temporary title, and
+requires that exact title to appear on the exact UIA automation ID before restoring it. It refuses when
+that association is unavailable or ambiguous. It never discovers a target from a model, title, command
+name, registry, or transcript.
 
 ```text
 python -B <skill-directory>\scripts\close.py close --target target.json --receipt receipt.json  # Windows

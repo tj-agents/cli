@@ -94,7 +94,8 @@ def _windows(identity: dict) -> list[dict]:
         raise process_identity.Refusal("Windows Terminal returned malformed inventory") from error
     if not isinstance(values, list):
         raise process_identity.Refusal("Windows Terminal returned malformed inventory")
-    return [{"kind": "windows-terminal", "automation_id": value.get("automationId"), "pid": value.get("processId")}
+    return [{"kind": "windows-terminal", "automation_id": value.get("automationId"), "pid": value.get("processId"),
+             "title": value.get("title")}
             for value in values if isinstance(value, dict) and _nonempty(value.get("automationId"))
             and isinstance(value.get("processId"), int)]
 
@@ -150,6 +151,26 @@ def _windows_tab_binding(identity: dict) -> str:
     return tab_id
 
 
+def _windows_console_association(frontend: dict, identity: dict) -> bool:
+    if os.name != "nt":
+        return False
+    probe = Path(__file__).with_name("windows_console_probe.py")
+    adapter = Path(__file__).with_name("windows_terminal_uia.ps1")
+    if not probe.is_file() or not adapter.is_file():
+        return False
+    frontend_pid, _started = process_identity.valid_identity(frontend)
+    command = [sys.executable, "-B", str(probe), "--frontend-pid", str(frontend_pid),
+               "--tab-id", _windows_tab_binding(identity), "--inventory-adapter", str(adapter)]
+    creationflags = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+    try:
+        result = subprocess.run(command, stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                                encoding="utf-8", timeout=5, check=False, creationflags=creationflags)
+        value = json.loads(result.stdout)
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return False
+    return result.returncode == 0 and value == {"associated": True}
+
+
 def verify_binding(target: dict) -> None:
     frontend = target.get("frontend")
     wrapper = target.get("wrapper")
@@ -162,6 +183,8 @@ def verify_binding(target: dict) -> None:
     if terminal.get("kind") == "windows-terminal":
         if item.get("automation_id") != _windows_tab_binding(terminal):
             raise process_identity.Refusal("Windows Terminal tab binding changed")
+        if not _windows_console_association(frontend, terminal):
+            raise process_identity.Refusal("Windows Terminal cannot prove frontend belongs to exact tab")
     else:
         roots = [process_identity.process_info(pid) for pid in _roots(item)]
         actual_roots = [root for root in roots if root is not None]
@@ -191,7 +214,19 @@ def close(target: dict) -> None:
     if result.returncode:
         raise process_identity.Refusal((result.stderr or result.stdout or "terminal refused close").strip())
     for _attempt in range(CONFIRM_ATTEMPTS):
-        if not any(_matches(item, identity) for item in _inventory(identity)):
+        try:
+            absent = not any(_matches(item, identity) for item in _inventory(identity))
+        except process_identity.Refusal:
+            if kind == "tmux" and _tmux_server_disappeared(identity):
+                return
+            raise
+        if absent:
             return
         time.sleep(CONFIRM_DELAY_SECONDS)
     raise process_identity.Refusal("terminal did not confirm exact tab disappearance")
+
+
+def _tmux_server_disappeared(identity: dict) -> bool:
+    result = _run(_tmux_command(identity, "has-session"))
+    message = (result.stderr or result.stdout).lower()
+    return result.returncode != 0 and "no server running" in message
