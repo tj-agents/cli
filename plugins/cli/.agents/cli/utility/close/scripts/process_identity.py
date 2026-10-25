@@ -12,6 +12,7 @@ from typing import Callable
 
 ProcessInfo = collections.namedtuple("ProcessInfo", "pid ppid started_at")
 TOLERANCE_SECONDS = 0.01
+MAXIMUM_PID = 0xFFFFFFFF
 
 
 class Refusal(RuntimeError):
@@ -124,7 +125,8 @@ def valid_identity(value: object) -> tuple[int, float]:
     if not isinstance(value, dict):
         raise Refusal("process identity must be an object")
     pid, started = value.get("pid"), value.get("started_at")
-    if not isinstance(pid, int) or pid <= 0 or not isinstance(started, (int, float)) or started <= 0:
+    if (not isinstance(pid, int) or pid <= 0 or pid > MAXIMUM_PID
+            or not isinstance(started, (int, float)) or started <= 0):
         raise Refusal("process identity needs positive pid and started_at")
     return pid, float(started)
 
@@ -178,7 +180,7 @@ def _stop_linux(pid: int, started: float, before_signal: Callable[[], None]) -> 
         raise Refusal("safe process closure requires Linux pidfd support")
     try:
         descriptor = os.pidfd_open(pid)
-    except OSError as error:
+    except (OSError, OverflowError) as error:
         raise Refusal("cannot acquire exact frontend process handle") from error
     try:
         actual = process_info(pid)
