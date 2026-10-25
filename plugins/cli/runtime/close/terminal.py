@@ -95,9 +95,9 @@ def _windows(identity: dict) -> list[dict]:
         raise process_identity.Refusal("Windows Terminal returned malformed inventory") from error
     if not isinstance(values, list):
         raise process_identity.Refusal("Windows Terminal returned malformed inventory")
-    return [{"kind": "windows-terminal", "automation_id": value.get("automationId"), "pid": value.get("processId"),
+    return [{"kind": "windows-terminal", "runtime_id": value.get("runtimeId"), "pid": value.get("processId"),
              "title": value.get("title")}
-            for value in values if isinstance(value, dict) and _nonempty(value.get("automationId"))
+            for value in values if isinstance(value, dict) and _nonempty(value.get("runtimeId"))
             and isinstance(value.get("processId"), int)]
 
 
@@ -124,7 +124,7 @@ def _matches(item: dict, identity: dict) -> bool:
         return item.get("listen_on") == identity.get("listen_on") and item.get("window_id") == str(identity.get("window_id"))
     if kind == "windows-terminal":
         binding = identity.get("tab_binding")
-        return isinstance(binding, dict) and item.get("automation_id") == binding.get("automation_id")
+        return isinstance(binding, dict) and item.get("runtime_id") == binding.get("runtime_id")
     return False
 
 
@@ -145,7 +145,7 @@ def _windows_tab_binding(identity: dict) -> str:
     binding = identity.get("tab_binding")
     if not isinstance(binding, dict):
         raise process_identity.Refusal("Windows Terminal target needs tab binding evidence")
-    tab_id = _nonempty(binding.get("automation_id"))
+    tab_id = _nonempty(binding.get("runtime_id"))
     title = _nonempty(binding.get("observed_title"))
     if not tab_id or not title or binding.get("evidence") != "windows-uia-unique-title-at-launch":
         raise process_identity.Refusal("Windows Terminal tab binding evidence is incomplete")
@@ -182,7 +182,7 @@ def verify_binding(target: dict) -> None:
     process_identity.require_live(wrapper, "wrapper identity changed")
     item = _one(terminal)
     if terminal.get("kind") == "windows-terminal":
-        if item.get("automation_id") != _windows_tab_binding(terminal):
+        if item.get("runtime_id") != _windows_tab_binding(terminal):
             raise process_identity.Refusal("Windows Terminal tab binding changed")
         if not _windows_console_association(frontend, terminal):
             raise process_identity.Refusal("Windows Terminal cannot prove frontend belongs to exact tab")
