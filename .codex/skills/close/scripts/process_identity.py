@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import collections
+import math
 import os
 from pathlib import Path
 import subprocess
 import sys
+from typing import Callable
 
 ProcessInfo = collections.namedtuple("ProcessInfo", "pid ppid started_at")
 TOLERANCE_SECONDS = 0.01
@@ -144,6 +146,90 @@ def require_live(identity: object, message: str = "process identity changed") ->
 def require_exited(identity: object) -> None:
     if matches(identity):
         raise Refusal("exact frontend did not exit")
+
+
+def stop(identity: dict, *, before_signal: Callable[[], None]) -> None:
+    """Stop only a held, birth-verified process after in-process reauthorization.
+
+    ``before_signal`` runs immediately before the held process handle receives its
+    signal.  A raised exception sends no signal, so callers can refuse when their
+    trusted, in-process input guard observes a change.  This never signals a
+    descendant or process tree, and deliberately performs no later escalation.
+    """
+    pid, started = valid_identity(identity)
+    if (isinstance(identity.get("pid"), bool) or isinstance(identity.get("started_at"), bool)
+            or not math.isfinite(started)):
+        raise Refusal("process identity needs positive pid and started_at")
+    if not callable(before_signal):
+        raise Refusal("before_signal must be callable")
+    if os.name == "nt":
+        _stop_windows(pid, started, before_signal)
+    elif sys.platform.startswith("linux"):
+        _stop_linux(pid, started, before_signal)
+    else:
+        raise Refusal("safe process closure is unsupported on this platform")
+
+
+def _stop_linux(pid: int, started: float, before_signal: Callable[[], None]) -> None:
+    import select
+    import signal
+
+    if not hasattr(os, "pidfd_open") or not hasattr(signal, "pidfd_send_signal"):
+        raise Refusal("safe process closure requires Linux pidfd support")
+    try:
+        descriptor = os.pidfd_open(pid)
+    except OSError as error:
+        raise Refusal("cannot acquire exact frontend process handle") from error
+    try:
+        actual = process_info(pid)
+        if actual is None or abs(actual.started_at - started) > TOLERANCE_SECONDS:
+            raise Refusal("frontend identity changed before close")
+        before_signal()
+        try:
+            signal.pidfd_send_signal(descriptor, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        if not select.select([descriptor], [], [], 5)[0]:
+            raise Refusal("exact frontend exit was not confirmed")
+    finally:
+        os.close(descriptor)
+
+
+def _stop_windows(pid: int, started: float, before_signal: Callable[[], None]) -> None:
+    import ctypes
+    from ctypes import wintypes
+
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel.OpenProcess.restype = wintypes.HANDLE
+    kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel.GetProcessTimes.argtypes = [
+        wintypes.HANDLE, ctypes.POINTER(wintypes.FILETIME), ctypes.POINTER(wintypes.FILETIME),
+        ctypes.POINTER(wintypes.FILETIME), ctypes.POINTER(wintypes.FILETIME),
+    ]
+    kernel.GetProcessTimes.restype = wintypes.BOOL
+    kernel.TerminateProcess.argtypes = [wintypes.HANDLE, wintypes.UINT]
+    kernel.TerminateProcess.restype = wintypes.BOOL
+    kernel.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    kernel.WaitForSingleObject.restype = wintypes.DWORD
+    handle = kernel.OpenProcess(0x100001 | 0x1000, False, pid)
+    if not handle:
+        raise Refusal("cannot acquire exact frontend process handle")
+    try:
+        created, exited, kernel_time, user_time = (wintypes.FILETIME() for _ in range(4))
+        if not kernel.GetProcessTimes(handle, ctypes.byref(created), ctypes.byref(exited),
+                                      ctypes.byref(kernel_time), ctypes.byref(user_time)):
+            raise Refusal("cannot verify exact frontend process handle")
+        actual = ((created.dwHighDateTime << 32) + created.dwLowDateTime) / 10_000_000 - 11_644_473_600
+        if abs(actual - started) > TOLERANCE_SECONDS:
+            raise Refusal("frontend identity changed before close")
+        before_signal()
+        if not kernel.TerminateProcess(handle, 0):
+            raise Refusal("exact frontend process refused termination")
+        if kernel.WaitForSingleObject(handle, 10_000) != 0:
+            raise Refusal("exact frontend exit was not confirmed")
+    finally:
+        kernel.CloseHandle(handle)
 
 
 def descends_from(frontend: object, root: object) -> bool:
