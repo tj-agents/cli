@@ -177,6 +177,17 @@ class VerifiedProcessStopTests(unittest.TestCase):
         self.assertIsNone(frontend.poll(), "wrong birth signalled the frontend")
         self.assertIsNone(sibling.poll(), "wrong birth signalled the sibling")
 
+    def test_oversized_pid_refuses_before_guard_or_signal(self):
+        frontend, identity = self._frontend()
+        sibling, _sibling_identity = self._frontend()
+        oversized = {**identity, "pid": identity["pid"] + 2 ** 32}
+        before_signal = mock.Mock()
+        with self.assertRaisesRegex(close.process_identity.Refusal, "pid"):
+            close.process_identity.stop(oversized, before_signal=before_signal)
+        before_signal.assert_not_called()
+        self.assertIsNone(frontend.poll(), "oversized pid signalled the frontend")
+        self.assertIsNone(sibling.poll(), "oversized pid signalled the sibling")
+
     def test_refusing_new_input_guard_preserves_the_frontend(self):
         frontend, identity = self._frontend()
         sibling, _sibling_identity = self._frontend()
