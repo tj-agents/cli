@@ -44,7 +44,7 @@ def validate_target(value: object) -> dict:
         binding = terminal_value.get("tab_binding")
         if not isinstance(binding, dict):
             raise process_identity.Refusal("Windows Terminal target needs tab binding evidence")
-        if (not isinstance(binding.get("automation_id"), str) or not binding["automation_id"].strip()
+        if (not isinstance(binding.get("runtime_id"), str) or not binding["runtime_id"].strip()
                 or not isinstance(binding.get("observed_title"), str) or not binding["observed_title"].strip()
                 or binding.get("evidence") != "windows-uia-unique-title-at-launch"):
             raise process_identity.Refusal("Windows Terminal tab binding evidence is incomplete")

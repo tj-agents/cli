@@ -60,7 +60,7 @@ def prove(frontend_pid: int, tab_id: str, adapter: Path) -> bool:
             raise OSError(ctypes.get_last_error(), "SetConsoleTitleW failed")
         time.sleep(0.1)
         matches = [item for item in _inventory(adapter)
-                   if item.get("automationId") == tab_id and item.get("title") == challenge]
+                   if item.get("runtimeId") == tab_id and item.get("title") == challenge]
         return len(matches) == 1
     finally:
         kernel32.SetConsoleTitleW(original)

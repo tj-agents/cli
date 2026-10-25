@@ -130,6 +130,18 @@ class CloseOperationTests(unittest.TestCase):
 
 
 class TerminalBindingTests(unittest.TestCase):
+    def test_windows_runtime_ids_disambiguate_tabs_with_empty_automation_ids(self):
+        values = [{"runtimeId": "42:100:2", "automationId": "", "processId": 77, "title": "same title"},
+                  {"runtimeId": "42:100:3", "automationId": "", "processId": 77, "title": "same title"}]
+        response = subprocess.CompletedProcess([], 0, json.dumps(values), "")
+        with mock.patch.object(close.terminal, "os", SimpleNamespace(name="nt")), \
+                mock.patch.object(close.terminal, "_run", return_value=response):
+            inventory = close.terminal._windows({"kind": "windows-terminal"})
+        self.assertEqual(["42:100:2", "42:100:3"], [item["runtime_id"] for item in inventory])
+        target = {"kind": "windows-terminal", "tab_binding": {"runtime_id": "42:100:3"}}
+        self.assertFalse(close.terminal._matches(inventory[0], target))
+        self.assertTrue(close.terminal._matches(inventory[1], target))
+
     def setUp(self):
         info = close.process_identity.ProcessInfo
         self.processes = {
@@ -149,11 +161,11 @@ class TerminalBindingTests(unittest.TestCase):
 
     def test_windows_same_window_sibling_refuses_without_console_tab_association(self):
         target = {**self.target, "terminal": {"kind": "windows-terminal", "tab_binding": {
-            "automation_id": "tab-b", "observed_title": "launch title",
+            "runtime_id": "tab-b", "observed_title": "launch title",
             "evidence": "windows-uia-unique-title-at-launch"}}}
         with mock.patch.object(close.process_identity, "process_info", side_effect=self.processes.get), \
                 mock.patch.object(close.terminal, "_one", return_value={
-                    "kind": "windows-terminal", "automation_id": "tab-b", "pid": 77
+                    "kind": "windows-terminal", "runtime_id": "tab-b", "pid": 77
                 }), mock.patch.object(close.terminal, "_windows_console_association", return_value=False), \
                 mock.patch.object(close.terminal, "_run") as mutate:
             with self.assertRaisesRegex(close.process_identity.Refusal, "cannot prove frontend belongs"):
@@ -162,7 +174,7 @@ class TerminalBindingTests(unittest.TestCase):
 
     def test_windows_console_association_runs_isolated_probe_and_refuses_negative_result(self):
         identity = {"kind": "windows-terminal", "tab_binding": {
-            "automation_id": "tab-b", "observed_title": "launch title",
+            "runtime_id": "tab-b", "observed_title": "launch title",
             "evidence": "windows-uia-unique-title-at-launch"}}
         frontend = {"pid": 30, "started_at": 300.0}
         success = subprocess.CompletedProcess([], 0, '{"associated": true}', "")
