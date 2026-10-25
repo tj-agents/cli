@@ -1,0 +1,20 @@
+{
+  "name": "tj-agents",
+  "description": "Deterministic CLI terminal and linked-worktree operations.",
+  "owner": {
+    "name": "ThomasSeery"
+  },
+  "plugins": [
+    {
+      "name": "cli",
+      "source": "./plugins/cli",
+      "description": "Deterministic CLI terminal and linked-worktree operations.",
+      "category": "Productivity",
+      "keywords": [
+        "cli",
+        "terminal",
+        "worktree"
+      ]
+    }
+  ]
+}

@@ -37,8 +37,8 @@ class CloseOperationTests(unittest.TestCase):
         info = close.process_identity.process_info(__import__("os").getpid())
         self.assertIsNotNone(info)
         self.target = {"schema_version": 1, "frontend": {"pid": info.pid, "started_at": info.started_at},
-                       "terminal": {"kind": "tmux", "pane_id": "%1",
-                                    "binding": {"pid": info.pid, "started_at": info.started_at}}}
+                       "wrapper": {"pid": info.pid, "started_at": info.started_at},
+                       "terminal": {"kind": "tmux", "pane_id": "%1"}}
 
     def test_process_identity_rejects_reused_or_wrong_start(self):
         self.assertTrue(close.process_identity.matches(self.target["frontend"]))
@@ -84,6 +84,37 @@ class CloseOperationTests(unittest.TestCase):
         close_exact.assert_called_once_with(self.target, receipt)
 
 
+class TerminalBindingTests(unittest.TestCase):
+    def setUp(self):
+        info = close.process_identity.ProcessInfo
+        self.processes = {
+            10: info(10, 1, 100.0),
+            20: info(20, 10, 200.0),
+            30: info(30, 20, 300.0),
+            77: info(77, 1, 400.0),
+        }
+        self.target = {"schema_version": 1, "frontend": {"pid": 30, "started_at": 300.0},
+                       "wrapper": {"pid": 20, "started_at": 200.0},
+                       "terminal": {"kind": "tmux", "pane_id": "%1"}}
+
+    def test_wrapper_beneath_native_pane_root_owns_frontend(self):
+        with mock.patch.object(close.process_identity, "process_info", side_effect=self.processes.get), \
+                mock.patch.object(close.terminal, "_one", return_value={"kind": "tmux", "pid": 10}):
+            close.terminal.verify_binding(self.target)
+
+    def test_windows_sibling_tab_evidence_refuses_before_mutation(self):
+        target = {**self.target, "terminal": {"kind": "windows-terminal", "tab_binding": {
+            "automation_id": "tab-b", "observed_title": "launch title",
+            "evidence": "windows-uia-unique-title-at-launch"}}}
+        with mock.patch.object(close.process_identity, "process_info", side_effect=self.processes.get), \
+                mock.patch.object(close.terminal, "_one", return_value={
+                    "kind": "windows-terminal", "automation_id": "tab-a", "pid": 77
+                }), mock.patch.object(close.terminal, "_run") as mutate:
+            with self.assertRaisesRegex(close.process_identity.Refusal, "tab binding changed"):
+                close.terminal.close(target)
+        mutate.assert_not_called()
+
+
 class CloseoutPreflightTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
@@ -113,8 +144,8 @@ class CloseoutPreflightTests(unittest.TestCase):
         self.eligibility = root / "eligibility.json"
         info = close.process_identity.process_info(__import__("os").getpid())
         self.target = {"schema_version": 1, "frontend": {"pid": info.pid, "started_at": info.started_at},
-                       "terminal": {"kind": "tmux", "pane_id": "%1",
-                                    "binding": {"pid": info.pid, "started_at": info.started_at}}}
+                       "wrapper": {"pid": info.pid, "started_at": info.started_at},
+                       "terminal": {"kind": "tmux", "pane_id": "%1"}}
         self.write_eligibility()
 
     def write_eligibility(self, target=None, remote_base="origin/main"):

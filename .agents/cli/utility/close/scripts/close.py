@@ -30,16 +30,29 @@ def _write_json(path: Path, value: dict) -> None:
     temporary.replace(path)
 
 
-def target(path: Path) -> dict:
-    value = _read_json(path)
+def validate_target(value: object) -> dict:
+    if not isinstance(value, dict):
+        raise process_identity.Refusal("target must be an object")
     if value.get("schema_version") != 1:
         raise process_identity.Refusal("target schema_version must be 1")
     process_identity.valid_identity(value.get("frontend"))
+    process_identity.valid_identity(value.get("wrapper"))
     terminal_value = value.get("terminal")
-    if not isinstance(terminal_value, dict):
+    if not isinstance(terminal_value, dict) or not isinstance(terminal_value.get("kind"), str):
         raise process_identity.Refusal("target needs terminal object")
-    process_identity.valid_identity(terminal_value.get("binding"))
+    if terminal_value["kind"] == "windows-terminal":
+        binding = terminal_value.get("tab_binding")
+        if not isinstance(binding, dict):
+            raise process_identity.Refusal("Windows Terminal target needs tab binding evidence")
+        if (not isinstance(binding.get("automation_id"), str) or not binding["automation_id"].strip()
+                or not isinstance(binding.get("observed_title"), str) or not binding["observed_title"].strip()
+                or binding.get("evidence") != "windows-uia-unique-title-at-launch"):
+            raise process_identity.Refusal("Windows Terminal tab binding evidence is incomplete")
     return value
+
+
+def target(path: Path) -> dict:
+    return validate_target(_read_json(path))
 
 
 def receipt(path: Path, target_value: dict, status: str, **extra: object) -> None:

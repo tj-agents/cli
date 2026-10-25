@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
-import shutil
 import subprocess
 import time
 
@@ -122,7 +121,8 @@ def _matches(item: dict, identity: dict) -> bool:
     if kind == "kitty":
         return item.get("listen_on") == identity.get("listen_on") and item.get("window_id") == str(identity.get("window_id"))
     if kind == "windows-terminal":
-        return item.get("automation_id") == identity.get("automation_id")
+        binding = identity.get("tab_binding")
+        return isinstance(binding, dict) and item.get("automation_id") == binding.get("automation_id")
     return False
 
 
@@ -139,19 +139,38 @@ def _roots(item: dict) -> list[int]:
     return [item["pid"]]
 
 
+def _windows_tab_binding(identity: dict) -> str:
+    binding = identity.get("tab_binding")
+    if not isinstance(binding, dict):
+        raise process_identity.Refusal("Windows Terminal target needs tab binding evidence")
+    tab_id = _nonempty(binding.get("automation_id"))
+    title = _nonempty(binding.get("observed_title"))
+    if not tab_id or not title or binding.get("evidence") != "windows-uia-unique-title-at-launch":
+        raise process_identity.Refusal("Windows Terminal tab binding evidence is incomplete")
+    return tab_id
+
+
 def verify_binding(target: dict) -> None:
     frontend = target.get("frontend")
+    wrapper = target.get("wrapper")
     terminal = target.get("terminal")
     if not isinstance(terminal, dict):
         raise process_identity.Refusal("target needs a terminal object")
-    binding = terminal.get("binding")
     process_identity.require_live(frontend, "frontend identity changed")
+    process_identity.require_live(wrapper, "wrapper identity changed")
     item = _one(terminal)
-    if not any(process_identity.matches({"pid": pid, "started_at": binding.get("started_at")})
-               and pid == binding.get("pid") for pid in _roots(item)):
-        raise process_identity.Refusal("terminal binding changed")
-    if not process_identity.descends_from(frontend, binding):
-        raise process_identity.Refusal("frontend is not owned by the exact terminal binding")
+    if terminal.get("kind") == "windows-terminal":
+        if item.get("automation_id") != _windows_tab_binding(terminal):
+            raise process_identity.Refusal("Windows Terminal tab binding changed")
+    else:
+        roots = [process_identity.process_info(pid) for pid in _roots(item)]
+        actual_roots = [root for root in roots if root is not None]
+        if not any(process_identity.descends_from(
+            wrapper, {"pid": root.pid, "started_at": root.started_at}
+        ) for root in actual_roots):
+            raise process_identity.Refusal("wrapper is not owned by the exact terminal target")
+    if not process_identity.descends_from(frontend, wrapper):
+        raise process_identity.Refusal("frontend is not owned by the dedicated wrapper")
 
 
 def close(target: dict) -> None:
@@ -164,8 +183,9 @@ def close(target: dict) -> None:
     elif kind == "kitty":
         result = _run(["kitty", "@", "--to", identity["listen_on"], "close-window", "--match", "id:" + str(identity["window_id"])])
     elif kind == "windows-terminal":
+        tab_id = _windows_tab_binding(identity)
         result = _run(["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
-                       str(Path(__file__).with_name("windows_terminal_uia.ps1")), "-TabId", identity["automation_id"]])
+                       str(Path(__file__).with_name("windows_terminal_uia.ps1")), "-TabId", tab_id])
     else:
         raise process_identity.Refusal("unsupported terminal identity")
     if result.returncode:

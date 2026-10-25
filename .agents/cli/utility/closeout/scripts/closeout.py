@@ -178,10 +178,10 @@ def retry_remove(args: argparse.Namespace) -> int:
         raise Refusal("receipt does not describe a failed closeout removal")
     if value.get("worktree") != str(worktree) or not isinstance(target, dict):
         raise Refusal("receipt does not bind this exact worktree")
-    if target.get("schema_version") != 1 or not isinstance(target.get("terminal"), dict):
-        raise Refusal("receipt has no valid original target")
-    close.process_identity.valid_identity(target.get("frontend"))
-    close.process_identity.valid_identity(target["terminal"].get("binding"))
+    try:
+        close.validate_target(target)
+    except Refusal as error:
+        raise Refusal("receipt has no valid original target") from error
     try:
         preflight(worktree, args.expected_head, args.expected_branch, args.remote_base, args.eligibility, target)
         _git(_primary_checkout(worktree), "worktree", "remove", str(worktree))
