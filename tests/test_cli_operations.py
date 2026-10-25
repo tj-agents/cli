@@ -1,5 +1,6 @@
 import importlib.util
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -31,6 +32,25 @@ def git(cwd, *arguments):
 
 
 class CloseOperationTests(unittest.TestCase):
+    @unittest.skipUnless(sys.platform.startswith("linux") and hasattr(os, "fork"), "requires Linux process state")
+    def test_exited_unreaped_frontend_is_not_live(self):
+        pid = os.fork()
+        if pid == 0:
+            os._exit(0)
+        try:
+            import time
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline:
+                raw = (Path("/proc") / str(pid) / "stat").read_text()
+                if raw[raw.rfind(")") + 2:].split()[0] == "Z":
+                    break
+                time.sleep(0.01)
+            else:
+                self.fail("disposable child did not exit")
+            self.assertIsNone(close.process_identity.process_info(pid))
+        finally:
+            os.waitpid(pid, 0)
+
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
