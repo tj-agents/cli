@@ -9,10 +9,10 @@ foreach ($window in @($root.FindAll([System.Windows.Automation.TreeScope]::Child
     if (-not $process -or $process.ProcessName -notin @('WindowsTerminal', 'WindowsTerminalPreview')) { continue }
     $tabType = New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::ControlTypeProperty, [System.Windows.Automation.ControlType]::TabItem)
     foreach ($tab in @($window.FindAll([System.Windows.Automation.TreeScope]::Descendants, $tabType))) {
-        $tabs += [pscustomobject]@{ AutomationId = $tab.Current.AutomationId; Element = $tab; ProcessId = $window.Current.ProcessId }
+        $tabs += [pscustomobject]@{ AutomationId = $tab.Current.AutomationId; Element = $tab; ProcessId = $window.Current.ProcessId; Title = $tab.Current.Name }
     }
 }
-if ($Json) { Write-Output ('[' + (@($tabs | ForEach-Object { ConvertTo-Json -Compress ([pscustomobject]@{ automationId=$_.AutomationId; processId=$_.ProcessId }) }) -join ',') + ']'); return }
+if ($Json) { Write-Output ('[' + (@($tabs | ForEach-Object { ConvertTo-Json -Compress ([pscustomobject]@{ automationId=$_.AutomationId; processId=$_.ProcessId; title=$_.Title }) }) -join ',') + ']'); return }
 $matches = @($tabs | Where-Object { $TabId -and $_.AutomationId -eq $TabId })
 if ($matches.Count -ne 1) { throw 'Windows Terminal target is absent or ambiguous.' }
 $close = New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::AutomationIdProperty, 'CloseButton')

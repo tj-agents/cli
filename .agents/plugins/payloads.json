@@ -3,5 +3,12 @@
     "cli": [
       "cli"
     ]
-  }
+  },
+  "resources": [
+    {
+      "plugin": "cli",
+      "source": ".agents/cli/utility/close/scripts",
+      "destination": "runtime/close"
+    }
+  ]
 }

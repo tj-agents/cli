@@ -15,7 +15,16 @@ ELIGIBILITY_MAX_AGE_SECONDS = 300
 
 
 def _close_module():
-    path = Path(__file__).resolve().parents[3] / "utility" / "close" / "scripts" / "close.py"
+    here = Path(__file__).resolve()
+    candidates = []
+    for root in (here.parent, *here.parents):
+        candidates.extend((
+            root / "runtime" / "close" / "close.py",
+            root / ".agents" / "cli" / "utility" / "close" / "scripts" / "close.py",
+        ))
+    path = next((candidate for candidate in candidates if candidate.is_file()), None)
+    if path is None:
+        raise RuntimeError("cli close runtime is unavailable from this package")
     sys.path.insert(0, str(path.parent))
     specification = importlib.util.spec_from_file_location("cli_close", path)
     if specification is None or specification.loader is None:
@@ -124,8 +133,8 @@ def preflight(
     record = next((item for item in _worktree_records(worktree) if item["path"] == worktree), None)
     if record is None or record["primary"] or record["locked"]:
         raise Refusal("target is absent, primary, or locked")
-    if _git(worktree, "status", "--porcelain", "--untracked-files=all"):
-        raise Refusal("target worktree is dirty or has untracked files")
+    if _git(worktree, "status", "--porcelain", "--ignored=matching", "--untracked-files=all"):
+        raise Refusal("target worktree is dirty or has untracked or ignored local files")
     head = _git(worktree, "rev-parse", "HEAD")
     branch = _git(worktree, "symbolic-ref", "--quiet", "--short", "HEAD")
     if head != expected_head or branch != expected_branch:

@@ -62,7 +62,7 @@ class CloseOperationTests(unittest.TestCase):
         target.write_text(json.dumps(self.target), encoding="utf-8")
         cancel.write_text("cancel", encoding="utf-8")
         with mock.patch.object(close.terminal, "close") as terminal_close:
-            result = close.main(["watch", "--target", str(target), "--receipt", str(receipt), "--completion",
+            result = close.main(["watch", "--target-json", json.dumps(self.target), "--armed-at", str(__import__("time").time()), "--receipt", str(receipt), "--completion",
                                  str(completion), "--completion-token", "token", "--cancel", str(cancel),
                                  "--delay", "0", "--timeout", "0.1"])
         self.assertEqual(0, result)
@@ -77,10 +77,34 @@ class CloseOperationTests(unittest.TestCase):
         target.write_text(json.dumps(self.target), encoding="utf-8")
         with mock.patch.object(close, "_completion_matches", return_value=True), \
                 mock.patch.object(close, "close") as close_exact:
-            result = close.main(["watch", "--target", str(target), "--receipt", str(receipt), "--completion",
+            result = close.main(["watch", "--target-json", json.dumps(self.target), "--armed-at", str(__import__("time").time()), "--receipt", str(receipt), "--completion",
                                  str(completion), "--completion-token", "token", "--cancel", str(cancel),
                                  "--delay", "0", "--timeout", "0.1"])
         self.assertEqual(0, result)
+        close_exact.assert_called_once_with(self.target, receipt)
+
+    def test_arm_freezes_target_and_arming_time_before_watcher_starts(self):
+        target_path = self.directory / "target.json"
+        receipt = self.directory / "receipt.json"
+        completion = self.directory / "completion.json"
+        cancel = self.directory / "cancel.json"
+        target_path.write_text(json.dumps(self.target), encoding="utf-8")
+        with mock.patch.object(close.subprocess, "Popen") as launch:
+            self.assertEqual(0, close.main(["arm", "--target", str(target_path), "--receipt", str(receipt),
+                                             "--completion", str(completion), "--completion-token", "token",
+                                             "--cancel", str(cancel), "--delay", "0", "--timeout", "1"]))
+        command = launch.call_args.args[0]
+        self.assertNotIn("--target", command)
+        frozen = json.loads(command[command.index("--target-json") + 1])
+        self.assertEqual(self.target, frozen)
+        armed_at = float(command[command.index("--armed-at") + 1])
+        self.assertEqual(armed_at, json.loads(receipt.read_text(encoding="utf-8"))["armed_at"])
+        replacement = {**self.target, "frontend": {**self.target["frontend"], "pid": 99999}}
+        target_path.write_text(json.dumps(replacement), encoding="utf-8")
+        completion.write_text(json.dumps({"token": "token"}), encoding="utf-8")
+        watcher = close.parser().parse_args(command[3:])
+        with mock.patch.object(close, "close") as close_exact:
+            self.assertEqual(0, close.watch(watcher))
         close_exact.assert_called_once_with(self.target, receipt)
 
 
@@ -102,17 +126,26 @@ class TerminalBindingTests(unittest.TestCase):
                 mock.patch.object(close.terminal, "_one", return_value={"kind": "tmux", "pid": 10}):
             close.terminal.verify_binding(self.target)
 
-    def test_windows_sibling_tab_evidence_refuses_before_mutation(self):
+    def test_windows_same_window_sibling_refuses_without_console_tab_association(self):
         target = {**self.target, "terminal": {"kind": "windows-terminal", "tab_binding": {
             "automation_id": "tab-b", "observed_title": "launch title",
             "evidence": "windows-uia-unique-title-at-launch"}}}
         with mock.patch.object(close.process_identity, "process_info", side_effect=self.processes.get), \
                 mock.patch.object(close.terminal, "_one", return_value={
-                    "kind": "windows-terminal", "automation_id": "tab-a", "pid": 77
-                }), mock.patch.object(close.terminal, "_run") as mutate:
-            with self.assertRaisesRegex(close.process_identity.Refusal, "tab binding changed"):
+                    "kind": "windows-terminal", "automation_id": "tab-b", "pid": 77
+                }), mock.patch.object(close.terminal, "_windows_console_association", return_value=False), \
+                mock.patch.object(close.terminal, "_run") as mutate:
+            with self.assertRaisesRegex(close.process_identity.Refusal, "cannot prove frontend belongs"):
                 close.terminal.close(target)
         mutate.assert_not_called()
+
+    def test_last_tmux_pane_accepts_only_verified_server_disappearance(self):
+        result = subprocess.CompletedProcess(["tmux"], 0, "", "")
+        with mock.patch.object(close.terminal, "verify_binding"), \
+                mock.patch.object(close.terminal, "_run", return_value=result), \
+                mock.patch.object(close.terminal, "_inventory", side_effect=close.process_identity.Refusal("tmux inventory failed")), \
+                mock.patch.object(close.terminal, "_tmux_server_disappeared", return_value=True):
+            close.terminal.close(self.target)
 
 
 class CloseoutPreflightTests(unittest.TestCase):
@@ -168,6 +201,46 @@ class CloseoutPreflightTests(unittest.TestCase):
         self.write_eligibility(wrong_target)
         with self.assertRaisesRegex(closeout.Refusal, "target"):
             closeout.preflight(self.linked, self.head, "feature", "origin/main", self.eligibility, self.target)
+
+    def test_ignored_env_refuses_before_close_and_retry_preserves_local_data(self):
+        ignored = self.linked / ".env"
+        (self.linked / ".gitignore").write_text(".env\n", encoding="utf-8")
+        git(self.linked, "add", ".gitignore")
+        git(self.linked, "commit", "-q", "-m", "ignore local env")
+        self.head = git(self.linked, "rev-parse", "HEAD")
+        git(self.linked, "push", "-q")
+        git(self.primary, "merge", "--no-ff", "-q", "feature", "-m", "merge ignored env")
+        git(self.primary, "push", "-q", "origin", "main")
+        git(self.linked, "fetch", "-q", "origin")
+        self.write_eligibility()
+        ignored.write_text("KEEP_ME", encoding="utf-8")
+        target = self.primary.parent / "target.json"
+        receipt = self.primary.parent / "receipt.json"
+        target.write_text(json.dumps(self.target), encoding="utf-8")
+        with mock.patch.object(closeout.close, "close") as close_exact:
+            result = closeout.main(["run", "--target", str(target), "--worktree", str(self.linked),
+                "--expected-head", self.head, "--expected-branch", "feature", "--remote-base", "origin/main",
+                "--eligibility", str(self.eligibility), "--receipt", str(receipt)])
+        self.assertEqual(2, result)
+        close_exact.assert_not_called()
+        self.assertEqual("KEEP_ME", ignored.read_text(encoding="utf-8"))
+        receipt.write_text(json.dumps({"schema_version": 1, "operation": "cli-closeout",
+            "status": "closed-removal-failed", "target": self.target, "worktree": str(self.linked.resolve())}),
+            encoding="utf-8")
+        result = closeout.main(["retry-remove", "--worktree", str(self.linked), "--expected-head", self.head,
+            "--expected-branch", "feature", "--remote-base", "origin/main", "--eligibility",
+            str(self.eligibility), "--receipt", str(receipt)])
+        self.assertEqual(2, result)
+        self.assertEqual("KEEP_ME", ignored.read_text(encoding="utf-8"))
+
+    def test_generated_closeout_entrypoints_reach_argument_parser(self):
+        for relative in (".codex/skills/closeout/scripts/closeout.py",
+                         ".claude/skills/closeout/scripts/closeout.py",
+                         "plugins/cli/skills/closeout/scripts/closeout.py"):
+            result = subprocess.run([sys.executable, relative, "--help"], cwd=ROOT,
+                                    capture_output=True, text=True, encoding="utf-8", check=False)
+            self.assertEqual(0, result.returncode, result.stderr)
+            self.assertIn("usage:", result.stdout)
 
     def test_closeout_removes_only_the_verified_linked_worktree(self):
         target = self.primary.parent / "target.json"
