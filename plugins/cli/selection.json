@@ -1,0 +1,42 @@
+{
+  "plugin": "cli",
+  "dependencies": [],
+  "profiles": {
+    "core": [
+      "close",
+      "closeout"
+    ]
+  },
+  "compatibilitySkillAliases": {},
+  "skills": [
+    {
+      "name": "close",
+      "kind": "utility",
+      "profile": "core",
+      "applicability": [
+        "all projects"
+      ],
+      "requires": [
+        "python"
+      ],
+      "provenance": [
+        "house"
+      ]
+    },
+    {
+      "name": "closeout",
+      "kind": "utility",
+      "profile": "core",
+      "applicability": [
+        "all projects"
+      ],
+      "requires": [
+        "python",
+        "git"
+      ],
+      "provenance": [
+        "house"
+      ]
+    }
+  ]
+}
