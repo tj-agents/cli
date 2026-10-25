@@ -33,6 +33,8 @@ def _linux_process(pid: int) -> ProcessInfo | None:
     if end < 0:
         raise Refusal("malformed Linux process identity")
     fields = text[end + 2:].split()
+    if fields and fields[0] in {"Z", "X", "x"}:
+        return None
     try:
         ppid = int(fields[1])
         ticks = int(fields[19])
