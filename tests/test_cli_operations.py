@@ -4,6 +4,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest import mock
 
@@ -145,7 +146,9 @@ class TerminalBindingTests(unittest.TestCase):
             "evidence": "windows-uia-unique-title-at-launch"}}
         frontend = {"pid": 30, "started_at": 300.0}
         success = subprocess.CompletedProcess([], 0, '{"associated": true}', "")
-        with mock.patch.object(close.terminal.os, "name", "nt"), \
+        with mock.patch.object(close.terminal, "os", SimpleNamespace(name="nt")), \
+                mock.patch.multiple(close.terminal.subprocess, DETACHED_PROCESS=8,
+                                    CREATE_NEW_PROCESS_GROUP=512, create=True), \
                 mock.patch.object(close.terminal.subprocess, "run", return_value=success) as run_probe:
             self.assertTrue(close.terminal._windows_console_association(frontend, identity))
         command = run_probe.call_args.args[0]
@@ -154,7 +157,7 @@ class TerminalBindingTests(unittest.TestCase):
                          command[3:8])
         self.assertTrue(run_probe.call_args.kwargs["creationflags"])
         negative = subprocess.CompletedProcess([], 2, '{"associated": false}', "")
-        with mock.patch.object(close.terminal.os, "name", "nt"), \
+        with mock.patch.object(close.terminal, "os", SimpleNamespace(name="nt")), \
                 mock.patch.object(close.terminal.subprocess, "run", return_value=negative):
             self.assertFalse(close.terminal._windows_console_association(frontend, identity))
 
