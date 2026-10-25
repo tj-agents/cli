@@ -10,6 +10,9 @@ sparse_paths = [".agents/plugins", ".claude-plugin", "plugins"]
 [plugins."agent-store@tj-agents"]
 enabled = true
 
+[plugins."agent@tj-agents"]
+enabled = true
+
 [plugins."base@tj-agents"]
 enabled = true
 

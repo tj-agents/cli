@@ -1,0 +1,15 @@
+{
+  "name": "cli",
+  "displayName": "CLI operations",
+  "description": "Deterministic CLI terminal and linked-worktree operations.",
+  "author": {
+    "name": "ThomasSeery"
+  },
+  "repository": "https://github.com/tj-agents/cli",
+  "skills": "./skills/",
+  "keywords": [
+    "cli",
+    "terminal",
+    "worktree"
+  ]
+}

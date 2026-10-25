@@ -8,6 +8,18 @@ with two everyday commands:
 | `cr` | Search your Claude Code or Codex sessions by **anything said in them**, preview how each one ended, and press Enter to resume it in the folder it was started from. |
 | `f` | Fuzzy-jump to a project folder. `f core` goes straight to the best match; plain `f` opens a picker. |
 
+## CLI skills
+
+The shared `tj-agents` marketplace also publishes `cli@tj-agents`:
+
+- [`cli:close`](.agents/cli/utility/close/SKILL.md) closes one explicit frontend and terminal tab, preserving its checkout.
+- [`cli:closeout`](.agents/cli/utility/closeout/SKILL.md) closes that exact target, then removes its separately verified clean, merged linked worktree.
+
+These skills use portable standard-library Python and explicit process, terminal and worktree identities.
+[Agent](https://github.com/tj-agents/agent) supplies session-aware target resolution. Native control supports
+Windows Terminal, tmux and Kitty; missing or ambiguous proof produces a refusal receipt. Windows Terminal
+must allow application title updates so the console-to-tab association can be verified.
+
 ## Install
 
 You need [fzf](https://github.com/junegunn/fzf) 0.54 or newer and either a Rust toolchain (to build) or the
