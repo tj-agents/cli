@@ -129,6 +129,86 @@ class CloseOperationTests(unittest.TestCase):
         close_exact.assert_called_once_with(self.target, receipt)
 
 
+class VerifiedProcessStopTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        if os.name != "nt" and not (sys.platform.startswith("linux") and hasattr(os, "pidfd_open")):
+            raise unittest.SkipTest("requires a supported held process handle")
+
+    def setUp(self):
+        self.processes = []
+        self.addCleanup(self._clean_processes)
+
+    def _clean_processes(self):
+        for process in self.processes:
+            if process.poll() is None:
+                process.terminate()
+                process.wait(timeout=5)
+
+    def _frontend(self):
+        process = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+        self.processes.append(process)
+        info = close.process_identity.process_info(process.pid)
+        self.assertIsNotNone(info)
+        return process, {"pid": info.pid, "started_at": info.started_at}
+
+    def _assert_preserved(self, frontend, sibling):
+        self.assertIsNotNone(frontend.poll())
+        self.assertIsNone(sibling.poll(), "sibling process was signalled")
+        self.assertTrue(close.process_identity.matches({
+            "pid": os.getpid(), "started_at": close.process_identity.process_info(os.getpid()).started_at,
+        }), "parent process changed")
+        self.assertTrue(ROOT.is_dir(), "checkout was removed")
+
+    def test_stops_only_the_disposable_frontend(self):
+        frontend, identity = self._frontend()
+        sibling, _sibling_identity = self._frontend()
+        close.process_identity.stop(identity, before_signal=lambda: None)
+        self._assert_preserved(frontend, sibling)
+
+    def test_wrong_birth_refuses_without_signalling_any_process(self):
+        frontend, identity = self._frontend()
+        sibling, _sibling_identity = self._frontend()
+        wrong_birth = {**identity, "started_at": identity["started_at"] + 1}
+        before_signal = mock.Mock()
+        with self.assertRaisesRegex(close.process_identity.Refusal, "identity changed"):
+            close.process_identity.stop(wrong_birth, before_signal=before_signal)
+        before_signal.assert_not_called()
+        self.assertIsNone(frontend.poll(), "wrong birth signalled the frontend")
+        self.assertIsNone(sibling.poll(), "wrong birth signalled the sibling")
+
+    def test_oversized_pid_refuses_before_guard_or_signal(self):
+        frontend, identity = self._frontend()
+        sibling, _sibling_identity = self._frontend()
+        oversized = {**identity, "pid": identity["pid"] + 2 ** 32}
+        before_signal = mock.Mock()
+        with self.assertRaisesRegex(close.process_identity.Refusal, "pid"):
+            close.process_identity.stop(oversized, before_signal=before_signal)
+        before_signal.assert_not_called()
+        self.assertIsNone(frontend.poll(), "oversized pid signalled the frontend")
+        self.assertIsNone(sibling.poll(), "oversized pid signalled the sibling")
+
+    def test_refusing_new_input_guard_preserves_the_frontend(self):
+        frontend, identity = self._frontend()
+        sibling, _sibling_identity = self._frontend()
+
+        def new_input():
+            raise close.process_identity.Refusal("frontend input changed")
+
+        with self.assertRaisesRegex(close.process_identity.Refusal, "input changed"):
+            close.process_identity.stop(identity, before_signal=new_input)
+        self.assertIsNone(frontend.poll(), "refusing guard signalled the frontend")
+        self.assertIsNone(sibling.poll(), "refusing guard signalled the sibling")
+
+    def test_raising_guard_preserves_the_frontend(self):
+        frontend, identity = self._frontend()
+        sibling, _sibling_identity = self._frontend()
+        with self.assertRaisesRegex(RuntimeError, "guard failed"):
+            close.process_identity.stop(identity, before_signal=lambda: (_ for _ in ()).throw(RuntimeError("guard failed")))
+        self.assertIsNone(frontend.poll(), "raising guard signalled the frontend")
+        self.assertIsNone(sibling.poll(), "raising guard signalled the sibling")
+
+
 class TerminalBindingTests(unittest.TestCase):
     def test_windows_runtime_ids_disambiguate_tabs_with_empty_automation_ids(self):
         values = [{"runtimeId": "42:100:2", "automationId": "", "processId": 77, "title": "same title"},
