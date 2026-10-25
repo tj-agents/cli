@@ -88,6 +88,14 @@ def _remote_base(worktree: Path, remote_base: str) -> tuple[str, str]:
     return reference, oid
 
 
+def _reject_hidden_index_flags(worktree: Path) -> None:
+    output = _git(worktree, "ls-files", "-v", "-z")
+    for record in output.split("\0"):
+        flag = record[:1]
+        if flag.islower() or flag in {"S", "s"}:
+            raise Refusal("target worktree has assume-unchanged or skip-worktree tracked files")
+
+
 def _require_eligibility(
     path: Path,
     worktree: Path,
@@ -135,6 +143,7 @@ def preflight(
         raise Refusal("target is absent, primary, or locked")
     if _git(worktree, "status", "--porcelain", "--ignored=matching", "--untracked-files=all"):
         raise Refusal("target worktree is dirty or has untracked or ignored local files")
+    _reject_hidden_index_flags(worktree)
     head = _git(worktree, "rev-parse", "HEAD")
     branch = _git(worktree, "symbolic-ref", "--quiet", "--short", "HEAD")
     if head != expected_head or branch != expected_branch:

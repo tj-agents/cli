@@ -139,6 +139,25 @@ class TerminalBindingTests(unittest.TestCase):
                 close.terminal.close(target)
         mutate.assert_not_called()
 
+    def test_windows_console_association_runs_isolated_probe_and_refuses_negative_result(self):
+        identity = {"kind": "windows-terminal", "tab_binding": {
+            "automation_id": "tab-b", "observed_title": "launch title",
+            "evidence": "windows-uia-unique-title-at-launch"}}
+        frontend = {"pid": 30, "started_at": 300.0}
+        success = subprocess.CompletedProcess([], 0, '{"associated": true}', "")
+        with mock.patch.object(close.terminal.os, "name", "nt"), \
+                mock.patch.object(close.terminal.subprocess, "run", return_value=success) as run_probe:
+            self.assertTrue(close.terminal._windows_console_association(frontend, identity))
+        command = run_probe.call_args.args[0]
+        self.assertEqual(sys.executable, command[0])
+        self.assertEqual(["--frontend-pid", "30", "--tab-id", "tab-b", "--inventory-adapter"],
+                         command[3:8])
+        self.assertTrue(run_probe.call_args.kwargs["creationflags"])
+        negative = subprocess.CompletedProcess([], 2, '{"associated": false}', "")
+        with mock.patch.object(close.terminal.os, "name", "nt"), \
+                mock.patch.object(close.terminal.subprocess, "run", return_value=negative):
+            self.assertFalse(close.terminal._windows_console_association(frontend, identity))
+
     def test_last_tmux_pane_accepts_only_verified_server_disappearance(self):
         result = subprocess.CompletedProcess(["tmux"], 0, "", "")
         with mock.patch.object(close.terminal, "verify_binding"), \
@@ -232,6 +251,31 @@ class CloseoutPreflightTests(unittest.TestCase):
             str(self.eligibility), "--receipt", str(receipt)])
         self.assertEqual(2, result)
         self.assertEqual("KEEP_ME", ignored.read_text(encoding="utf-8"))
+
+    def test_assume_unchanged_edit_refuses_initial_and_retry_without_removal(self):
+        hidden = self.linked / "feature.txt"
+        git(self.linked, "update-index", "--assume-unchanged", "feature.txt")
+        hidden.write_text("KEEP_HIDDEN_EDIT", encoding="utf-8")
+        target = self.primary.parent / "target.json"
+        receipt = self.primary.parent / "receipt.json"
+        target.write_text(json.dumps(self.target), encoding="utf-8")
+        with mock.patch.object(closeout.close, "close") as close_exact:
+            result = closeout.main(["run", "--target", str(target), "--worktree", str(self.linked),
+                "--expected-head", self.head, "--expected-branch", "feature", "--remote-base", "origin/main",
+                "--eligibility", str(self.eligibility), "--receipt", str(receipt)])
+        self.assertEqual(2, result)
+        close_exact.assert_not_called()
+        self.assertTrue(self.linked.exists())
+        self.assertEqual("KEEP_HIDDEN_EDIT", hidden.read_text(encoding="utf-8"))
+        receipt.write_text(json.dumps({"schema_version": 1, "operation": "cli-closeout",
+            "status": "closed-removal-failed", "target": self.target, "worktree": str(self.linked.resolve())}),
+            encoding="utf-8")
+        result = closeout.main(["retry-remove", "--worktree", str(self.linked), "--expected-head", self.head,
+            "--expected-branch", "feature", "--remote-base", "origin/main", "--eligibility",
+            str(self.eligibility), "--receipt", str(receipt)])
+        self.assertEqual(2, result)
+        self.assertTrue(self.linked.exists())
+        self.assertEqual("KEEP_HIDDEN_EDIT", hidden.read_text(encoding="utf-8"))
 
     def test_generated_closeout_entrypoints_reach_argument_parser(self):
         for relative in (".codex/skills/closeout/scripts/closeout.py",
