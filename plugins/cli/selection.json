@@ -3,12 +3,27 @@
   "dependencies": [],
   "profiles": {
     "core": [
+      "clip",
       "close",
       "closeout"
     ]
   },
   "compatibilitySkillAliases": {},
   "skills": [
+    {
+      "name": "clip",
+      "kind": "utility",
+      "profile": "core",
+      "applicability": [
+        "all projects"
+      ],
+      "requires": [
+        "python"
+      ],
+      "provenance": [
+        "house"
+      ]
+    },
     {
       "name": "close",
       "kind": "utility",
