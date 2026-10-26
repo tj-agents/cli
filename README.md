@@ -14,6 +14,7 @@ The shared `tj-agents` marketplace also publishes `cli@tj-agents`:
 
 - [`cli:close`](.agents/cli/utility/close/SKILL.md) closes one explicit frontend and terminal tab, preserving its checkout.
 - [`cli:closeout`](.agents/cli/utility/closeout/SKILL.md) closes that exact target, then removes its separately verified clean, merged linked worktree.
+- [`cli:clip`](.agents/cli/utility/clip/SKILL.md) puts text on the OS clipboard (Windows, Linux or macOS) so it can be pasted elsewhere.
 
 These skills use portable standard-library Python and explicit process, terminal and worktree identities.
 [Agent](https://github.com/tj-agents/agent) supplies session-aware target resolution. Native control supports
