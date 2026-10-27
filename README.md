@@ -130,6 +130,31 @@ differ, so only those are split into `linux/` and `windows/`.
 
 ## Development
 
+The repository also owns the `tj-cli` Python distribution under `packages/tj-cli/`.
+Its regular package groups reusable mechanics by capability; `tj_cli.paths` exposes
+literal executable-search PATH operations. Agent and Personal consume its public API:
+
+```python
+from tj_cli.paths import prepend
+
+child_entries = prepend(existing_entries, tools_directory)
+```
+
+The API keeps literal search locations and their order, including meaningful empty
+entries. Credential filtering belongs to the caller. Python development uses the
+repository's uv workspace:
+
+```text
+uv sync --locked
+uv run ruff format --check
+uv run ruff check
+uv run mypy
+uv run pytest
+uv build --package tj-cli
+```
+
+The Rust application remains in `src/`:
+
 ```bash
 cargo test
 cargo clippy --all-targets -- -D warnings
