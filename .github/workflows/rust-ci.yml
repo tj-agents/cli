@@ -57,10 +57,9 @@ jobs:
           if ($second -match '^(installed|updated|removed) ') { throw 'second install changed something' }
           windows/install.ps1 -BinDir $bin -Check
           if ($LASTEXITCODE) { exit 1 }
-          pwsh -Command "`$env:Path += ';$bin'; . `$PROFILE.CurrentUserAllHosts; Get-Command f, cr -ErrorAction Stop"
+          pwsh -Command "`$env:Path += ';$bin'; . `$PROFILE.CurrentUserAllHosts; Get-Command f, cr -ErrorAction Stop; if ((Get-Command f).Definition -notmatch '& tj\.exe f') { throw 'f does not invoke tj.exe' }"
           $profile = Get-Content -LiteralPath $PROFILE.CurrentUserAllHosts -Raw
           if ($profile -notmatch [regex]::Escape((Join-Path $bin 'tj.exe'))) { throw 'profile does not invoke the installed executable' }
-          if ((Get-Command f).Definition -notmatch '& tj\.exe f') { throw 'f does not invoke tj.exe' }
           windows/install.ps1 -BinDir $bin -Uninstall
           windows/install.ps1 -BinDir $bin -Check
           if (-not $LASTEXITCODE) { throw '--check passed after uninstall' }
