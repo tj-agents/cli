@@ -113,7 +113,8 @@ $profiles = @(Join-Path $documents 'PowerShell\profile.ps1')
 if ($PSVersionTable.PSEdition -eq 'Desktop' -or (Test-Path (Join-Path $documents 'WindowsPowerShell'))) {
     $profiles += Join-Path $documents 'WindowsPowerShell\profile.ps1'
 }
-$line = 'if (Get-Command tj -ErrorAction SilentlyContinue) { Invoke-Expression (& tj init pwsh | Out-String) }'
+$escapedTarget = $target.Replace("'", "''")
+$line = "if (Test-Path -LiteralPath '$escapedTarget') { Invoke-Expression (& '$escapedTarget' init pwsh | Out-String) }"
 foreach ($p in $profiles) { Set-Block $p $line }
 
 if (-not $Check -and -not $Uninstall) { ''; 'Done. Open a new terminal and try: f, cr' }
