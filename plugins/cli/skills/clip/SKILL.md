@@ -1,6 +1,6 @@
 ---
 name: clip
-description: Use when giving Tommy a command to run or text to paste, or when he asks to copy text. Not for GitHub review drafts.
+description: Put text on Tommy's clipboard. Use when giving Tommy a command to run or text to paste, or when he asks to copy text. Not for GitHub review drafts.
 kind: utility
 domain: cli
 route: infer
