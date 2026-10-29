@@ -1,7 +1,7 @@
 ---
 name: closeout
 description: Close one explicitly identified CLI target and then remove its explicitly eligible linked worktree. Use when external workflow evidence has already proved a worktree safe to remove.
-kind: utility
+kind: operation
 domain: cli
 route: infer
 profile: core

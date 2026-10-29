@@ -1,0 +1,21 @@
+name: structure-qualification
+
+on:
+  pull_request:
+  push:
+    branches: [Refactor/SubjectSkillLayout]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  qualify:
+    uses: tj-agents/template/.github/workflows/plugin-ci.yml@9b64b05252d6dff684ae3cd2a4a4850bb356f3b5
+    with:
+      template_ref: 9b64b05252d6dff684ae3cd2a4a4850bb356f3b5
+    secrets:
+      read_token: ${{ secrets.TJ_AGENTS_READ_TOKEN }}

@@ -1,7 +1,7 @@
 ---
 name: clip
 description: Put text on Tommy's clipboard (Windows, Linux or macOS) so he can paste it straight into Teams, an email or a terminal instead of drag-selecting it out of the transcript. Use when drafting a message for someone to paste, and whenever he says "copy that", "put that on my clipboard", "clip that". NOT for GitHub review comments — review drafts are previewed in the reply and posted from here, never pasted. Applies in every repo, personal and work.
-kind: utility
+kind: operation
 domain: cli
 route: infer
 profile: core
@@ -24,7 +24,7 @@ or `python` on Windows:
 python3 '<skill-directory>/scripts/copy_draft.py' --path '<absolute-path-to-file>'
 ```
 
-`copy_draft.py` sits beside this file.
+`copy_draft.py` is in this skill's `scripts/` directory.
 
 The script reads UTF-8, trims trailing blank lines, copies, and reads the clipboard back to verify —
 it exits non-zero rather than reporting a success it did not achieve. It prints the character count;

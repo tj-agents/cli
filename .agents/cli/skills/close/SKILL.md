@@ -1,7 +1,7 @@
 ---
 name: close
 description: Close one explicitly identified CLI frontend and terminal tab while retaining its worktree. Use when a caller supplies the exact process and terminal identities to close.
-kind: utility
+kind: operation
 domain: cli
 route: infer
 profile: core
