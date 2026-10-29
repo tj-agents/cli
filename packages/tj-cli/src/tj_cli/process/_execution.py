@@ -6,6 +6,7 @@ import subprocess
 import sys
 from collections.abc import Sequence
 from contextlib import suppress
+from pathlib import Path
 from typing import Any
 
 
@@ -18,7 +19,7 @@ def spawn(
         raise ValueError("hidden processes require an explicit executable")
     if "executable" in options:
         raise ValueError("the executable belongs in the command")
-    launcher = shutil.which("tj_hook")
+    launcher = _launcher()
     if launcher is None:
         raise FileNotFoundError("tj_hook is not installed on PATH")
     if sys.platform == "win32":
@@ -36,6 +37,19 @@ def spawn(
             )
         options["creationflags"] = flags | subprocess.CREATE_NO_WINDOW
     return subprocess.Popen([launcher, "--", *command], **options)
+
+
+def _launcher() -> str | None:
+    launcher = None
+    if sys.platform == "win32":
+        for directory in os.get_exec_path():
+            candidate = Path(directory).absolute() / "tj_hook.exe"
+            if shutil.which(candidate) is not None:
+                launcher = str(candidate)
+                break
+    else:
+        launcher = shutil.which("tj_hook")
+    return launcher
 
 
 def run(

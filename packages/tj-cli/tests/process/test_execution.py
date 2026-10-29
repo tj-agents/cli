@@ -61,6 +61,22 @@ def test_run_requires_installed_launcher(monkeypatch: pytest.MonkeyPatch) -> Non
         process.run([sys.executable, "-c", "pass"])
 
 
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows executable search")
+def test_launcher_comes_from_path_without_implicit_current_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "tj_hook.exe").write_bytes(b"not an executable")
+    monkeypatch.chdir(tmp_path)
+    result = process.run(
+        [sys.executable, "-c", "print('installed launcher')"],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "installed launcher\n"
+
+
 def test_spawn_rejects_implicit_shell() -> None:
     with pytest.raises(ValueError, match="explicit executable"):
         process.spawn([sys.executable], shell=True)
