@@ -73,8 +73,7 @@ where wrapping and indentation get baked in, and it silently breaks a long comma
 the same failure that put a line break into a Teams message mid-sentence.
 
 Use `--plain-only` for a command: no HTML flavour, and backticks stay literal because in a shell they
-are syntax, not markup. Show the command in your reply too so he can read it, but the clipboard copy
-is the one he runs.
+are syntax, not markup.
 
 Do not invent a wrapper script to dodge the problem — the clipboard already solves it, and a
 throwaway script file is machinery he then has to clean up. Write a script only when the thing is
