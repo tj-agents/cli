@@ -84,6 +84,32 @@ def test_run_inherits_default_standard_streams() -> None:
     assert result.stderr == "diagnostic"
 
 
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows explicit shell")
+def test_run_explicit_cmd_command_string() -> None:
+    result = process.run(
+        ["cmd.exe", "/d", "/c", 'echo "hello world" & exit /b 7'],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 7, result.stderr
+    assert result.stdout.strip() == '"hello world"'
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows batch commands")
+def test_run_explicit_cmd_batch_with_spaces(tmp_path: Path) -> None:
+    script = tmp_path / "hook with spaces.cmd"
+    script.write_text("@echo off\necho %~1\nexit /b 9\n", encoding="utf-8")
+    result = process.run(
+        ["cmd.exe", "/d", "/s", "/c", str(script), "two words"],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 9, result.stderr
+    assert result.stdout == "two words\n"
+
+
 def _alive(pid: int) -> bool:
     if sys.platform == "win32":
         kernel = ctypes.WinDLL("kernel32", use_last_error=True)
