@@ -4,16 +4,17 @@ from __future__ import annotations
 
 import argparse
 import ctypes
-from ctypes import wintypes
 import json
-from pathlib import Path
 import subprocess
 import sys
 import time
 import uuid
+from ctypes import wintypes
+from pathlib import Path
+from typing import Any
 
 
-def _title(kernel32: object) -> str:
+def _title(kernel32: ctypes.CDLL) -> str:
     buffer = ctypes.create_unicode_buffer(32768)
     length = kernel32.GetConsoleTitleW(buffer, len(buffer))
     if not length:
@@ -21,7 +22,7 @@ def _title(kernel32: object) -> str:
     return buffer.value
 
 
-def _processes(kernel32: object) -> set[int]:
+def _processes(kernel32: ctypes.CDLL) -> set[int]:
     size = 16
     while size <= 4096:
         values = (wintypes.DWORD * size)()
@@ -34,12 +35,28 @@ def _processes(kernel32: object) -> set[int]:
     raise OSError("console process list is unexpectedly large")
 
 
-def _inventory(adapter: Path) -> list[dict]:
-    result = subprocess.run(["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
-                             str(adapter), "-Json"], stdin=subprocess.DEVNULL, capture_output=True,
-                            text=True, encoding="utf-8", timeout=3, check=False)
+def _inventory(adapter: Path) -> list[dict[str, Any]]:
+    result = subprocess.run(
+        [
+            "powershell.exe",
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(adapter),
+            "-Json",
+        ],
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        timeout=3,
+        check=False,
+    )
     if result.returncode:
-        raise OSError(result.stderr or result.stdout or "Windows Terminal inventory failed")
+        raise OSError(
+            result.stderr or result.stdout or "Windows Terminal inventory failed"
+        )
     value = json.loads(result.stdout or "[]")
     if not isinstance(value, list):
         raise OSError("Windows Terminal inventory is malformed")
@@ -59,8 +76,11 @@ def prove(frontend_pid: int, tab_id: str, adapter: Path) -> bool:
         if not kernel32.SetConsoleTitleW(challenge):
             raise OSError(ctypes.get_last_error(), "SetConsoleTitleW failed")
         time.sleep(0.1)
-        matches = [item for item in _inventory(adapter)
-                   if item.get("runtimeId") == tab_id and item.get("title") == challenge]
+        matches = [
+            item
+            for item in _inventory(adapter)
+            if item.get("runtimeId") == tab_id and item.get("title") == challenge
+        ]
         return len(matches) == 1
     finally:
         kernel32.SetConsoleTitleW(original)
