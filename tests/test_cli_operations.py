@@ -60,17 +60,21 @@ class CloseOperationTests(unittest.TestCase):
         completion = self.directory / "completion.json"
         cancel = self.directory / "cancel.json"
         cancel.write_text("cancel", encoding="utf-8")
-        command = [sys.executable, "-I", "-B", str(Path(close.__file__).with_name("_close_entry.py")),
-                   "watch", "--target-json", json.dumps(self.target),
-                   "--armed-at", str(__import__("time").time()), "--receipt", str(receipt),
-                   "--completion", str(completion), "--completion-token", "token",
-                   "--cancel", str(cancel), "--delay", "0", "--timeout", "1"]
+        for entry in (Path(close.__file__).with_name("_close_entry.py"),
+                      ROOT / "plugins/cli/python/tj_cli/_close_entry.py"):
+            with self.subTest(entry=str(entry)):
+                command = [sys.executable, "-I", "-B", str(entry),
+                           "watch", "--target-json", json.dumps(self.target),
+                           "--armed-at", str(__import__("time").time()), "--receipt", str(receipt),
+                           "--completion", str(completion), "--completion-token", "token",
+                           "--cancel", str(cancel), "--delay", "0", "--timeout", "1"]
 
-        result = subprocess.run(command, cwd=self.directory, capture_output=True, text=True,
-                                encoding="utf-8", timeout=10, check=False)
+                result = subprocess.run(command, cwd=self.directory, capture_output=True, text=True,
+                                        encoding="utf-8", timeout=10, check=False)
 
-        self.assertEqual(0, result.returncode, result.stderr)
-        self.assertEqual("cancelled", json.loads(receipt.read_text(encoding="utf-8"))["status"])
+                self.assertEqual(0, result.returncode, result.stderr)
+                self.assertEqual("cancelled", json.loads(receipt.read_text(encoding="utf-8"))["status"])
+
 
     def test_close_refusal_writes_durable_receipt_without_process_signal(self):
         receipt = self.directory / "receipt.json"

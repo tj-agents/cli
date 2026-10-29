@@ -14,8 +14,8 @@ concurrency:
 
 jobs:
   qualify:
-    uses: tj-agents/template/.github/workflows/plugin-ci.yml@9b64b05252d6dff684ae3cd2a4a4850bb356f3b5
+    uses: tj-agents/template/.github/workflows/plugin-ci.yml@7583dede1853a92451abebf5742385a99b97d9a8
     with:
-      template_ref: 9b64b05252d6dff684ae3cd2a4a4850bb356f3b5
+      template_ref: 7583dede1853a92451abebf5742385a99b97d9a8
     secrets:
       read_token: ${{ secrets.TJ_AGENTS_READ_TOKEN }}

@@ -166,7 +166,7 @@ def arm(args: argparse.Namespace) -> int:
         sys.executable,
         "-I",
         "-B",
-        str(Path(__file__).parent / "commands/close.py"),
+        str(Path(__file__).with_name("_close_entry.py")),
         "watch",
         "--target-json",
         frozen_target,
