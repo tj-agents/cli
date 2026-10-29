@@ -230,6 +230,25 @@ def test_run_classifies_cmd_executable_aliases(tmp_path: Path, suffix: str) -> N
     assert not marker.exists()
 
 
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows App Execution Aliases")
+@pytest.mark.parametrize("name", ["py.exe", "winget.exe"])
+def test_run_preserves_registered_app_execution_aliases(name: str) -> None:
+    if sys.platform == "win32":
+        alias = Path(os.environ["LOCALAPPDATA"]) / "Microsoft" / "WindowsApps" / name
+        if not alias.is_file() or alias.lstat().st_reparse_tag != 0x8000001B:
+            pytest.skip(f"{name} is not registered as an App Execution Alias")
+        expected = subprocess.run(
+            [str(alias), "--version"],
+            capture_output=True,
+            timeout=30,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+        actual = process.run([str(alias), "--version"], capture_output=True, timeout=30)
+        assert actual.returncode == expected.returncode == 0
+        assert actual.stdout == expected.stdout
+        assert actual.stderr == expected.stderr
+
+
 def _alive(pid: int) -> bool:
     if sys.platform == "win32":
         kernel = ctypes.WinDLL("kernel32", use_last_error=True)
