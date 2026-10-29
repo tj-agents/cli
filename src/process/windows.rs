@@ -91,12 +91,17 @@ fn command_line(arguments: &[OsString]) -> io::Result<Vec<u16>> {
 }
 
 fn shell_command_line(arguments: &[OsString]) -> io::Result<Vec<u16>> {
-    let Some(mode) = arguments
+    let Some(mode) = arguments[1..]
         .iter()
         .position(|argument| argument.eq_ignore_ascii_case("/c") || argument.eq_ignore_ascii_case("/k"))
+        .map(|offset| offset + 1)
     else {
-        return command_line(arguments);
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "cmd.exe requires a separate /c or /k switch"));
     };
+    let options = ["/d", "/s", "/q", "/a", "/u", "/e:on", "/e:off", "/f:on", "/f:off", "/v:on", "/v:off"];
+    if arguments[1..mode].iter().any(|argument| !options.iter().any(|option| argument.eq_ignore_ascii_case(option))) {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "cmd.exe options must be separate supported switches"));
+    }
     let (prefix, script) = arguments.split_at(mode + 1);
     if script.len() != 1 {
         return Err(io::Error::new(
