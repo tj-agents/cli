@@ -202,6 +202,17 @@ def test_run_timeout_kills_linux_descendant(tmp_path: Path) -> None:
     assert not _alive(pid)
 
 
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux timeout partial bytes")
+def test_run_timeout_retains_incomplete_utf8() -> None:
+    command = ["/bin/sh", "-c", r"printf '\342'; printf '\342' >&2; sleep 60"]
+    with pytest.raises(subprocess.TimeoutExpired) as caught:
+        process.run(
+            command, capture_output=True, text=True, encoding="utf-8", timeout=1
+        )
+    assert caught.value.stdout == b"\xe2"
+    assert caught.value.stderr == b"\xe2"
+
+
 @pytest.mark.skipif(os.name != "nt", reason="Windows console visibility")
 def test_hook_and_unmodified_descendant_inherit_hidden_console() -> None:
     probe = (

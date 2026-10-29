@@ -62,16 +62,19 @@ def run(
             stdout, stderr = process.communicate(input_data, timeout=timeout)
         except subprocess.TimeoutExpired as error:
             _kill_tree(process)
-            stdout, stderr = process.communicate()
             error.cmd = command
-            encoding = options.get("encoding") or locale.getpreferredencoding(False)
-            errors = options.get("errors") or "strict"
-            error.output = _timeout_output(stdout, encoding, errors)
-            error.stderr = _timeout_output(stderr, encoding, errors)
+            if sys.platform == "win32":
+                stdout, stderr = process.communicate()
+                encoding = options.get("encoding") or locale.getpreferredencoding(False)
+                errors = options.get("errors") or "strict"
+                error.output = _timeout_output(stdout, encoding, errors)
+                error.stderr = _timeout_output(stderr, encoding, errors)
+            else:
+                process.wait()
             raise
         except BaseException:
             _kill_tree(process)
-            process.communicate()
+            process.wait()
             raise
         result = subprocess.CompletedProcess(
             command, process.returncode, stdout, stderr
