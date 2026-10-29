@@ -2,6 +2,7 @@ use std::ffi::OsString;
 use std::io;
 
 #[cfg(windows)]
+#[allow(unsafe_code)]
 mod windows;
 
 pub fn run(arguments: &[OsString]) -> io::Result<u32> {
