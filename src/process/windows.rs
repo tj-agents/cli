@@ -98,13 +98,16 @@ fn shell_command_line(arguments: &[OsString]) -> io::Result<Vec<u16>> {
         return command_line(arguments);
     };
     let (prefix, script) = arguments.split_at(mode + 1);
-    if script.is_empty() {
-        return command_line(arguments);
+    if script.len() != 1 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "cmd.exe /c and /k require exactly one complete command string",
+        ));
     }
     let mut command = command_line(prefix)?;
     command.pop();
     command.extend([u16::from(b' '), u16::from(b'"')]);
-    let script = if script.len() == 1 { wide(&script[0])? } else { command_line(script)? };
+    let script = wide(&script[0])?;
     command.extend_from_slice(&script[..script.len() - 1]);
     command.extend([u16::from(b'"'), 0]);
     Ok(command)
