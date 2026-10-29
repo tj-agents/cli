@@ -6,7 +6,7 @@ use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::ptr::{null, null_mut};
 
 use windows_sys::Win32::Foundation::{
-    DUPLICATE_SAME_ACCESS, DuplicateHandle, HANDLE, INVALID_HANDLE_VALUE, WAIT_FAILED,
+    DUPLICATE_SAME_ACCESS, DuplicateHandle, ERROR_CANT_ACCESS_FILE, HANDLE, INVALID_HANDLE_VALUE, WAIT_FAILED,
 };
 use windows_sys::Win32::System::Console::{GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE};
 use windows_sys::Win32::System::JobObjects::{
@@ -138,8 +138,12 @@ fn raw(handle: &Option<OwnedHandle>) -> HANDLE {
 }
 
 pub(super) fn run(arguments: &[OsString]) -> io::Result<u32> {
-    let executable =
-        which::which(&arguments[0]).map_err(|error| io::Error::new(io::ErrorKind::NotFound, error))?.canonicalize()?;
+    let executable = which::which(&arguments[0]).map_err(|error| io::Error::new(io::ErrorKind::NotFound, error))?;
+    let executable = match executable.canonicalize() {
+        Ok(path) => path,
+        Err(error) if error.raw_os_error() == Some(ERROR_CANT_ACCESS_FILE as i32) => std::path::absolute(executable)?,
+        Err(error) => return Err(error),
+    };
     if executable
         .extension()
         .is_some_and(|extension| extension.eq_ignore_ascii_case("cmd") || extension.eq_ignore_ascii_case("bat"))
