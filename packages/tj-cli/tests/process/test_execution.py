@@ -66,6 +66,24 @@ def test_spawn_rejects_implicit_shell() -> None:
         process.spawn([sys.executable], shell=True)
 
 
+def test_run_inherits_default_standard_streams() -> None:
+    child = "import sys; print(sys.stdin.read()); sys.stderr.write('diagnostic')"
+    driver = (
+        "import sys; from tj_cli import process; "
+        f"sys.exit(process.run([sys.executable,'-c',{child!r}]).returncode)"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", driver],
+        input="event",
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "event\n"
+    assert result.stderr == "diagnostic"
+
+
 def _alive(pid: int) -> bool:
     if sys.platform == "win32":
         kernel = ctypes.WinDLL("kernel32", use_last_error=True)
