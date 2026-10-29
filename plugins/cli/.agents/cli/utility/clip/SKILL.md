@@ -1,6 +1,6 @@
 ---
 name: clip
-description: Put text on Tommy's clipboard (Windows, Linux or macOS) so he can paste it straight into Teams, an email or a terminal instead of drag-selecting it out of the transcript. Use when drafting a message for someone to paste, and whenever he says "copy that", "put that on my clipboard", "clip that". NOT for GitHub review comments — review drafts are previewed in the reply and posted from here, never pasted. Applies in every repo, personal and work.
+description: Put text on Tommy's clipboard. Use when giving Tommy a command to run or text to paste, or when he asks to copy text. Not for GitHub review drafts.
 kind: utility
 domain: cli
 route: infer
@@ -73,8 +73,7 @@ where wrapping and indentation get baked in, and it silently breaks a long comma
 the same failure that put a line break into a Teams message mid-sentence.
 
 Use `--plain-only` for a command: no HTML flavour, and backticks stay literal because in a shell they
-are syntax, not markup. Show the command in your reply too so he can read it, but the clipboard copy
-is the one he runs.
+are syntax, not markup.
 
 Do not invent a wrapper script to dodge the problem — the clipboard already solves it, and a
 throwaway script file is machinery he then has to clean up. Write a script only when the thing is

@@ -1,6 +1,6 @@
 ---
 name: clip
-description: Put text on Tommy's clipboard (Windows, Linux or macOS) so he can paste it straight into Teams, an email or a terminal instead of drag-selecting it out of the transcript. Use when drafting a message for someone to paste, and whenever he says "copy that", "put that on my clipboard", "clip that". NOT for GitHub review comments — review drafts are previewed in the reply and posted from here, never pasted. Applies in every repo, personal and work.
+description: Put text on Tommy's clipboard. Use when giving Tommy a command to run or text to paste, or when he asks to copy text. Not for GitHub review drafts.
 kind: utility
 domain: cli
 route: infer

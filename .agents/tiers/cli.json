@@ -1,9 +1,6 @@
 {
-  "schema_version": 1,
   "tier": "cli",
   "stack": "any project",
   "applies": "always",
-  "owner_repository": [
-    "tj-agents/cli"
-  ]
+  "session_context": "Whenever you give Tommy a command to run or text to paste, use `cli:clip`; use `--plain-only` for commands. Clipboard mechanics belong to `cli:clip`."
 }
