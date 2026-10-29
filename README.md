@@ -155,6 +155,10 @@ the Python wheel alone does not install the native binaries. A missing launcher 
 explicitly. `run` owns a separate process session on Linux and kills that process group
 on timeout or interruption. `spawn` returns a `Popen` handle for callers managing its
 lifetime themselves. Timeout and nonzero-exit errors identify the requested command.
+
+Both functions accept typed options for standard streams, working directory, environment,
+text encoding, buffering and process creation. Unknown options fail before launch.
+`run` additionally supports input, output capture, timeout and exit-status checking.
 Shell commands require an explicit shell executable. For `cmd.exe`, `/c` and `/k`
 require exactly one complete command string, preserving its shell syntax and quotes.
 Separate command arguments are rejected.
