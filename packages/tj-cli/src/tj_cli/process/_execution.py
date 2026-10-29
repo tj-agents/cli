@@ -22,6 +22,13 @@ def spawn(
     if launcher is None:
         raise FileNotFoundError("tj_hook is not installed on PATH")
     if sys.platform == "win32":
+        if all(options.get(stream) is None for stream in ("stdin", "stdout", "stderr")):
+            try:
+                os.fstat(0)
+            except OSError:
+                options["stdin"] = subprocess.DEVNULL
+            else:
+                options["stdin"] = 0
         flags = options.pop("creationflags", 0)
         if flags & (subprocess.CREATE_NEW_CONSOLE | subprocess.DETACHED_PROCESS):
             raise ValueError(
