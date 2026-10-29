@@ -62,9 +62,14 @@ fn command_line(arguments: &[OsString]) -> io::Result<Vec<u16>> {
         if index > 0 {
             command.push(u16::from(b' '));
         }
-        command.push(u16::from(b'"'));
+        let argument = wide(argument)?;
+        let argument = &argument[..argument.len() - 1];
+        let quoted = argument.is_empty() || argument.contains(&u16::from(b' ')) || argument.contains(&u16::from(b'\t'));
+        if quoted {
+            command.push(u16::from(b'"'));
+        }
         let mut backslashes = 0;
-        for character in wide(argument)?.into_iter().take(argument.encode_wide().count()) {
+        for &character in argument {
             if character == u16::from(b'\\') {
                 backslashes += 1;
                 continue;
@@ -76,10 +81,32 @@ fn command_line(arguments: &[OsString]) -> io::Result<Vec<u16>> {
             backslashes = 0;
             command.push(character);
         }
-        command.extend(std::iter::repeat_n(u16::from(b'\\'), backslashes * 2));
-        command.push(u16::from(b'"'));
+        command.extend(std::iter::repeat_n(u16::from(b'\\'), if quoted { backslashes * 2 } else { backslashes }));
+        if quoted {
+            command.push(u16::from(b'"'));
+        }
     }
     command.push(0);
+    Ok(command)
+}
+
+fn shell_command_line(arguments: &[OsString]) -> io::Result<Vec<u16>> {
+    let Some(mode) = arguments
+        .iter()
+        .position(|argument| argument.eq_ignore_ascii_case("/c") || argument.eq_ignore_ascii_case("/k"))
+    else {
+        return command_line(arguments);
+    };
+    let (prefix, script) = arguments.split_at(mode + 1);
+    if script.is_empty() {
+        return command_line(arguments);
+    }
+    let mut command = command_line(prefix)?;
+    command.pop();
+    command.extend([u16::from(b' '), u16::from(b'"')]);
+    let script = if script.len() == 1 { wide(&script[0])? } else { command_line(script)? };
+    command.extend_from_slice(&script[..script.len() - 1]);
+    command.extend([u16::from(b'"'), 0]);
     Ok(command)
 }
 
@@ -110,8 +137,12 @@ pub(super) fn run(arguments: &[OsString]) -> io::Result<u32> {
     {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "batch files require an explicit cmd.exe command"));
     }
+    let mut command = if executable.file_name().is_some_and(|name| name.eq_ignore_ascii_case("cmd.exe")) {
+        shell_command_line(arguments)?
+    } else {
+        command_line(arguments)?
+    };
     let executable = wide(executable.as_os_str())?;
-    let mut command = command_line(arguments)?;
     let stdin = inherited_handle(STD_INPUT_HANDLE)?;
     let stdout = inherited_handle(STD_OUTPUT_HANDLE)?;
     let stderr = inherited_handle(STD_ERROR_HANDLE)?;

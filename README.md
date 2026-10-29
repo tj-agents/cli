@@ -155,7 +155,8 @@ the Python wheel alone does not install the native binaries. A missing launcher 
 explicitly. `run` owns a separate process session on Linux and kills that process group
 on timeout or interruption. `spawn` returns a `Popen` handle for callers managing its
 lifetime themselves. Timeout and nonzero-exit errors identify the requested command.
-Shell commands require an explicit shell executable.
+Shell commands require an explicit shell executable. For `cmd.exe`, `/c` or `/k`
+followed by one command string preserves its shell syntax and quotes.
 
 Hooks must use the launcher as their executable. A host-created shell runs before the
 launcher, so its visibility must also be controlled by the host. Code that explicitly
