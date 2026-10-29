@@ -1,12 +1,6 @@
 {
-  "extraKnownMarketplaces": {
-    "tj-agents": {
-      "source": {
-        "source": "github",
-        "repo": "tj-agents/marketplace"
-      },
-      "autoUpdate": true
-    }
+  "permissions": {
+    "allow": []
   },
   "enabledPlugins": {
     "agent-store@tj-agents": true,
@@ -18,10 +12,17 @@
     "personal@tj-agents": true,
     "python@tj-agents": true,
     "rust@tj-agents": true,
+    "skill@tj-agents": true,
     "template@tj-agents": true,
     "workflow@tj-agents": true
   },
-  "permissions": {
-    "allow": []
+  "extraKnownMarketplaces": {
+    "tj-agents": {
+      "source": {
+        "source": "github",
+        "repo": "tj-agents/marketplace"
+      },
+      "autoUpdate": true
+    }
   }
 }

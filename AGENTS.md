@@ -11,6 +11,8 @@ Read `README.md` first; it owns usage, install and the source layout.
   `tests/fixtures/`.
 - Bump `INDEX_VERSION` in `src/cr/index.rs` whenever parsing or rendering changes what is stored.
 - Before committing: `cargo fmt`, `cargo clippy --all-targets -- -D warnings`, `cargo test`.
+- Apply the selected `rust@tj-agents` standards. The approved exception permits unsafe Win32 calls only in
+  `src/process/windows.rs`; every other Rust module denies unsafe code.
 
 <!-- BEGIN personal:rules sha256:eee7a719bb90e67aaa81ac101a45836dd099bc745fee61216c99ec7d6075f12d -->
 # Personal rules
