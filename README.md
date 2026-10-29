@@ -159,7 +159,7 @@ Shell commands require an explicit shell executable. For `cmd.exe`, `/c` and `/k
 require exactly one complete command string, preserving its shell syntax and quotes.
 Separate command arguments are rejected.
 The mode must be a separate switch. Supported preceding switches are `/d`, `/s`,
-`/q`, `/a`, `/u`, `/e:on`, `/e:off`, `/f:on`, `/f:off`, `/v:on` and `/v:off`.
+`/q`, `/a`, `/u`, `/E:ON`, `/E:OFF`, `/F:ON`, `/F:OFF`, `/V:ON` and `/V:OFF`.
 
 Hooks must use the launcher as their executable. A host-created shell runs before the
 launcher, so its visibility must also be controlled by the host. Code that explicitly
