@@ -2,15 +2,20 @@
 
 from __future__ import annotations
 
-import collections
 import contextlib
 import math
 import os
 import sys
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, NamedTuple
 
-ProcessInfo = collections.namedtuple("ProcessInfo", "pid ppid started_at")
+
+class ProcessInfo(NamedTuple):
+    pid: int
+    ppid: int
+    started_at: float
+
+
 TOLERANCE_SECONDS = 0.01
 MAXIMUM_PID = 0xFFFFFFFF
 
