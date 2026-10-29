@@ -2,15 +2,20 @@
 
 from __future__ import annotations
 
-import collections
+import contextlib
 import math
 import os
-from pathlib import Path
-import subprocess
 import sys
-from typing import Callable
+from pathlib import Path
+from typing import Any, Callable, NamedTuple
 
-ProcessInfo = collections.namedtuple("ProcessInfo", "pid ppid started_at")
+
+class ProcessInfo(NamedTuple):
+    pid: int
+    ppid: int
+    started_at: float
+
+
 TOLERANCE_SECONDS = 0.01
 MAXIMUM_PID = 0xFFFFFFFF
 
@@ -35,13 +40,16 @@ def _linux_process(pid: int) -> ProcessInfo | None:
     end = text.rfind(")")
     if end < 0:
         raise Refusal("malformed Linux process identity")
-    fields = text[end + 2:].split()
+    fields = text[end + 2 :].split()
     if fields and fields[0] in {"Z", "X", "x"}:
         return None
     try:
         ppid = int(fields[1])
         ticks = int(fields[19])
-        rate = os.sysconf("SC_CLK_TCK")
+        sysconf = getattr(os, "sysconf", None)
+        if not callable(sysconf):
+            raise Refusal("Linux process identity requires sysconf")
+        rate = int(sysconf("SC_CLK_TCK"))
     except (IndexError, ValueError, OSError) as error:
         raise Refusal("malformed Linux process identity") from error
     return ProcessInfo(pid, ppid, _linux_boot_time() + ticks / rate)
@@ -55,8 +63,11 @@ def _windows_process(pid: int) -> ProcessInfo | None:
     kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
     kernel32.OpenProcess.restype = wintypes.HANDLE
     kernel32.GetProcessTimes.argtypes = [
-        wintypes.HANDLE, ctypes.POINTER(wintypes.FILETIME), ctypes.POINTER(wintypes.FILETIME),
-        ctypes.POINTER(wintypes.FILETIME), ctypes.POINTER(wintypes.FILETIME),
+        wintypes.HANDLE,
+        ctypes.POINTER(wintypes.FILETIME),
+        ctypes.POINTER(wintypes.FILETIME),
+        ctypes.POINTER(wintypes.FILETIME),
+        ctypes.POINTER(wintypes.FILETIME),
     ]
     kernel32.GetProcessTimes.restype = wintypes.BOOL
     kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
@@ -72,7 +83,11 @@ def _windows_process(pid: int) -> ProcessInfo | None:
         kernel = wintypes.FILETIME()
         user = wintypes.FILETIME()
         if not kernel32.GetProcessTimes(
-            handle, ctypes.byref(creation), ctypes.byref(exited), ctypes.byref(kernel), ctypes.byref(user)
+            handle,
+            ctypes.byref(creation),
+            ctypes.byref(exited),
+            ctypes.byref(kernel),
+            ctypes.byref(user),
         ):
             return None
         ticks = (creation.dwHighDateTime << 32) | creation.dwLowDateTime
@@ -83,20 +98,33 @@ def _windows_process(pid: int) -> ProcessInfo | None:
         kernel32.CloseHandle(handle)
 
     class PROCESSENTRY32W(ctypes.Structure):
-        _fields_ = [("dwSize", wintypes.DWORD), ("cntUsage", wintypes.DWORD),
-                    ("th32ProcessID", wintypes.DWORD), ("th32DefaultHeapID", ctypes.c_void_p),
-                    ("th32ModuleID", wintypes.DWORD), ("cntThreads", wintypes.DWORD),
-                    ("th32ParentProcessID", wintypes.DWORD), ("pcPriClassBase", ctypes.c_long),
-                    ("dwFlags", wintypes.DWORD), ("szExeFile", ctypes.c_wchar * 260)]
+        _fields_ = [
+            ("dwSize", wintypes.DWORD),
+            ("cntUsage", wintypes.DWORD),
+            ("th32ProcessID", wintypes.DWORD),
+            ("th32DefaultHeapID", ctypes.c_void_p),
+            ("th32ModuleID", wintypes.DWORD),
+            ("cntThreads", wintypes.DWORD),
+            ("th32ParentProcessID", wintypes.DWORD),
+            ("pcPriClassBase", ctypes.c_long),
+            ("dwFlags", wintypes.DWORD),
+            ("szExeFile", ctypes.c_wchar * 260),
+        ]
 
     snapshot = kernel32.CreateToolhelp32Snapshot(0x00000002, 0)
     if not snapshot or ctypes.c_ssize_t(snapshot).value == -1:
         return None
     entry = PROCESSENTRY32W()
     entry.dwSize = ctypes.sizeof(entry)
-    kernel32.Process32FirstW.argtypes = [wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W)]
+    kernel32.Process32FirstW.argtypes = [
+        wintypes.HANDLE,
+        ctypes.POINTER(PROCESSENTRY32W),
+    ]
     kernel32.Process32FirstW.restype = wintypes.BOOL
-    kernel32.Process32NextW.argtypes = [wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W)]
+    kernel32.Process32NextW.argtypes = [
+        wintypes.HANDLE,
+        ctypes.POINTER(PROCESSENTRY32W),
+    ]
     kernel32.Process32NextW.restype = wintypes.BOOL
     try:
         if not kernel32.Process32FirstW(snapshot, ctypes.byref(entry)):
@@ -125,8 +153,13 @@ def valid_identity(value: object) -> tuple[int, float]:
     if not isinstance(value, dict):
         raise Refusal("process identity must be an object")
     pid, started = value.get("pid"), value.get("started_at")
-    if (not isinstance(pid, int) or pid <= 0 or pid > MAXIMUM_PID
-            or not isinstance(started, (int, float)) or started <= 0):
+    if (
+        not isinstance(pid, int)
+        or pid <= 0
+        or pid > MAXIMUM_PID
+        or not isinstance(started, (int, float))
+        or started <= 0
+    ):
         raise Refusal("process identity needs positive pid and started_at")
     return pid, float(started)
 
@@ -137,7 +170,9 @@ def matches(identity: object) -> bool:
     return actual is not None and abs(actual.started_at - started) <= TOLERANCE_SECONDS
 
 
-def require_live(identity: object, message: str = "process identity changed") -> ProcessInfo:
+def require_live(
+    identity: object, message: str = "process identity changed"
+) -> ProcessInfo:
     pid, _started = valid_identity(identity)
     actual = process_info(pid)
     if actual is None or not matches(identity):
@@ -150,7 +185,7 @@ def require_exited(identity: object) -> None:
         raise Refusal("exact frontend did not exit")
 
 
-def stop(identity: dict, *, before_signal: Callable[[], None]) -> None:
+def stop(identity: dict[str, Any], *, before_signal: Callable[[], None]) -> None:
     """Stop only a held, birth-verified process after in-process reauthorization.
 
     ``before_signal`` runs immediately before the held process handle receives its
@@ -159,8 +194,11 @@ def stop(identity: dict, *, before_signal: Callable[[], None]) -> None:
     descendant or process tree, and deliberately performs no later escalation.
     """
     pid, started = valid_identity(identity)
-    if (isinstance(identity.get("pid"), bool) or isinstance(identity.get("started_at"), bool)
-            or not math.isfinite(started)):
+    if (
+        isinstance(identity.get("pid"), bool)
+        or isinstance(identity.get("started_at"), bool)
+        or not math.isfinite(started)
+    ):
         raise Refusal("process identity needs positive pid and started_at")
     if not callable(before_signal):
         raise Refusal("before_signal must be callable")
@@ -187,10 +225,8 @@ def _stop_linux(pid: int, started: float, before_signal: Callable[[], None]) -> 
         if actual is None or abs(actual.started_at - started) > TOLERANCE_SECONDS:
             raise Refusal("frontend identity changed before close")
         before_signal()
-        try:
+        with contextlib.suppress(ProcessLookupError):
             signal.pidfd_send_signal(descriptor, signal.SIGTERM)
-        except ProcessLookupError:
-            pass
         if not select.select([descriptor], [], [], 5)[0]:
             raise Refusal("exact frontend exit was not confirmed")
     finally:
@@ -206,8 +242,11 @@ def _stop_windows(pid: int, started: float, before_signal: Callable[[], None]) -
     kernel.OpenProcess.restype = wintypes.HANDLE
     kernel.CloseHandle.argtypes = [wintypes.HANDLE]
     kernel.GetProcessTimes.argtypes = [
-        wintypes.HANDLE, ctypes.POINTER(wintypes.FILETIME), ctypes.POINTER(wintypes.FILETIME),
-        ctypes.POINTER(wintypes.FILETIME), ctypes.POINTER(wintypes.FILETIME),
+        wintypes.HANDLE,
+        ctypes.POINTER(wintypes.FILETIME),
+        ctypes.POINTER(wintypes.FILETIME),
+        ctypes.POINTER(wintypes.FILETIME),
+        ctypes.POINTER(wintypes.FILETIME),
     ]
     kernel.GetProcessTimes.restype = wintypes.BOOL
     kernel.TerminateProcess.argtypes = [wintypes.HANDLE, wintypes.UINT]
@@ -218,11 +257,20 @@ def _stop_windows(pid: int, started: float, before_signal: Callable[[], None]) -
     if not handle:
         raise Refusal("cannot acquire exact frontend process handle")
     try:
-        created, exited, kernel_time, user_time = (wintypes.FILETIME() for _ in range(4))
-        if not kernel.GetProcessTimes(handle, ctypes.byref(created), ctypes.byref(exited),
-                                      ctypes.byref(kernel_time), ctypes.byref(user_time)):
+        created, exited, kernel_time, user_time = (
+            wintypes.FILETIME() for _ in range(4)
+        )
+        if not kernel.GetProcessTimes(
+            handle,
+            ctypes.byref(created),
+            ctypes.byref(exited),
+            ctypes.byref(kernel_time),
+            ctypes.byref(user_time),
+        ):
             raise Refusal("cannot verify exact frontend process handle")
-        actual = ((created.dwHighDateTime << 32) + created.dwLowDateTime) / 10_000_000 - 11_644_473_600
+        actual = (
+            (created.dwHighDateTime << 32) + created.dwLowDateTime
+        ) / 10_000_000 - 11_644_473_600
         if abs(actual - started) > TOLERANCE_SECONDS:
             raise Refusal("frontend identity changed before close")
         before_signal()
@@ -241,7 +289,10 @@ def descends_from(frontend: object, root: object) -> bool:
         return False
     seen: set[int] = set()
     while current.pid not in seen:
-        if current.pid == root_pid and abs(current.started_at - root_started) <= TOLERANCE_SECONDS:
+        if (
+            current.pid == root_pid
+            and abs(current.started_at - root_started) <= TOLERANCE_SECONDS
+        ):
             return True
         seen.add(current.pid)
         parent = process_info(current.ppid)
