@@ -154,6 +154,28 @@ def test_run_rejects_missing_cmd_command(mode: str) -> None:
     assert "require exactly one complete command string" in result.stderr
 
 
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows shell boundary")
+@pytest.mark.parametrize("mode", ["/c", "/k"])
+@pytest.mark.parametrize("form", ["compact", "combined", "prefix"])
+def test_run_rejects_compact_cmd_switches(tmp_path: Path, mode: str, form: str) -> None:
+    marker = tmp_path / "injected.txt"
+    tail = f'safe&echo injected>"{marker}"'
+    arguments = {
+        "compact": ["/d", f"{mode}echo", tail],
+        "combined": [f"/d{mode}", "echo", tail],
+        "prefix": [f"{mode}echo", "safe", mode, f"echo {tail}"],
+    }
+    result = process.run(
+        ["cmd.exe", *arguments[form]],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 127
+    assert "cmd.exe" in result.stderr
+    assert not marker.exists()
+
+
 def _alive(pid: int) -> bool:
     if sys.platform == "win32":
         kernel = ctypes.WinDLL("kernel32", use_last_error=True)
