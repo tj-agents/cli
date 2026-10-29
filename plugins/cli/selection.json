@@ -12,7 +12,7 @@
   "skills": [
     {
       "name": "clip",
-      "kind": "utility",
+      "kind": "operation",
       "profile": "core",
       "applicability": [
         "all projects"
@@ -26,7 +26,7 @@
     },
     {
       "name": "close",
-      "kind": "utility",
+      "kind": "operation",
       "profile": "core",
       "applicability": [
         "all projects"
@@ -40,7 +40,7 @@
     },
     {
       "name": "closeout",
-      "kind": "utility",
+      "kind": "operation",
       "profile": "core",
       "applicability": [
         "all projects"

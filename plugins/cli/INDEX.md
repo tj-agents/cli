@@ -1,5 +1,5 @@
 # cli package capabilities
 
-- `clip` — utility — core
-- `close` — utility — core
-- `closeout` — utility — core
+- `clip` — operation — core
+- `close` — operation — core
+- `closeout` — operation — core

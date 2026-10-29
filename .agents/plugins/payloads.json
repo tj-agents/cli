@@ -7,7 +7,7 @@
   "resources": [
     {
       "plugin": "cli",
-      "source": ".agents/cli/utility/close/scripts",
+      "source": ".agents/cli/skills/close/scripts",
       "destination": "runtime/close"
     }
   ]
