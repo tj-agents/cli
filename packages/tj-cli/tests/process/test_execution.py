@@ -117,13 +117,41 @@ def test_run_explicit_cmd_batch_with_spaces(tmp_path: Path) -> None:
     script = tmp_path / "hook with spaces.cmd"
     script.write_text("@echo off\necho %~1\nexit /b 9\n", encoding="utf-8")
     result = process.run(
-        ["cmd.exe", "/d", "/s", "/c", str(script), "two words"],
+        ["cmd.exe", "/d", "/s", "/c", f'"{script}" "two words"'],
         capture_output=True,
         text=True,
         timeout=30,
     )
     assert result.returncode == 9, result.stderr
     assert result.stdout == "two words\n"
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows shell boundary")
+@pytest.mark.parametrize("mode", ["/c", "/k"])
+@pytest.mark.parametrize("operator", ["&", "|"])
+def test_run_rejects_separate_cmd_arguments(
+    tmp_path: Path, mode: str, operator: str
+) -> None:
+    marker = tmp_path / "injected.txt"
+    result = process.run(
+        ["cmd.exe", "/d", mode, "echo", f'a{operator}echo injected>"{marker}"'],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 127
+    assert "require exactly one complete command string" in result.stderr
+    assert not marker.exists()
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows shell boundary")
+@pytest.mark.parametrize("mode", ["/c", "/k"])
+def test_run_rejects_missing_cmd_command(mode: str) -> None:
+    result = process.run(
+        ["cmd.exe", "/d", mode], capture_output=True, text=True, timeout=30
+    )
+    assert result.returncode == 127
+    assert "require exactly one complete command string" in result.stderr
 
 
 def _alive(pid: int) -> bool:
