@@ -12,14 +12,12 @@ with two everyday commands:
 
 The shared `tj-agents` marketplace also publishes `cli@tj-agents`:
 
-- [`cli:close`](.agents/cli/utility/close/SKILL.md) closes one explicit frontend and terminal tab, preserving its checkout.
-- [`cli:closeout`](.agents/cli/utility/closeout/SKILL.md) closes that exact target, then removes its separately verified clean, merged linked worktree.
 - [`cli:clip`](.agents/cli/utility/clip/SKILL.md) puts text on the OS clipboard (Windows, Linux or macOS) so it can be pasted elsewhere.
 
-These skills use portable standard-library Python and explicit process, terminal and worktree identities.
-[Agent](https://github.com/tj-agents/agent) supplies session-aware target resolution. Native control supports
-Windows Terminal, tmux and Kitty; missing or ambiguous proof produces a refusal receipt. Windows Terminal
-must allow application title updates so the console-to-tab association can be verified.
+`tj-cli` supplies deterministic process, terminal, and linked-worktree mechanics to Agent. Agent owns
+session-aware target resolution and lifecycle decisions. Native control supports Windows Terminal, tmux and
+Kitty; missing or ambiguous proof produces a refusal receipt. Windows Terminal must allow application title
+updates so the console-to-tab association can be verified.
 
 ## Install
 
@@ -131,8 +129,11 @@ differ, so only those are split into `linux/` and `windows/`.
 ## Development
 
 The repository also owns the `tj-cli` Python distribution under `packages/tj-cli/`.
-Its regular package groups reusable mechanics by capability; `tj_cli.paths` exposes
-literal executable-search PATH operations. Agent and Personal consume its public API:
+Its regular package groups reusable mechanics by capability. `tj_cli.paths` exposes literal executable-search
+PATH operations; `tj_cli.processes` holds exact process identities; `tj_cli.close` and `tj_cli.closeout` expose
+explicit terminal and worktree operations for Agent. Agent supplies its lifecycle guards to `close` and
+`closeout`, which run them immediately before terminal and worktree mutation. Agent and Personal consume the
+public API:
 
 ```python
 from tj_cli.paths import prepend
