@@ -13,7 +13,7 @@ type _Command = Sequence[str | os.PathLike[str]]
 type _Stream = int | IO[str] | IO[bytes] | None
 
 
-class _SpawnOptions(TypedDict, total=False):
+class _StartOptions(TypedDict, total=False):
     stdin: _Stream
     stdout: _Stream
     stderr: _Stream
@@ -30,16 +30,16 @@ class _SpawnOptions(TypedDict, total=False):
     executable: str | os.PathLike[str] | None
 
 
-class _RunOptions(_SpawnOptions, total=False):
+class _RunOptions(_StartOptions, total=False):
     input: str | bytes | None
 
 
-def spawn(command: _Command, **options: Unpack[_SpawnOptions]) -> subprocess.Popen[Any]:
-    return _spawn(command, options)
+def start(command: _Command, **options: Unpack[_StartOptions]) -> subprocess.Popen[Any]:
+    return _start(command, options)
 
 
-def _spawn(command: _Command, options: _SpawnOptions) -> subprocess.Popen[Any]:
-    if unknown := options.keys() - _SpawnOptions.__optional_keys__:
+def _start(command: _Command, options: _StartOptions) -> subprocess.Popen[Any]:
+    if unknown := options.keys() - _StartOptions.__optional_keys__:
         raise TypeError(f"unsupported process options: {', '.join(sorted(unknown))}")
     if not command:
         raise ValueError("an executable is required")
@@ -100,7 +100,7 @@ def run(
         options["stdout"] = options["stderr"] = subprocess.PIPE
     if sys.platform != "win32":
         options["start_new_session"] = True
-    with _spawn(command, options) as process:
+    with _start(command, options) as process:
         try:
             stdout, stderr = process.communicate(input_data, timeout=timeout)
         except subprocess.TimeoutExpired as error:

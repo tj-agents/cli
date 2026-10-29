@@ -71,7 +71,7 @@ def test_launcher_console_is_never_shown() -> None:
             f"subprocess.run([sys.executable,'-c',{probe!r}],check=True)"
         )
         try:
-            with process.spawn(
+            with process.start(
                 [sys.executable, "-u", "-c", code],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
