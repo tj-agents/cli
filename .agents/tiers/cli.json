@@ -1,5 +1,6 @@
 {
   "tier": "cli",
   "stack": "any project",
-  "applies": "always"
+  "applies": "always",
+  "session_context": "Whenever you give Tommy a command to run or text to paste, use `cli:clip`; use `--plain-only` for commands. Clipboard mechanics belong to `cli:clip`."
 }
