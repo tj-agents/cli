@@ -138,7 +138,8 @@ fn raw(handle: &Option<OwnedHandle>) -> HANDLE {
 }
 
 pub(super) fn run(arguments: &[OsString]) -> io::Result<u32> {
-    let executable = which::which(&arguments[0]).map_err(|error| io::Error::new(io::ErrorKind::NotFound, error))?;
+    let executable =
+        which::which(&arguments[0]).map_err(|error| io::Error::new(io::ErrorKind::NotFound, error))?.canonicalize()?;
     if executable
         .extension()
         .is_some_and(|extension| extension.eq_ignore_ascii_case("cmd") || extension.eq_ignore_ascii_case("bat"))

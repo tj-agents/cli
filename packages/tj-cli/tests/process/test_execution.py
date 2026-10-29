@@ -204,6 +204,32 @@ def test_run_rejects_compact_cmd_switches(tmp_path: Path, mode: str, form: str) 
     assert not marker.exists()
 
 
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows executable aliases")
+@pytest.mark.parametrize("suffix", [".", " "])
+def test_run_classifies_cmd_executable_aliases(tmp_path: Path, suffix: str) -> None:
+    executable = shutil.which("cmd.exe")
+    assert executable is not None
+    alias = executable + suffix
+    accepted = process.run(
+        [alias, "/d", "/c", "echo accepted"],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert accepted.returncode == 0, accepted.stderr
+    assert accepted.stdout.strip() == "accepted"
+    marker = tmp_path / "injected.txt"
+    rejected = process.run(
+        [alias, "/d", "/c", "echo", f'safe&echo injected>"{marker}"'],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert rejected.returncode == 127
+    assert "require exactly one complete command string" in rejected.stderr
+    assert not marker.exists()
+
+
 def _alive(pid: int) -> bool:
     if sys.platform == "win32":
         kernel = ctypes.WinDLL("kernel32", use_last_error=True)
