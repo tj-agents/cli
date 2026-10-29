@@ -1,6 +1,7 @@
 import ctypes
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -75,6 +76,33 @@ def test_launcher_comes_from_path_without_implicit_current_directory(
     )
     assert result.returncode == 0, result.stderr
     assert result.stdout == "installed launcher\n"
+
+
+@pytest.mark.parametrize("entry", ["tools", ""])
+def test_launcher_resolution_precedes_child_directory_and_environment(
+    native_launcher: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, entry: str
+) -> None:
+    installed = tmp_path / entry
+    installed.mkdir(exist_ok=True)
+    shutil.copy2(native_launcher, installed / native_launcher.name)
+    child_directory = tmp_path / "child"
+    competing = child_directory / "tools"
+    competing.mkdir(parents=True)
+    shadow = competing / native_launcher.name
+    shadow.write_bytes(b"not an executable")
+    shadow.chmod(0o755)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("PATH", entry + os.pathsep + os.environ["PATH"])
+    result = process.run(
+        [sys.executable, "-c", "print('selected launcher')"],
+        cwd=child_directory,
+        env={**os.environ, "PATH": str(competing)},
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "selected launcher\n"
 
 
 def test_spawn_rejects_implicit_shell() -> None:

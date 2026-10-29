@@ -49,7 +49,7 @@ def _launcher() -> str | None:
                 break
     else:
         launcher = shutil.which("tj_hook")
-    return launcher
+    return str(Path(launcher).absolute()) if launcher is not None else None
 
 
 def run(
