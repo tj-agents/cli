@@ -11,7 +11,7 @@ from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
-CLOSE_SCRIPTS = ROOT / ".agents" / "cli" / "utility" / "close" / "scripts"
+CLOSE_SCRIPTS = ROOT / ".agents" / "cli" / "skills" / "close" / "scripts"
 
 
 def load(name, path):
@@ -23,7 +23,7 @@ def load(name, path):
 
 
 close = load("test_close", CLOSE_SCRIPTS / "close.py")
-closeout = load("test_closeout", ROOT / ".agents" / "cli" / "utility" / "closeout" / "scripts" / "closeout.py")
+closeout = load("test_closeout", ROOT / ".agents" / "cli" / "skills" / "closeout" / "scripts" / "closeout.py")
 
 
 def git(cwd, *arguments):

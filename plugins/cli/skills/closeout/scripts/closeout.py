@@ -20,7 +20,7 @@ def _close_module():
     for root in (here.parent, *here.parents):
         candidates.extend((
             root / "runtime" / "close" / "close.py",
-            root / ".agents" / "cli" / "utility" / "close" / "scripts" / "close.py",
+            root / ".agents" / "cli" / "skills" / "close" / "scripts" / "close.py",
         ))
     path = next((candidate for candidate in candidates if candidate.is_file()), None)
     if path is None:

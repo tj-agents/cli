@@ -1,9 +1,9 @@
 # cli capabilities
 
-Generated from `.agents/<plugin>/<kind>/<family>/<member>/SKILL.md`; a skill's name is its folder path below the kind folder joined by hyphens.
+Generated from `.agents/<plugin>/skills/<family>/<member>/SKILL.md`; a skill's name is its folder path below skills/ joined by hyphens.
 
 ## cli
 
-- `clip` — utility — core — `.agents/cli/utility/clip/SKILL.md`
-- `close` — utility — core — `.agents/cli/utility/close/SKILL.md`
-- `closeout` — utility — core — `.agents/cli/utility/closeout/SKILL.md`
+- `clip` — operation — core — `.agents/cli/skills/clip/SKILL.md`
+- `close` — operation — core — `.agents/cli/skills/close/SKILL.md`
+- `closeout` — operation — core — `.agents/cli/skills/closeout/SKILL.md`
