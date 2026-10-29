@@ -3,9 +3,7 @@
   "dependencies": [],
   "profiles": {
     "core": [
-      "clip",
-      "close",
-      "closeout"
+      "clip"
     ]
   },
   "compatibilitySkillAliases": {},
@@ -19,35 +17,6 @@
       ],
       "requires": [
         "python"
-      ],
-      "provenance": [
-        "house"
-      ]
-    },
-    {
-      "name": "close",
-      "kind": "utility",
-      "profile": "core",
-      "applicability": [
-        "all projects"
-      ],
-      "requires": [
-        "python"
-      ],
-      "provenance": [
-        "house"
-      ]
-    },
-    {
-      "name": "closeout",
-      "kind": "utility",
-      "profile": "core",
-      "applicability": [
-        "all projects"
-      ],
-      "requires": [
-        "python",
-        "git"
       ],
       "provenance": [
         "house"
