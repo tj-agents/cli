@@ -5,6 +5,7 @@ import shutil
 import subprocess
 import sys
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -108,6 +109,56 @@ def test_launcher_resolution_precedes_child_directory_and_environment(
 def test_spawn_rejects_implicit_shell() -> None:
     with pytest.raises(ValueError, match="explicit executable"):
         process.spawn([sys.executable], shell=True)
+
+
+@pytest.mark.parametrize("execute", [process.run, process.spawn])
+@pytest.mark.parametrize("option", ["preexec_fn", "startupinfo", "universal_newlines"])
+def test_rejects_unsupported_process_options_before_launch(
+    execute: Callable[..., object], option: str, tmp_path: Path
+) -> None:
+    marker = tmp_path / "launched"
+    command = [
+        sys.executable,
+        "-c",
+        "import pathlib,sys; pathlib.Path(sys.argv[1]).touch()",
+        str(marker),
+    ]
+    with pytest.raises(TypeError, match=f"unsupported process options: {option}"):
+        execute(command, **{option: True})
+    assert not marker.exists()
+
+
+@pytest.mark.parametrize("payload", [b"binary\x00\xff", "text é日本"])
+def test_run_preserves_binary_and_text_input(payload: str | bytes) -> None:
+    result = process.run(
+        [
+            sys.executable,
+            "-c",
+            "import sys; sys.stdout.buffer.write(sys.stdin.buffer.read())",
+        ],
+        input=payload,
+        text=isinstance(payload, str),
+        encoding="utf-8" if isinstance(payload, str) else None,
+        capture_output=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == payload
+
+
+def test_run_redirects_to_an_open_file(tmp_path: Path) -> None:
+    output = tmp_path / "output"
+    with output.open("wb") as stream:
+        result = process.run(
+            [sys.executable, "-c", "import sys; sys.stdout.buffer.write(b'written')"],
+            stdout=stream,
+            bufsize=0,
+            close_fds=True,
+            timeout=30,
+        )
+    assert result.returncode == 0
+    assert result.stdout is None
+    assert output.read_bytes() == b"written"
 
 
 def test_run_inherits_default_standard_streams() -> None:

@@ -4,15 +4,43 @@ import shutil
 import signal
 import subprocess
 import sys
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from contextlib import suppress
 from pathlib import Path
-from typing import Any
+from typing import IO, Any, TypedDict, Unpack
+
+type _Command = Sequence[str | os.PathLike[str]]
+type _Stream = int | IO[str] | IO[bytes] | None
 
 
-def spawn(
-    command: Sequence[str | os.PathLike[str]], **options: Any
-) -> subprocess.Popen[Any]:
+class _SpawnOptions(TypedDict, total=False):
+    stdin: _Stream
+    stdout: _Stream
+    stderr: _Stream
+    cwd: str | os.PathLike[str] | None
+    env: Mapping[str, str] | None
+    text: bool
+    encoding: str | None
+    errors: str | None
+    bufsize: int
+    close_fds: bool
+    creationflags: int
+    start_new_session: bool
+    shell: bool
+    executable: str | os.PathLike[str] | None
+
+
+class _RunOptions(_SpawnOptions, total=False):
+    input: str | bytes | None
+
+
+def spawn(command: _Command, **options: Unpack[_SpawnOptions]) -> subprocess.Popen[Any]:
+    return _spawn(command, options)
+
+
+def _spawn(command: _Command, options: _SpawnOptions) -> subprocess.Popen[Any]:
+    if unknown := options.keys() - _SpawnOptions.__optional_keys__:
+        raise TypeError(f"unsupported process options: {', '.join(sorted(unknown))}")
     if not command:
         raise ValueError("an executable is required")
     if options.pop("shell", False):
@@ -23,7 +51,8 @@ def spawn(
     if launcher is None:
         raise FileNotFoundError("tj_hook is not installed on PATH")
     if sys.platform == "win32":
-        if all(options.get(stream) is None for stream in ("stdin", "stdout", "stderr")):
+        streams = (options.get("stdin"), options.get("stdout"), options.get("stderr"))
+        if all(stream is None for stream in streams):
             try:
                 os.fstat(0)
             except OSError:
@@ -53,12 +82,12 @@ def _launcher() -> str | None:
 
 
 def run(
-    command: Sequence[str | os.PathLike[str]],
+    command: _Command,
     *,
     capture_output: bool = False,
     timeout: float | None = None,
     check: bool = False,
-    **options: Any,
+    **options: Unpack[_RunOptions],
 ) -> subprocess.CompletedProcess[Any]:
     input_data = options.pop("input", None)
     if input_data is not None:
@@ -71,7 +100,7 @@ def run(
         options["stdout"] = options["stderr"] = subprocess.PIPE
     if sys.platform != "win32":
         options["start_new_session"] = True
-    with spawn(command, **options) as process:
+    with _spawn(command, options) as process:
         try:
             stdout, stderr = process.communicate(input_data, timeout=timeout)
         except subprocess.TimeoutExpired as error:
