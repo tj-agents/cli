@@ -106,12 +106,12 @@ def test_launcher_resolution_precedes_child_directory_and_environment(
     assert result.stdout == "selected launcher\n"
 
 
-def test_spawn_rejects_implicit_shell() -> None:
+def test_start_rejects_implicit_shell() -> None:
     with pytest.raises(ValueError, match="explicit executable"):
-        process.spawn([sys.executable], shell=True)
+        process.start([sys.executable], shell=True)
 
 
-@pytest.mark.parametrize("execute", [process.run, process.spawn])
+@pytest.mark.parametrize("execute", [process.run, process.start])
 @pytest.mark.parametrize("option", ["preexec_fn", "startupinfo", "universal_newlines"])
 def test_rejects_unsupported_process_options_before_launch(
     execute: Callable[..., object], option: str, tmp_path: Path
@@ -349,7 +349,7 @@ def test_terminating_launcher_kills_ready_descendant(
     )
     command = [sys.executable, "-c", code, str(record)]
     pid = None
-    with process.spawn(
+    with process.start(
         command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
     ) as launched:
         try:

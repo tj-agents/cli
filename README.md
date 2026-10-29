@@ -149,11 +149,11 @@ from tj_cli import process
 result = process.run(["git", "status", "--porcelain"], capture_output=True, text=True, timeout=5)
 ```
 
-`process.run` and `process.spawn` invoke the same native `tj_hook` executable. Install
+`process.run` and `process.start` invoke the same native `tj_hook` executable. Install
 the native CLI and keep its binary directory on the invoking process's PATH; installing
 the Python wheel alone does not install the native binaries. A missing launcher fails
 explicitly. `run` owns a separate process session on Linux and kills that process group
-on timeout or interruption. `spawn` returns a `Popen` handle for callers managing its
+on timeout or interruption. `start` returns a `Popen` handle for callers managing its
 lifetime themselves. Timeout and nonzero-exit errors identify the requested command.
 
 Both functions accept typed options for standard streams, working directory, environment,
