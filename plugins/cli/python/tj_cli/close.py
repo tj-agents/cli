@@ -4,70 +4,92 @@ from __future__ import annotations
 
 import argparse
 import json
-from pathlib import Path
 import subprocess
 import sys
 import time
+from pathlib import Path
+from typing import Any
 
-import process_identity
-import terminal
+import tj_cli.terminal
+from tj_cli.process import identity
 
 
-def _read_json(path: Path) -> dict:
+def _read_json(path: Path) -> dict[str, Any]:
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError) as error:
-        raise process_identity.Refusal("cannot read JSON: " + str(path)) from error
+        raise identity.Refusal("cannot read JSON: " + str(path)) from error
     if not isinstance(value, dict):
-        raise process_identity.Refusal("JSON object required: " + str(path))
+        raise identity.Refusal("JSON object required: " + str(path))
     return value
 
 
-def _write_json(path: Path, value: dict) -> None:
+def _write_json(path: Path, value: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name("." + path.name + ".tmp")
     temporary.write_text(json.dumps(value, sort_keys=True) + "\n", encoding="utf-8")
     temporary.replace(path)
 
 
-def validate_target(value: object) -> dict:
+def validate_target(value: object) -> dict[str, Any]:
     if not isinstance(value, dict):
-        raise process_identity.Refusal("target must be an object")
+        raise identity.Refusal("target must be an object")
     if value.get("schema_version") != 1:
-        raise process_identity.Refusal("target schema_version must be 1")
-    process_identity.valid_identity(value.get("frontend"))
-    process_identity.valid_identity(value.get("wrapper"))
+        raise identity.Refusal("target schema_version must be 1")
+    identity.valid_identity(value.get("frontend"))
+    identity.valid_identity(value.get("wrapper"))
     terminal_value = value.get("terminal")
-    if not isinstance(terminal_value, dict) or not isinstance(terminal_value.get("kind"), str):
-        raise process_identity.Refusal("target needs terminal object")
+    if not isinstance(terminal_value, dict) or not isinstance(
+        terminal_value.get("kind"), str
+    ):
+        raise identity.Refusal("target needs terminal object")
     if terminal_value["kind"] == "windows-terminal":
         binding = terminal_value.get("tab_binding")
         if not isinstance(binding, dict):
-            raise process_identity.Refusal("Windows Terminal target needs tab binding evidence")
-        if (not isinstance(binding.get("runtime_id"), str) or not binding["runtime_id"].strip()
-                or not isinstance(binding.get("observed_title"), str) or not binding["observed_title"].strip()
-                or binding.get("evidence") != "windows-uia-unique-title-at-launch"):
-            raise process_identity.Refusal("Windows Terminal tab binding evidence is incomplete")
+            raise identity.Refusal("Windows Terminal target needs tab binding evidence")
+        if (
+            not isinstance(binding.get("runtime_id"), str)
+            or not binding["runtime_id"].strip()
+            or not isinstance(binding.get("observed_title"), str)
+            or not binding["observed_title"].strip()
+            or binding.get("evidence") != "windows-uia-unique-title-at-launch"
+        ):
+            raise identity.Refusal(
+                "Windows Terminal tab binding evidence is incomplete"
+            )
     return value
 
 
-def target(path: Path) -> dict:
+def target(path: Path) -> dict[str, Any]:
     return validate_target(_read_json(path))
 
 
-def receipt(path: Path, target_value: dict, status: str, **extra: object) -> None:
-    _write_json(path, {"schema_version": 1, "operation": "cli-close", "status": status,
-                       "at": time.time(), "target": target_value, **extra})
+def receipt(
+    path: Path, target_value: dict[str, Any], status: str, **extra: object
+) -> None:
+    _write_json(
+        path,
+        {
+            "schema_version": 1,
+            "operation": "cli-close",
+            "status": status,
+            "at": time.time(),
+            "target": target_value,
+            **extra,
+        },
+    )
 
 
-def close(target_value: dict, receipt_path: Path) -> None:
+def close(target_value: dict[str, Any], receipt_path: Path) -> None:
     try:
-        terminal.close(target_value)
+        tj_cli.terminal.close(target_value)
         deadline = time.monotonic() + 5
-        while process_identity.matches(target_value["frontend"]) and time.monotonic() < deadline:
+        while (
+            identity.matches(target_value["frontend"]) and time.monotonic() < deadline
+        ):
             time.sleep(0.05)
-        process_identity.require_exited(target_value["frontend"])
-    except process_identity.Refusal as error:
+        identity.require_exited(target_value["frontend"])
+    except identity.Refusal as error:
         receipt(receipt_path, target_value, "refused", reason=str(error))
         raise
     receipt(receipt_path, target_value, "closed")
@@ -83,33 +105,48 @@ def _completion_matches(path: Path, token: str, armed_at: float) -> bool:
     return value.get("token") == token
 
 
-def _frozen_target(value: str) -> dict:
+def _frozen_target(value: str) -> dict[str, Any]:
     try:
         return validate_target(json.loads(value))
     except ValueError as error:
-        raise process_identity.Refusal("armed target JSON is invalid") from error
+        raise identity.Refusal("armed target JSON is invalid") from error
 
 
 def watch(args: argparse.Namespace) -> int:
     target_value = _frozen_target(args.target_json)
     armed_at = args.armed_at
     if armed_at <= 0:
-        raise process_identity.Refusal("armed timestamp is invalid")
+        raise identity.Refusal("armed timestamp is invalid")
     deadline = time.monotonic() + args.timeout
     while time.monotonic() < deadline:
         if args.cancel.exists():
-            receipt(args.receipt, target_value, "cancelled", reason="caller supplied cancellation")
+            receipt(
+                args.receipt,
+                target_value,
+                "cancelled",
+                reason="caller supplied cancellation",
+            )
             return 0
         if _completion_matches(args.completion, args.completion_token, armed_at):
             if args.delay:
                 time.sleep(args.delay)
             if args.cancel.exists():
-                receipt(args.receipt, target_value, "cancelled", reason="caller supplied cancellation")
+                receipt(
+                    args.receipt,
+                    target_value,
+                    "cancelled",
+                    reason="caller supplied cancellation",
+                )
                 return 0
             close(target_value, args.receipt)
             return 0
         time.sleep(0.1)
-    receipt(args.receipt, target_value, "cancelled", reason="completion was not supplied before timeout")
+    receipt(
+        args.receipt,
+        target_value,
+        "cancelled",
+        reason="completion was not supplied before timeout",
+    )
     return 0
 
 
@@ -117,18 +154,50 @@ def arm(args: argparse.Namespace) -> int:
     target_value = target(args.target)
     armed_at = time.time()
     frozen_target = json.dumps(target_value, sort_keys=True, separators=(",", ":"))
-    receipt(args.receipt, target_value, "armed", armed_at=armed_at,
-            completion=str(args.completion), cancel=str(args.cancel))
-    command = [sys.executable, "-B", str(Path(__file__).resolve()), "watch", "--target-json", frozen_target,
-               "--armed-at", str(armed_at),
-               "--receipt", str(args.receipt), "--completion", str(args.completion), "--completion-token",
-               args.completion_token, "--cancel", str(args.cancel), "--delay", str(args.delay), "--timeout", str(args.timeout)]
-    kwargs: dict[str, object] = {"stdin": subprocess.DEVNULL, "stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}
+    receipt(
+        args.receipt,
+        target_value,
+        "armed",
+        armed_at=armed_at,
+        completion=str(args.completion),
+        cancel=str(args.cancel),
+    )
+    command = [
+        sys.executable,
+        "-I",
+        "-B",
+        str(Path(__file__).parent / "commands/close.py"),
+        "watch",
+        "--target-json",
+        frozen_target,
+        "--armed-at",
+        str(armed_at),
+        "--receipt",
+        str(args.receipt),
+        "--completion",
+        str(args.completion),
+        "--completion-token",
+        args.completion_token,
+        "--cancel",
+        str(args.cancel),
+        "--delay",
+        str(args.delay),
+        "--timeout",
+        str(args.timeout),
+    ]
+    creationflags = 0
     if sys.platform == "win32":
-        kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS
-    else:
-        kwargs["start_new_session"] = True
-    subprocess.Popen(command, **kwargs)
+        creationflags = (
+            subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS
+        )
+    subprocess.Popen(
+        command,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        creationflags=creationflags,
+        start_new_session=sys.platform != "win32",
+    )
     return 0
 
 
@@ -167,7 +236,7 @@ def main(argv: list[str] | None = None) -> int:
             close(target(args.target), args.receipt)
             return 0
         return arm(args) if args.command == "arm" else watch(args)
-    except (OSError, ValueError, process_identity.Refusal) as error:
+    except (OSError, ValueError, identity.Refusal) as error:
         print("cli:close: " + str(error), file=sys.stderr)
         return 2
 
