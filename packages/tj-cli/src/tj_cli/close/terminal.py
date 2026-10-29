@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -66,7 +67,9 @@ def _tmux_command(identity: JSON, *arguments: str) -> list[str]:
 
 def _tmux(identity: JSON) -> list[JSON]:
     result = _run(
-        _tmux_command(identity, "list-panes", "-a", "-F", "#{pane_id}\t#{pane_pid}")
+        _tmux_command(
+            identity, "list-panes", "-a", "-F", "#{pane_id}\t#{pane_pid}\t#{pane_title}"
+        )
     )
     if result.returncode:
         raise processes.Refusal(
@@ -74,9 +77,15 @@ def _tmux(identity: JSON) -> list[JSON]:
         )
     items: list[JSON] = []
     for line in result.stdout.splitlines():
-        pane, separator, pid = line.partition("\t")
+        pane, separator, rest = line.partition("\t")
+        pid, separator, title = rest.partition("\t")
         if separator and pane and pid.isdigit():
-            item: JSON = {"kind": "tmux", "pane_id": pane, "pid": int(pid)}
+            item: JSON = {
+                "kind": "tmux",
+                "pane_id": pane,
+                "pid": int(pid),
+                "title": title,
+            }
             if _nonempty(identity.get("socket")):
                 item["socket"] = identity["socket"]
             items.append(item)
@@ -127,6 +136,7 @@ def _kitty(identity: JSON) -> list[JSON]:
                         "kind": "kitty",
                         "listen_on": listen,
                         "window_id": str(window["id"]),
+                        "title": str(window.get("title") or ""),
                         "root_pids": [
                             pid for pid in roots if isinstance(pid, int) and pid > 0
                         ],
@@ -191,12 +201,54 @@ def _inventory(identity: JSON) -> list[JSON]:
     if kind == "windows-terminal":
         return _windows(identity)
     if kind == "konsole":
-        raise processes.Refusal("Konsole cannot verify exact tab disappearance")
+        return [_konsole(identity)]
     raise processes.Refusal("unsupported terminal identity")
 
 
 def inventory(identity: Mapping[str, object]) -> tuple[Mapping[str, object], ...]:
     return tuple(_inventory(_identity(identity)))
+
+
+def query(identity: Mapping[str, object]) -> tuple[Mapping[str, object], ...]:
+    return inventory(identity)
+
+
+def _konsole(identity: JSON) -> JSON:
+    executable = (
+        shutil.which("qdbus6") or shutil.which("qdbus") or shutil.which("qdbus-qt5")
+    )
+    service = _nonempty(identity.get("service"))
+    session = _nonempty(identity.get("session"))
+    if not executable or not service or not session or not session.startswith("/"):
+        raise processes.Refusal(
+            "Konsole needs qdbus6/qdbus and its recorded service and full session path"
+        )
+    roots: list[int] = []
+    for method in (
+        "org.kde.konsole.Session.processId",
+        "org.kde.konsole.Session.foregroundProcessId",
+    ):
+        result = _run([executable, service, session, method])
+        if result.returncode:
+            raise processes.Refusal(
+                (result.stderr or result.stdout or "Konsole query failed").strip()
+            )
+        try:
+            pid = int(result.stdout.strip())
+        except ValueError:
+            continue
+        info = processes.process_info(pid)
+        if info is not None:
+            roots.append(info.pid)
+    if not roots:
+        raise processes.Refusal("the recorded Konsole session has no queryable process")
+    return {
+        "kind": "konsole",
+        "service": service,
+        "session": session,
+        "root_pids": roots,
+        "title": str(identity.get("title") or ""),
+    }
 
 
 def _matches(item: JSON, identity: JSON) -> bool:
@@ -212,10 +264,11 @@ def _matches(item: JSON, identity: JSON) -> bool:
             "window_id"
         ) == str(identity.get("window_id"))
     if kind == "windows-terminal":
-        binding = identity.get("tab_binding")
-        return isinstance(binding, dict) and item.get("runtime_id") == binding.get(
-            "runtime_id"
-        )
+        return item.get("runtime_id") == _windows_runtime_id(identity)
+    if kind == "konsole":
+        return item.get("service") == identity.get("service") and item.get(
+            "session"
+        ) == identity.get("session")
     return False
 
 
@@ -227,7 +280,7 @@ def _one(identity: JSON) -> JSON:
 
 
 def _roots(item: JSON) -> list[int]:
-    if item["kind"] == "kitty":
+    if item["kind"] in {"kitty", "konsole"}:
         values = item["root_pids"]
         return (
             values
@@ -239,19 +292,17 @@ def _roots(item: JSON) -> list[int]:
     return [pid] if isinstance(pid, int) else []
 
 
-def _windows_tab_binding(identity: JSON) -> str:
+def _windows_runtime_id(identity: JSON) -> str:
+    runtime_id = _nonempty(identity.get("runtime_id"))
+    if runtime_id:
+        return runtime_id
     binding = identity.get("tab_binding")
     if not isinstance(binding, dict):
         raise processes.Refusal("Windows Terminal target needs tab binding evidence")
     tab_id = _nonempty(binding.get("runtime_id"))
-    title = _nonempty(binding.get("observed_title"))
-    if (
-        not tab_id
-        or not title
-        or binding.get("evidence") != "windows-uia-unique-title-at-launch"
-    ):
-        raise processes.Refusal("Windows Terminal tab binding evidence is incomplete")
-    return tab_id
+    if tab_id:
+        return tab_id
+    raise processes.Refusal("Windows Terminal tab binding evidence is incomplete")
 
 
 def _windows_console_association(
@@ -260,17 +311,19 @@ def _windows_console_association(
     if os.name != "nt":
         return False
     frontend_pid, _started = processes.valid_identity(frontend)
+    probe = Path(__file__).with_name("probe.py").resolve()
+    if not probe.is_file():
+        return False
     with _adapter() as adapter:
         command = [
             sys.executable,
             "-I",
             "-B",
-            "-m",
-            "tj_cli.close.probe",
+            str(probe),
             "--frontend-pid",
             str(frontend_pid),
             "--tab-id",
-            _windows_tab_binding(identity),
+            _windows_runtime_id(identity),
             "--inventory-adapter",
             str(adapter),
         ]
@@ -294,6 +347,35 @@ def _windows_console_association(
     return result.returncode == 0 and value == {"associated": True}
 
 
+def verify_process_binding(
+    identity: Mapping[str, object], process_identity: Mapping[str, object]
+) -> None:
+    exact = _identity(identity)
+    processes.require_live(process_identity, "process identity changed")
+    item = _one(exact)
+    if exact.get("kind") == "windows-terminal":
+        if item.get("runtime_id") != _windows_runtime_id(exact):
+            raise processes.Refusal("Windows Terminal tab binding changed")
+        if not _windows_console_association(process_identity, exact):
+            raise processes.Refusal(
+                "Windows Terminal cannot prove frontend belongs to exact tab"
+            )
+    else:
+        roots = [processes.process_info(pid) for pid in _roots(item)]
+        actual_roots = [root for root in roots if root is not None]
+        if not any(
+            processes.descends_from(
+                process_identity, {"pid": root.pid, "started_at": root.started_at}
+            )
+            for root in actual_roots
+        ):
+            raise processes.Refusal("process is not owned by the exact terminal target")
+
+
+def native_roots(identity: Mapping[str, object]) -> tuple[int, ...]:
+    return tuple(_roots(_one(_identity(identity))))
+
+
 def verify_binding(target: Target) -> None:
     frontend = target.get("frontend")
     wrapper = target.get("wrapper")
@@ -304,27 +386,9 @@ def verify_binding(target: Target) -> None:
         or not isinstance(terminal, Mapping)
     ):
         raise processes.Refusal("target needs frontend, wrapper, and terminal objects")
-    identity = _identity(terminal)
     processes.require_live(frontend, "frontend identity changed")
     processes.require_live(wrapper, "wrapper identity changed")
-    item = _one(identity)
-    if identity.get("kind") == "windows-terminal":
-        if item.get("runtime_id") != _windows_tab_binding(identity):
-            raise processes.Refusal("Windows Terminal tab binding changed")
-        if not _windows_console_association(frontend, identity):
-            raise processes.Refusal(
-                "Windows Terminal cannot prove frontend belongs to exact tab"
-            )
-    else:
-        roots = [processes.process_info(pid) for pid in _roots(item)]
-        actual_roots = [root for root in roots if root is not None]
-        if not any(
-            processes.descends_from(
-                wrapper, {"pid": root.pid, "started_at": root.started_at}
-            )
-            for root in actual_roots
-        ):
-            raise processes.Refusal("wrapper is not owned by the exact terminal target")
+    verify_process_binding(terminal, wrapper)
     if not processes.descends_from(frontend, wrapper):
         raise processes.Refusal("frontend is not owned by the dedicated wrapper")
 
@@ -333,19 +397,24 @@ def close(target: Target, *, before_close: Guard = _no_guard) -> None:
     terminal = target.get("terminal")
     if not isinstance(terminal, Mapping):
         raise processes.Refusal("target needs a terminal object")
-    identity = _identity(terminal)
     verify_binding(target)
+    close_identity(terminal, before_close=before_close)
+
+
+def close_identity(identity: Mapping[str, object], *, before_close: Guard) -> None:
+    exact = _identity(identity)
+    _one(exact)
     before_close()
-    kind = identity.get("kind")
+    kind = exact.get("kind")
     if kind == "tmux":
-        pane = _nonempty(identity.get("pane_id"))
+        pane = _nonempty(exact.get("pane_id"))
         if not pane:
             raise processes.Refusal("tmux target needs pane_id")
-        result = _run(_tmux_command(identity, "kill-pane", "-t", pane))
+        result = _run(_tmux_command(exact, "kill-pane", "-t", pane))
     elif kind == "kitty":
         listen, window = (
-            _nonempty(identity.get("listen_on")),
-            _nonempty(identity.get("window_id")),
+            _nonempty(exact.get("listen_on")),
+            _nonempty(exact.get("window_id")),
         )
         if not listen or not window:
             raise processes.Refusal("kitty target needs listen_on and window_id")
@@ -363,7 +432,7 @@ def close(target: Target, *, before_close: Guard = _no_guard) -> None:
                     "-File",
                     str(adapter),
                     "-TabId",
-                    _windows_tab_binding(identity),
+                    _windows_runtime_id(exact),
                 ]
             )
     else:
@@ -374,9 +443,9 @@ def close(target: Target, *, before_close: Guard = _no_guard) -> None:
         )
     for _attempt in range(CONFIRM_ATTEMPTS):
         try:
-            absent = not any(_matches(item, identity) for item in _inventory(identity))
+            absent = not any(_matches(item, exact) for item in _inventory(exact))
         except processes.Refusal:
-            if kind == "tmux" and _tmux_server_disappeared(identity):
+            if kind == "tmux" and _tmux_server_disappeared(exact):
                 return
             raise
         if absent:
@@ -393,7 +462,11 @@ def focus(identity: Mapping[str, object]) -> None:
         pane = _nonempty(exact.get("pane_id"))
         if not pane:
             raise processes.Refusal("tmux target needs pane_id")
-        result = _run(_tmux_command(exact, "select-pane", "-t", pane))
+        result = _run(_tmux_command(exact, "select-window", "-t", pane))
+        if not result.returncode:
+            result = _run(_tmux_command(exact, "select-pane", "-t", pane))
+        if not result.returncode:
+            _run(_tmux_command(exact, "switch-client", "-t", pane))
     elif kind == "kitty":
         listen, window = (
             _nonempty(exact.get("listen_on")),
@@ -415,7 +488,7 @@ def focus(identity: Mapping[str, object]) -> None:
                     "-File",
                     str(adapter),
                     "-TabId",
-                    _windows_tab_binding(exact),
+                    _windows_runtime_id(exact),
                     "-Focus",
                 ]
             )
@@ -433,4 +506,14 @@ def _tmux_server_disappeared(identity: JSON) -> bool:
     return result.returncode != 0 and "no server running" in message
 
 
-__all__ = ["Target", "close", "focus", "inventory", "verify_binding"]
+__all__ = [
+    "Target",
+    "close",
+    "close_identity",
+    "focus",
+    "inventory",
+    "native_roots",
+    "query",
+    "verify_binding",
+    "verify_process_binding",
+]
