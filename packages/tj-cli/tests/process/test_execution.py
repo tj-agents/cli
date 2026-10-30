@@ -300,6 +300,21 @@ def test_run_preserves_registered_app_execution_aliases(name: str) -> None:
         assert actual.stderr == expected.stderr
 
 
+@pytest.mark.skipif(sys.platform != "win32", reason="Git for Windows installation")
+def test_run_preserves_git_system_config_lookup() -> None:
+    command = ["git", "config", "--system", "--list", "--name-only"]
+    environment = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith("GIT_CONFIG_")
+    }
+    expected = subprocess.run(command, capture_output=True, env=environment, timeout=30)
+    actual = process.run(command, capture_output=True, env=environment, timeout=30)
+    assert actual.returncode == expected.returncode == 0, actual.stderr
+    assert actual.stdout == expected.stdout
+    assert actual.stderr == expected.stderr
+
+
 def _alive(pid: int) -> bool:
     if sys.platform == "win32":
         kernel = ctypes.WinDLL("kernel32", use_last_error=True)

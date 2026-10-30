@@ -138,19 +138,21 @@ fn raw(handle: &Option<OwnedHandle>) -> HANDLE {
 }
 
 pub(super) fn run(arguments: &[OsString]) -> io::Result<u32> {
-    let executable = which::which(&arguments[0]).map_err(|error| io::Error::new(io::ErrorKind::NotFound, error))?;
-    let executable = match executable.canonicalize() {
+    let executable = std::path::absolute(
+        which::which(&arguments[0]).map_err(|error| io::Error::new(io::ErrorKind::NotFound, error))?,
+    )?;
+    let canonical = match executable.canonicalize() {
         Ok(path) => path,
-        Err(error) if error.raw_os_error() == Some(ERROR_CANT_ACCESS_FILE as i32) => std::path::absolute(executable)?,
+        Err(error) if error.raw_os_error() == Some(ERROR_CANT_ACCESS_FILE as i32) => executable.clone(),
         Err(error) => return Err(error),
     };
-    if executable
+    if canonical
         .extension()
         .is_some_and(|extension| extension.eq_ignore_ascii_case("cmd") || extension.eq_ignore_ascii_case("bat"))
     {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "batch files require an explicit cmd.exe command"));
     }
-    let mut command = if executable.file_name().is_some_and(|name| name.eq_ignore_ascii_case("cmd.exe")) {
+    let mut command = if canonical.file_name().is_some_and(|name| name.eq_ignore_ascii_case("cmd.exe")) {
         shell_command_line(arguments)?
     } else {
         command_line(arguments)?
