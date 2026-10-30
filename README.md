@@ -1,7 +1,6 @@
 # tj
 
-Fast shell tools for agentic programming, on Windows and Linux. It's a single Rust binary, `tj`,
-with two everyday commands:
+Fast shell tools for agentic programming, on Windows and Linux. `tj` provides two everyday commands:
 
 | Command | What it does |
 | --- | --- |
@@ -43,7 +42,7 @@ Then open a new terminal.
 You can run the installer as often as you like. It updates whatever is out of date and reports `ok`
 for everything else, so re-running it after a `git pull` is how you upgrade. It:
 
-1. builds `tj` (or downloads the latest release) and puts it in `~/.local/bin` on Linux or
+1. builds `tj` and `tj_hook` (or downloads the latest release) and puts them in `~/.local/bin` on Linux or
    `%LOCALAPPDATA%\Programs\tj` on Windows, adding that folder to your user PATH on Windows;
 2. checks for fzf. On Windows it installs fzf with winget if it's missing; on Linux it tells you
    the package to install;
@@ -122,9 +121,52 @@ differ, so only those are split into `linux/` and `windows/`.
 | --- | --- | --- |
 | `TJ_F_ROOT` | `~/projects`, then `~/source/repos` | where `f` searches |
 | `TJ_CACHE_DIR` | OS cache folder + `/tj` | where `cr` keeps its index |
-| `TJ_BIN_DIR` | `~/.local/bin` / `%LOCALAPPDATA%\Programs\tj` | where the installer puts `tj` |
+| `TJ_BIN_DIR` | `~/.local/bin` / `%LOCALAPPDATA%\Programs\tj` | where the installer puts `tj` and `tj_hook` |
 | `CLAUDE_CONFIG_DIR` | `~/.claude` | Claude Code's config folder, as Claude Code itself reads it |
 | `CODEX_HOME` | `~/.codex` | Codex's config folder, as Codex itself reads it |
+
+## Hidden processes
+
+`tj_hook -- <executable> [arguments...]` runs a command with inherited input, output,
+environment and working directory, returning its exit status. On Windows the launcher
+has no console window and starts the command in a console hidden from creation. Ordinary
+descendants inherit that hidden console. A Windows Job Object keeps the command tree
+owned by the launcher: exiting or terminating the launcher also terminates its descendants.
+On Linux the launcher replaces itself with the command, retaining its process identity
+and signal behavior.
+
+```text
+tj_hook -- python -I -B hook.py
+```
+
+Python consumers use the installed `tj-cli` package:
+
+```python
+from tj_cli import process
+
+result = process.run(["git", "status", "--porcelain"], capture_output=True, text=True, timeout=5)
+```
+
+`process.run` and `process.start` invoke the same native `tj_hook` executable. Install
+the native CLI and keep its binary directory on the invoking process's PATH; installing
+the Python wheel alone does not install the native binaries. A missing launcher fails
+explicitly. `run` owns a separate process session on Linux and kills that process group
+on timeout or interruption. `start` returns a `Popen` handle for callers managing its
+lifetime themselves. Timeout and nonzero-exit errors identify the requested command.
+
+Both functions accept typed options for standard streams, working directory, environment,
+text encoding, buffering and process creation. Unknown options fail before launch.
+`run` additionally supports input, output capture, timeout and exit-status checking.
+Shell commands require an explicit shell executable. For `cmd.exe`, `/c` and `/k`
+require exactly one complete command string, preserving its shell syntax and quotes.
+Separate command arguments are rejected.
+The mode must be a separate switch. Supported preceding switches are `/d`, `/s`,
+`/q`, `/a`, `/u`, `/E:ON`, `/E:OFF`, `/F:ON`, `/F:OFF`, `/V:ON` and `/V:OFF`.
+
+Hooks must use the launcher as their executable. A host-created shell runs before the
+launcher, so its visibility must also be controlled by the host. Code that explicitly
+requests a new console can bypass ordinary console inheritance; hook registration and
+subprocess checks must enforce the shared path.
 
 ## Development
 
@@ -169,6 +211,9 @@ run changes anything. To publish prebuilt binaries, push a tag such as `v0.2.0`.
 | --- | --- |
 | `linux/` | the Linux installer and the bash/zsh/fish functions |
 | `windows/` | the Windows installer and the PowerShell functions |
+| `src/bin/tj_hook.rs` | the windowless executable entry point |
+| `src/process.rs` and `src/process/` | native command execution and Windows process containment |
+| `packages/tj-cli/src/tj_cli/process/` | the Python API for the native launcher |
 | `src/f.rs` | folder walk, match scoring, picker |
 | `src/cr/parse.rs` | reading Claude and Codex transcripts into searchable text and turns |
 | `src/cr/render.rs` | the Tab preview pane |

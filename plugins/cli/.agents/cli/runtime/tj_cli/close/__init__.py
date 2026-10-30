@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 import argparse
-from collections.abc import Callable, Mapping
 import json
-from pathlib import Path
 import subprocess
 import sys
 import time
+from collections.abc import Callable, Mapping
+from pathlib import Path
 from typing import Literal, NotRequired, TypedDict, cast
 
 from tj_cli import processes
@@ -221,18 +221,23 @@ def arm(args: argparse.Namespace) -> int:
         "--timeout",
         str(args.timeout),
     ]
-    kwargs: dict[str, object] = {
-        "stdin": subprocess.DEVNULL,
-        "stdout": subprocess.DEVNULL,
-        "stderr": subprocess.DEVNULL,
-    }
     if sys.platform == "win32":
-        kwargs["creationflags"] = (
-            subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS
+        subprocess.Popen(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP
+            | subprocess.DETACHED_PROCESS,
         )
     else:
-        kwargs["start_new_session"] = True
-    subprocess.Popen(command, **kwargs)
+        subprocess.Popen(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
     return 0
 
 
