@@ -2,10 +2,7 @@
 
 from __future__ import annotations
 
-import argparse
 import json
-import subprocess
-import sys
 import time
 from collections.abc import Callable, Mapping
 from pathlib import Path
@@ -130,165 +127,13 @@ def close(
     receipt(receipt_path, target_value, "closed")
 
 
-def _completion_matches(path: Path, token: str, armed_at: float) -> bool:
-    try:
-        if path.stat().st_mtime < armed_at:
-            return False
-        value = _read_json(path)
-    except OSError:
-        return False
-    return value.get("token") == token
-
-
-def _frozen_target(value: str) -> CloseTarget:
-    try:
-        return validate_target(json.loads(value))
-    except ValueError as error:
-        raise processes.Refusal("armed target JSON is invalid") from error
-
-
-def watch(args: argparse.Namespace) -> int:
-    target_value = _frozen_target(args.target_json)
-    armed_at = args.armed_at
-    if armed_at <= 0:
-        raise processes.Refusal("armed timestamp is invalid")
-    deadline = time.monotonic() + args.timeout
-    while time.monotonic() < deadline:
-        if args.cancel.exists():
-            receipt(
-                args.receipt,
-                target_value,
-                "cancelled",
-                reason="caller supplied cancellation",
-            )
-            return 0
-        if _completion_matches(args.completion, args.completion_token, armed_at):
-            if args.delay:
-                time.sleep(args.delay)
-            if args.cancel.exists():
-                receipt(
-                    args.receipt,
-                    target_value,
-                    "cancelled",
-                    reason="caller supplied cancellation",
-                )
-                return 0
-            close(target_value, args.receipt)
-            return 0
-        time.sleep(0.1)
-    receipt(
-        args.receipt,
-        target_value,
-        "cancelled",
-        reason="completion was not supplied before timeout",
-    )
-    return 0
-
-
-def arm(args: argparse.Namespace) -> int:
-    target_value = target(args.target)
-    armed_at = time.time()
-    frozen_target = json.dumps(target_value, sort_keys=True, separators=(",", ":"))
-    receipt(
-        args.receipt,
-        target_value,
-        "armed",
-        armed_at=armed_at,
-        completion=str(args.completion),
-        cancel=str(args.cancel),
-    )
-    command = [
-        sys.executable,
-        "-I",
-        "-B",
-        "-m",
-        "tj_cli.close",
-        "watch",
-        "--target-json",
-        frozen_target,
-        "--armed-at",
-        str(armed_at),
-        "--receipt",
-        str(args.receipt),
-        "--completion",
-        str(args.completion),
-        "--completion-token",
-        args.completion_token,
-        "--cancel",
-        str(args.cancel),
-        "--delay",
-        str(args.delay),
-        "--timeout",
-        str(args.timeout),
-    ]
-    if sys.platform == "win32":
-        subprocess.Popen(
-            command,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP
-            | subprocess.DETACHED_PROCESS,
-        )
-    else:
-        subprocess.Popen(
-            command,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            start_new_session=True,
-        )
-    return 0
-
-
-def parser() -> argparse.ArgumentParser:
-    result = argparse.ArgumentParser(description=__doc__)
-    commands = result.add_subparsers(dest="command", required=True)
-    for name in ("close", "arm"):
-        command = commands.add_parser(name)
-        command.add_argument("--target", type=Path, required=True)
-        command.add_argument("--receipt", type=Path, required=True)
-        if name == "arm":
-            command.add_argument("--completion", type=Path, required=True)
-            command.add_argument("--completion-token", required=True)
-            command.add_argument("--cancel", type=Path, required=True)
-            command.add_argument("--delay", type=float, default=3.0)
-            command.add_argument("--timeout", type=float, default=900.0)
-    watch_command = commands.add_parser("watch")
-    watch_command.add_argument("--target-json", required=True)
-    watch_command.add_argument("--armed-at", type=float, required=True)
-    watch_command.add_argument("--receipt", type=Path, required=True)
-    watch_command.add_argument("--completion", type=Path, required=True)
-    watch_command.add_argument("--completion-token", required=True)
-    watch_command.add_argument("--cancel", type=Path, required=True)
-    watch_command.add_argument("--delay", type=float, default=3.0)
-    watch_command.add_argument("--timeout", type=float, default=900.0)
-    return result
-
-
-def main(argv: list[str] | None = None) -> int:
-    args = parser().parse_args(argv)
-    try:
-        if args.command == "close":
-            close(target(args.target), args.receipt)
-            return 0
-        return arm(args) if args.command == "arm" else watch(args)
-    except (OSError, ValueError, processes.Refusal) as error:
-        print("tj-cli close: " + str(error), file=sys.stderr)
-        return 2
-
-
 __all__ = [
     "CloseTarget",
     "ProcessTarget",
     "Receipt",
-    "arm",
     "close",
-    "main",
-    "parser",
     "receipt",
     "target",
     "terminal",
     "validate_target",
-    "watch",
 ]
