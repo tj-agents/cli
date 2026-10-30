@@ -34,6 +34,9 @@ enabled = true
 [plugins."rust@tj-agents"]
 enabled = true
 
+[plugins."skill@tj-agents"]
+enabled = true
+
 [plugins."template@tj-agents"]
 enabled = true
 

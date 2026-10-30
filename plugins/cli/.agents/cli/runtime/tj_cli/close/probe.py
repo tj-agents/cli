@@ -4,14 +4,14 @@ from __future__ import annotations
 
 import argparse
 import ctypes
-from ctypes import wintypes
 import json
-from pathlib import Path
 import subprocess
 import sys
 import time
-from typing import Any
 import uuid
+from ctypes import wintypes
+from pathlib import Path
+from typing import Any
 
 
 def _title(kernel32: Any) -> str:

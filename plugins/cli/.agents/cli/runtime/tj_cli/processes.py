@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
+import contextlib
 import math
 import os
-from pathlib import Path
-import subprocess
 import sys
 from collections.abc import Callable, Mapping
+from pathlib import Path
 from typing import NamedTuple
 
 
@@ -22,7 +22,7 @@ TOLERANCE_SECONDS = 0.01
 MAXIMUM_PID = 0xFFFFFFFF
 
 
-class Refusal(RuntimeError):
+class Refusal(RuntimeError):  # noqa: N818
     pass
 
 
@@ -48,7 +48,10 @@ def _linux_process(pid: int) -> ProcessInfo | None:
     try:
         ppid = int(fields[1])
         ticks = int(fields[19])
-        rate = os.sysconf("SC_CLK_TCK")
+        sysconf = getattr(os, "sysconf", None)
+        if not callable(sysconf):
+            raise OSError("process clock is unavailable")
+        rate = int(sysconf("SC_CLK_TCK"))
     except (IndexError, ValueError, OSError) as error:
         raise Refusal("malformed Linux process identity") from error
     return ProcessInfo(pid, ppid, _linux_boot_time() + ticks / rate)
@@ -227,10 +230,8 @@ def _stop_linux(pid: int, started: float, before_signal: Callable[[], None]) -> 
         if actual is None or abs(actual.started_at - started) > TOLERANCE_SECONDS:
             raise Refusal("frontend identity changed before close")
         before_signal()
-        try:
+        with contextlib.suppress(ProcessLookupError):
             signal.pidfd_send_signal(descriptor, signal.SIGTERM)
-        except ProcessLookupError:
-            pass
         if not select.select([descriptor], [], [], 5)[0]:
             raise Refusal("exact frontend exit was not confirmed")
     finally:
@@ -308,10 +309,10 @@ def descends_from(frontend: object, root: object) -> bool:
 
 __all__ = [
     "MAXIMUM_PID",
+    "TOLERANCE_SECONDS",
     "ProcessIdentity",
     "ProcessInfo",
     "Refusal",
-    "TOLERANCE_SECONDS",
     "descends_from",
     "matches",
     "process_info",
