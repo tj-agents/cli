@@ -13,12 +13,14 @@ from ctypes import wintypes
 from pathlib import Path
 from typing import Any
 
+from tj_cli import _windows
+
 
 def _title(kernel32: ctypes.CDLL) -> str:
     buffer = ctypes.create_unicode_buffer(32768)
     length = kernel32.GetConsoleTitleW(buffer, len(buffer))
     if not length:
-        raise OSError(ctypes.get_last_error(), "GetConsoleTitleW failed")
+        raise OSError(_windows.last_error(), "GetConsoleTitleW failed")
     return buffer.value
 
 
@@ -28,7 +30,7 @@ def _processes(kernel32: ctypes.CDLL) -> set[int]:
         values = (wintypes.DWORD * size)()
         count = kernel32.GetConsoleProcessList(values, size)
         if not count:
-            raise OSError(ctypes.get_last_error(), "GetConsoleProcessList failed")
+            raise OSError(_windows.last_error(), "GetConsoleProcessList failed")
         if count <= size:
             return {int(values[index]) for index in range(count)}
         size = count
@@ -64,17 +66,17 @@ def _inventory(adapter: Path) -> list[dict[str, Any]]:
 
 
 def prove(frontend_pid: int, tab_id: str, adapter: Path) -> bool:
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32 = _windows.kernel32()
     kernel32.FreeConsole()
     if not kernel32.AttachConsole(frontend_pid):
-        raise OSError(ctypes.get_last_error(), "AttachConsole failed")
+        raise OSError(_windows.last_error(), "AttachConsole failed")
     original = _title(kernel32)
     challenge = "tj-cli-binding-" + uuid.uuid4().hex
     try:
         if frontend_pid not in _processes(kernel32):
             return False
         if not kernel32.SetConsoleTitleW(challenge):
-            raise OSError(ctypes.get_last_error(), "SetConsoleTitleW failed")
+            raise OSError(_windows.last_error(), "SetConsoleTitleW failed")
         time.sleep(0.1)
         matches = [
             item
@@ -93,7 +95,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--tab-id", required=True)
     parser.add_argument("--inventory-adapter", type=Path, required=True)
     args = parser.parse_args(argv)
-    if sys.platform != "win32" or not args.inventory_adapter.is_file():
+    current_platform = sys.platform
+    if current_platform != "win32" or not args.inventory_adapter.is_file():
         print(json.dumps({"associated": False}))
         return 2
     try:
