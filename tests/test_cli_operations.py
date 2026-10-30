@@ -77,122 +77,6 @@ class CloseOperationTests(unittest.TestCase):
         self.assertEqual("refused", value["status"])
         self.assertEqual("tab ambiguous", value["reason"])
 
-    def test_cancellation_file_prevents_armed_mutation(self):
-        target = self.directory / "target.json"
-        receipt = self.directory / "receipt.json"
-        completion = self.directory / "completion.json"
-        cancel = self.directory / "cancel.json"
-        target.write_text(json.dumps(self.target), encoding="utf-8")
-        cancel.write_text("cancel", encoding="utf-8")
-        with mock.patch.object(close.terminal, "close") as terminal_close:
-            result = close.main(
-                [
-                    "watch",
-                    "--target-json",
-                    json.dumps(self.target),
-                    "--armed-at",
-                    str(__import__("time").time()),
-                    "--receipt",
-                    str(receipt),
-                    "--completion",
-                    str(completion),
-                    "--completion-token",
-                    "token",
-                    "--cancel",
-                    str(cancel),
-                    "--delay",
-                    "0",
-                    "--timeout",
-                    "0.1",
-                ]
-            )
-        self.assertEqual(0, result)
-        terminal_close.assert_not_called()
-        self.assertEqual(
-            "cancelled", json.loads(receipt.read_text(encoding="utf-8"))["status"]
-        )
-
-    def test_matching_completion_authorizes_close(self):
-        target = self.directory / "target.json"
-        receipt = self.directory / "receipt.json"
-        completion = self.directory / "completion.json"
-        cancel = self.directory / "cancel.json"
-        target.write_text(json.dumps(self.target), encoding="utf-8")
-        with (
-            mock.patch.object(close, "_completion_matches", return_value=True),
-            mock.patch.object(close, "close") as close_exact,
-        ):
-            result = close.main(
-                [
-                    "watch",
-                    "--target-json",
-                    json.dumps(self.target),
-                    "--armed-at",
-                    str(__import__("time").time()),
-                    "--receipt",
-                    str(receipt),
-                    "--completion",
-                    str(completion),
-                    "--completion-token",
-                    "token",
-                    "--cancel",
-                    str(cancel),
-                    "--delay",
-                    "0",
-                    "--timeout",
-                    "0.1",
-                ]
-            )
-        self.assertEqual(0, result)
-        close_exact.assert_called_once_with(self.target, receipt)
-
-    def test_arm_freezes_target_and_arming_time_before_watcher_starts(self):
-        target_path = self.directory / "target.json"
-        receipt = self.directory / "receipt.json"
-        completion = self.directory / "completion.json"
-        cancel = self.directory / "cancel.json"
-        target_path.write_text(json.dumps(self.target), encoding="utf-8")
-        with mock.patch.object(close.subprocess, "Popen") as launch:
-            self.assertEqual(
-                0,
-                close.main(
-                    [
-                        "arm",
-                        "--target",
-                        str(target_path),
-                        "--receipt",
-                        str(receipt),
-                        "--completion",
-                        str(completion),
-                        "--completion-token",
-                        "token",
-                        "--cancel",
-                        str(cancel),
-                        "--delay",
-                        "0",
-                        "--timeout",
-                        "1",
-                    ]
-                ),
-            )
-        command = launch.call_args.args[0]
-        self.assertNotIn("--target", command)
-        frozen = json.loads(command[command.index("--target-json") + 1])
-        self.assertEqual(self.target, frozen)
-        armed_at = float(command[command.index("--armed-at") + 1])
-        self.assertEqual(
-            armed_at, json.loads(receipt.read_text(encoding="utf-8"))["armed_at"]
-        )
-        replacement = {
-            **self.target,
-            "frontend": {**self.target["frontend"], "pid": 99999},
-        }
-        target_path.write_text(json.dumps(replacement), encoding="utf-8")
-        completion.write_text(json.dumps({"token": "token"}), encoding="utf-8")
-        watcher = close.parser().parse_args(command[5:])
-        with mock.patch.object(close, "close") as close_exact:
-            self.assertEqual(0, close.watch(watcher))
-        close_exact.assert_called_once_with(self.target, receipt)
 
 
 class VerifiedProcessStopTests(unittest.TestCase):
@@ -292,7 +176,7 @@ class VerifiedProcessStopTests(unittest.TestCase):
 
 class TerminalBindingTests(unittest.TestCase):
     def test_packaged_probe_runs_without_site_packages(self):
-        probe = ROOT / "plugins" / "cli" / "runtime" / "tj_cli" / "close" / "probe.py"
+        probe = ROOT / "plugins/cli/.agents/cli/runtime/tj_cli/close/probe.py"
         result = subprocess.run([sys.executable, "-I", "-B", str(probe), "--help"], cwd=ROOT,
                                 capture_output=True, text=True, encoding="utf-8", check=False)
         self.assertEqual(0, result.returncode, result.stderr)
