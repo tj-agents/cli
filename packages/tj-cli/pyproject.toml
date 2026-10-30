@@ -2,7 +2,7 @@
 name = "tj-cli"
 version = "0.1.0"
 description = "Reusable CLI and operating-system mechanics for TJ Agents"
-requires-python = ">=3.12"
+requires-python = ">=3.9"
 dependencies = []
 
 [build-system]

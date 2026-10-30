@@ -1,4 +1,3 @@
-import importlib.util
 import json
 import os
 from pathlib import Path
@@ -11,19 +10,9 @@ from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
-CLOSE_SCRIPTS = ROOT / ".agents" / "cli" / "utility" / "close" / "scripts"
 
-
-def load(name, path):
-    specification = importlib.util.spec_from_file_location(name, path)
-    module = importlib.util.module_from_spec(specification)
-    sys.path.insert(0, str(path.parent))
-    specification.loader.exec_module(module)
-    return module
-
-
-close = load("test_close", CLOSE_SCRIPTS / "close.py")
-closeout = load("test_closeout", ROOT / ".agents" / "cli" / "utility" / "closeout" / "scripts" / "closeout.py")
+from tj_cli import close, closeout, terminal
+import tj_cli.process.identity
 
 
 def git(cwd, *arguments):
@@ -47,7 +36,7 @@ class CloseOperationTests(unittest.TestCase):
                 time.sleep(0.01)
             else:
                 self.fail("disposable child did not exit")
-            self.assertIsNone(close.process_identity.process_info(pid))
+            self.assertIsNone(tj_cli.process.identity.process_info(pid))
         finally:
             os.waitpid(pid, 0)
 
@@ -55,21 +44,42 @@ class CloseOperationTests(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
         self.directory = Path(self.temporary.name)
-        info = close.process_identity.process_info(__import__("os").getpid())
+        info = tj_cli.process.identity.process_info(__import__("os").getpid())
         self.assertIsNotNone(info)
         self.target = {"schema_version": 1, "frontend": {"pid": info.pid, "started_at": info.started_at},
                        "wrapper": {"pid": info.pid, "started_at": info.started_at},
                        "terminal": {"kind": "tmux", "pane_id": "%1"}}
 
     def test_process_identity_rejects_reused_or_wrong_start(self):
-        self.assertTrue(close.process_identity.matches(self.target["frontend"]))
+        self.assertTrue(tj_cli.process.identity.matches(self.target["frontend"]))
         changed = {**self.target["frontend"], "started_at": self.target["frontend"]["started_at"] + 1}
-        self.assertFalse(close.process_identity.matches(changed))
+        self.assertFalse(tj_cli.process.identity.matches(changed))
+
+    def test_package_watcher_runs_in_isolated_child_and_obeys_cancellation(self):
+        receipt = self.directory / "receipt.json"
+        completion = self.directory / "completion.json"
+        cancel = self.directory / "cancel.json"
+        cancel.write_text("cancel", encoding="utf-8")
+        for entry in (Path(close.__file__).with_name("_close_entry.py"),
+                      ROOT / "plugins/cli/python/tj_cli/_close_entry.py"):
+            with self.subTest(entry=str(entry)):
+                command = [sys.executable, "-I", "-B", str(entry),
+                           "watch", "--target-json", json.dumps(self.target),
+                           "--armed-at", str(__import__("time").time()), "--receipt", str(receipt),
+                           "--completion", str(completion), "--completion-token", "token",
+                           "--cancel", str(cancel), "--delay", "0", "--timeout", "1"]
+
+                result = subprocess.run(command, cwd=self.directory, capture_output=True, text=True,
+                                        encoding="utf-8", timeout=10, check=False)
+
+                self.assertEqual(0, result.returncode, result.stderr)
+                self.assertEqual("cancelled", json.loads(receipt.read_text(encoding="utf-8"))["status"])
+
 
     def test_close_refusal_writes_durable_receipt_without_process_signal(self):
         receipt = self.directory / "receipt.json"
-        with mock.patch.object(close.terminal, "close", side_effect=close.process_identity.Refusal("tab ambiguous")):
-            with self.assertRaisesRegex(close.process_identity.Refusal, "tab ambiguous"):
+        with mock.patch.object(terminal, "close", side_effect=tj_cli.process.identity.Refusal("tab ambiguous")):
+            with self.assertRaisesRegex(tj_cli.process.identity.Refusal, "tab ambiguous"):
                 close.close(self.target, receipt)
         value = json.loads(receipt.read_text(encoding="utf-8"))
         self.assertEqual("refused", value["status"])
@@ -82,7 +92,7 @@ class CloseOperationTests(unittest.TestCase):
         cancel = self.directory / "cancel.json"
         target.write_text(json.dumps(self.target), encoding="utf-8")
         cancel.write_text("cancel", encoding="utf-8")
-        with mock.patch.object(close.terminal, "close") as terminal_close:
+        with mock.patch.object(terminal, "close") as terminal_close:
             result = close.main(["watch", "--target-json", json.dumps(self.target), "--armed-at", str(__import__("time").time()), "--receipt", str(receipt), "--completion",
                                  str(completion), "--completion-token", "token", "--cancel", str(cancel),
                                  "--delay", "0", "--timeout", "0.1"])
@@ -123,7 +133,7 @@ class CloseOperationTests(unittest.TestCase):
         replacement = {**self.target, "frontend": {**self.target["frontend"], "pid": 99999}}
         target_path.write_text(json.dumps(replacement), encoding="utf-8")
         completion.write_text(json.dumps({"token": "token"}), encoding="utf-8")
-        watcher = close.parser().parse_args(command[3:])
+        watcher = close.parser().parse_args(command[4:])
         with mock.patch.object(close, "close") as close_exact:
             self.assertEqual(0, close.watch(watcher))
         close_exact.assert_called_once_with(self.target, receipt)
@@ -148,22 +158,22 @@ class VerifiedProcessStopTests(unittest.TestCase):
     def _frontend(self):
         process = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
         self.processes.append(process)
-        info = close.process_identity.process_info(process.pid)
+        info = tj_cli.process.identity.process_info(process.pid)
         self.assertIsNotNone(info)
         return process, {"pid": info.pid, "started_at": info.started_at}
 
     def _assert_preserved(self, frontend, sibling):
         self.assertIsNotNone(frontend.poll())
         self.assertIsNone(sibling.poll(), "sibling process was signalled")
-        self.assertTrue(close.process_identity.matches({
-            "pid": os.getpid(), "started_at": close.process_identity.process_info(os.getpid()).started_at,
+        self.assertTrue(tj_cli.process.identity.matches({
+            "pid": os.getpid(), "started_at": tj_cli.process.identity.process_info(os.getpid()).started_at,
         }), "parent process changed")
         self.assertTrue(ROOT.is_dir(), "checkout was removed")
 
     def test_stops_only_the_disposable_frontend(self):
         frontend, identity = self._frontend()
         sibling, _sibling_identity = self._frontend()
-        close.process_identity.stop(identity, before_signal=lambda: None)
+        tj_cli.process.identity.stop(identity, before_signal=lambda: None)
         self._assert_preserved(frontend, sibling)
 
     def test_wrong_birth_refuses_without_signalling_any_process(self):
@@ -171,8 +181,8 @@ class VerifiedProcessStopTests(unittest.TestCase):
         sibling, _sibling_identity = self._frontend()
         wrong_birth = {**identity, "started_at": identity["started_at"] + 1}
         before_signal = mock.Mock()
-        with self.assertRaisesRegex(close.process_identity.Refusal, "identity changed"):
-            close.process_identity.stop(wrong_birth, before_signal=before_signal)
+        with self.assertRaisesRegex(tj_cli.process.identity.Refusal, "identity changed"):
+            tj_cli.process.identity.stop(wrong_birth, before_signal=before_signal)
         before_signal.assert_not_called()
         self.assertIsNone(frontend.poll(), "wrong birth signalled the frontend")
         self.assertIsNone(sibling.poll(), "wrong birth signalled the sibling")
@@ -182,8 +192,8 @@ class VerifiedProcessStopTests(unittest.TestCase):
         sibling, _sibling_identity = self._frontend()
         oversized = {**identity, "pid": identity["pid"] + 2 ** 32}
         before_signal = mock.Mock()
-        with self.assertRaisesRegex(close.process_identity.Refusal, "pid"):
-            close.process_identity.stop(oversized, before_signal=before_signal)
+        with self.assertRaisesRegex(tj_cli.process.identity.Refusal, "pid"):
+            tj_cli.process.identity.stop(oversized, before_signal=before_signal)
         before_signal.assert_not_called()
         self.assertIsNone(frontend.poll(), "oversized pid signalled the frontend")
         self.assertIsNone(sibling.poll(), "oversized pid signalled the sibling")
@@ -193,10 +203,10 @@ class VerifiedProcessStopTests(unittest.TestCase):
         sibling, _sibling_identity = self._frontend()
 
         def new_input():
-            raise close.process_identity.Refusal("frontend input changed")
+            raise tj_cli.process.identity.Refusal("frontend input changed")
 
-        with self.assertRaisesRegex(close.process_identity.Refusal, "input changed"):
-            close.process_identity.stop(identity, before_signal=new_input)
+        with self.assertRaisesRegex(tj_cli.process.identity.Refusal, "input changed"):
+            tj_cli.process.identity.stop(identity, before_signal=new_input)
         self.assertIsNone(frontend.poll(), "refusing guard signalled the frontend")
         self.assertIsNone(sibling.poll(), "refusing guard signalled the sibling")
 
@@ -204,7 +214,7 @@ class VerifiedProcessStopTests(unittest.TestCase):
         frontend, identity = self._frontend()
         sibling, _sibling_identity = self._frontend()
         with self.assertRaisesRegex(RuntimeError, "guard failed"):
-            close.process_identity.stop(identity, before_signal=lambda: (_ for _ in ()).throw(RuntimeError("guard failed")))
+            tj_cli.process.identity.stop(identity, before_signal=lambda: (_ for _ in ()).throw(RuntimeError("guard failed")))
         self.assertIsNone(frontend.poll(), "raising guard signalled the frontend")
         self.assertIsNone(sibling.poll(), "raising guard signalled the sibling")
 
@@ -214,16 +224,16 @@ class TerminalBindingTests(unittest.TestCase):
         values = [{"runtimeId": "42:100:2", "automationId": "", "processId": 77, "title": "same title"},
                   {"runtimeId": "42:100:3", "automationId": "", "processId": 77, "title": "same title"}]
         response = subprocess.CompletedProcess([], 0, json.dumps(values), "")
-        with mock.patch.object(close.terminal, "os", SimpleNamespace(name="nt")), \
-                mock.patch.object(close.terminal, "_run", return_value=response):
-            inventory = close.terminal._windows({"kind": "windows-terminal"})
+        with mock.patch.object(terminal, "os", SimpleNamespace(name="nt")), \
+                mock.patch.object(terminal, "_run", return_value=response):
+            inventory = terminal._windows({"kind": "windows-terminal"})
         self.assertEqual(["42:100:2", "42:100:3"], [item["runtime_id"] for item in inventory])
         target = {"kind": "windows-terminal", "tab_binding": {"runtime_id": "42:100:3"}}
-        self.assertFalse(close.terminal._matches(inventory[0], target))
-        self.assertTrue(close.terminal._matches(inventory[1], target))
+        self.assertFalse(terminal._matches(inventory[0], target))
+        self.assertTrue(terminal._matches(inventory[1], target))
 
     def setUp(self):
-        info = close.process_identity.ProcessInfo
+        info = tj_cli.process.identity.ProcessInfo
         self.processes = {
             10: info(10, 1, 100.0),
             20: info(20, 10, 200.0),
@@ -235,21 +245,21 @@ class TerminalBindingTests(unittest.TestCase):
                        "terminal": {"kind": "tmux", "pane_id": "%1"}}
 
     def test_wrapper_beneath_native_pane_root_owns_frontend(self):
-        with mock.patch.object(close.process_identity, "process_info", side_effect=self.processes.get), \
-                mock.patch.object(close.terminal, "_one", return_value={"kind": "tmux", "pid": 10}):
-            close.terminal.verify_binding(self.target)
+        with mock.patch.object(tj_cli.process.identity, "process_info", side_effect=self.processes.get), \
+                mock.patch.object(terminal, "_one", return_value={"kind": "tmux", "pid": 10}):
+            terminal.verify_binding(self.target)
 
     def test_windows_same_window_sibling_refuses_without_console_tab_association(self):
         target = {**self.target, "terminal": {"kind": "windows-terminal", "tab_binding": {
             "runtime_id": "tab-b", "observed_title": "launch title",
             "evidence": "windows-uia-unique-title-at-launch"}}}
-        with mock.patch.object(close.process_identity, "process_info", side_effect=self.processes.get), \
-                mock.patch.object(close.terminal, "_one", return_value={
+        with mock.patch.object(tj_cli.process.identity, "process_info", side_effect=self.processes.get), \
+                mock.patch.object(terminal, "_one", return_value={
                     "kind": "windows-terminal", "runtime_id": "tab-b", "pid": 77
-                }), mock.patch.object(close.terminal, "_windows_console_association", return_value=False), \
-                mock.patch.object(close.terminal, "_run") as mutate:
-            with self.assertRaisesRegex(close.process_identity.Refusal, "cannot prove frontend belongs"):
-                close.terminal.close(target)
+                }), mock.patch.object(terminal, "_windows_console_association", return_value=False), \
+                mock.patch.object(terminal, "_run") as mutate:
+            with self.assertRaisesRegex(tj_cli.process.identity.Refusal, "cannot prove frontend belongs"):
+                terminal.close(target)
         mutate.assert_not_called()
 
     def test_windows_console_association_runs_isolated_probe_and_refuses_negative_result(self):
@@ -258,28 +268,30 @@ class TerminalBindingTests(unittest.TestCase):
             "evidence": "windows-uia-unique-title-at-launch"}}
         frontend = {"pid": 30, "started_at": 300.0}
         success = subprocess.CompletedProcess([], 0, '{"associated": true}', "")
-        with mock.patch.object(close.terminal, "os", SimpleNamespace(name="nt")), \
-                mock.patch.multiple(close.terminal.subprocess, DETACHED_PROCESS=8,
+        with mock.patch.object(terminal, "os", SimpleNamespace(name="nt")), \
+                mock.patch.multiple(terminal.subprocess, DETACHED_PROCESS=8,
                                     CREATE_NEW_PROCESS_GROUP=512, create=True), \
-                mock.patch.object(close.terminal.subprocess, "run", return_value=success) as run_probe:
-            self.assertTrue(close.terminal._windows_console_association(frontend, identity))
+                mock.patch.object(terminal.subprocess, "run", return_value=success) as run_probe:
+            self.assertTrue(terminal._windows_console_association(frontend, identity))
         command = run_probe.call_args.args[0]
         self.assertEqual(sys.executable, command[0])
+        self.assertEqual(["-I", "-B"], command[1:3])
+        self.assertEqual("_console_probe_entry.py", Path(command[3]).name)
         self.assertEqual(["--frontend-pid", "30", "--tab-id", "tab-b", "--inventory-adapter"],
-                         command[3:8])
+                         command[4:9])
         self.assertTrue(run_probe.call_args.kwargs["creationflags"])
         negative = subprocess.CompletedProcess([], 2, '{"associated": false}', "")
-        with mock.patch.object(close.terminal, "os", SimpleNamespace(name="nt")), \
-                mock.patch.object(close.terminal.subprocess, "run", return_value=negative):
-            self.assertFalse(close.terminal._windows_console_association(frontend, identity))
+        with mock.patch.object(terminal, "os", SimpleNamespace(name="nt")), \
+                mock.patch.object(terminal.subprocess, "run", return_value=negative):
+            self.assertFalse(terminal._windows_console_association(frontend, identity))
 
     def test_last_tmux_pane_accepts_only_verified_server_disappearance(self):
         result = subprocess.CompletedProcess(["tmux"], 0, "", "")
-        with mock.patch.object(close.terminal, "verify_binding"), \
-                mock.patch.object(close.terminal, "_run", return_value=result), \
-                mock.patch.object(close.terminal, "_inventory", side_effect=close.process_identity.Refusal("tmux inventory failed")), \
-                mock.patch.object(close.terminal, "_tmux_server_disappeared", return_value=True):
-            close.terminal.close(self.target)
+        with mock.patch.object(terminal, "verify_binding"), \
+                mock.patch.object(terminal, "_run", return_value=result), \
+                mock.patch.object(terminal, "_inventory", side_effect=tj_cli.process.identity.Refusal("tmux inventory failed")), \
+                mock.patch.object(terminal, "_tmux_server_disappeared", return_value=True):
+            terminal.close(self.target)
 
 
 class CloseoutPreflightTests(unittest.TestCase):
@@ -309,7 +321,7 @@ class CloseoutPreflightTests(unittest.TestCase):
         git(self.linked, "fetch", "-q", "origin")
         self.head = git(self.linked, "rev-parse", "HEAD")
         self.eligibility = root / "eligibility.json"
-        info = close.process_identity.process_info(__import__("os").getpid())
+        info = tj_cli.process.identity.process_info(__import__("os").getpid())
         self.target = {"schema_version": 1, "frontend": {"pid": info.pid, "started_at": info.started_at},
                        "wrapper": {"pid": info.pid, "started_at": info.started_at},
                        "terminal": {"kind": "tmux", "pane_id": "%1"}}
@@ -351,7 +363,7 @@ class CloseoutPreflightTests(unittest.TestCase):
         target = self.primary.parent / "target.json"
         receipt = self.primary.parent / "receipt.json"
         target.write_text(json.dumps(self.target), encoding="utf-8")
-        with mock.patch.object(closeout.close, "close") as close_exact:
+        with mock.patch.object(close, "close") as close_exact:
             result = closeout.main(["run", "--target", str(target), "--worktree", str(self.linked),
                 "--expected-head", self.head, "--expected-branch", "feature", "--remote-base", "origin/main",
                 "--eligibility", str(self.eligibility), "--receipt", str(receipt)])
@@ -374,7 +386,7 @@ class CloseoutPreflightTests(unittest.TestCase):
         target = self.primary.parent / "target.json"
         receipt = self.primary.parent / "receipt.json"
         target.write_text(json.dumps(self.target), encoding="utf-8")
-        with mock.patch.object(closeout.close, "close") as close_exact:
+        with mock.patch.object(close, "close") as close_exact:
             result = closeout.main(["run", "--target", str(target), "--worktree", str(self.linked),
                 "--expected-head", self.head, "--expected-branch", "feature", "--remote-base", "origin/main",
                 "--eligibility", str(self.eligibility), "--receipt", str(receipt)])
@@ -405,7 +417,7 @@ class CloseoutPreflightTests(unittest.TestCase):
         target = self.primary.parent / "target.json"
         receipt = self.primary.parent / "receipt.json"
         target.write_text(json.dumps(self.target), encoding="utf-8")
-        with mock.patch.object(closeout.close, "close") as close_exact:
+        with mock.patch.object(close, "close") as close_exact:
             result = closeout.main(["run", "--target", str(target), "--worktree", str(self.linked),
                 "--expected-head", self.head, "--expected-branch", "feature", "--remote-base", "origin/main",
                 "--eligibility", str(self.eligibility), "--receipt", str(receipt)])
@@ -420,7 +432,7 @@ class CloseoutPreflightTests(unittest.TestCase):
         receipt.write_text(json.dumps({"schema_version": 1, "operation": "cli-closeout",
             "status": "closed-removal-failed", "target": self.target, "worktree": str(self.linked.resolve())}),
             encoding="utf-8")
-        with mock.patch.object(closeout.close, "close") as close_exact:
+        with mock.patch.object(close, "close") as close_exact:
             result = closeout.main(["retry-remove", "--worktree", str(self.linked), "--expected-head", self.head,
                 "--expected-branch", "feature", "--remote-base", "origin/main", "--eligibility",
                 str(self.eligibility), "--receipt", str(receipt)])
@@ -437,7 +449,7 @@ class CloseoutPreflightTests(unittest.TestCase):
         def close_then_change(*_args):
             (self.linked / "late.txt").write_text("late", encoding="utf-8")
 
-        with mock.patch.object(closeout.close, "close", side_effect=close_then_change):
+        with mock.patch.object(close, "close", side_effect=close_then_change):
             result = closeout.main(["run", "--target", str(target_path), "--worktree", str(self.linked),
                 "--expected-head", self.head, "--expected-branch", "feature", "--remote-base", "origin/main",
                 "--eligibility", str(self.eligibility), "--receipt", str(receipt)])
@@ -450,6 +462,34 @@ class CloseoutPreflightTests(unittest.TestCase):
         self.assertEqual(2, result)
         self.assertTrue(self.linked.exists())
 
+
+
+class SkillAdapterBoundaryTests(unittest.TestCase):
+    def test_missing_own_bundle_refuses_installed_or_outer_package(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            outer = Path(temporary)
+            (outer / ".agents/plugins").mkdir(parents=True)
+            (outer / ".agents/plugins/payloads.json").write_text("{}", encoding="utf-8")
+            (outer / "pyproject.toml").write_text("", encoding="utf-8")
+            package = outer / "packages/tj-cli/src/tj_cli"
+            package.mkdir(parents=True)
+            (package / "__init__.py").write_text("raise RuntimeError('borrowed outer package')", encoding="utf-8")
+            for host in ("claude", "codex"):
+                payload = outer / host
+                declaration = payload / ("." + host + "-plugin")
+                declaration.mkdir(parents=True)
+                (declaration / "plugin.json").write_text("{}", encoding="utf-8")
+                for subject in ("close", "closeout"):
+                    with self.subTest(host=host, subject=subject):
+                        script = payload / ".agents/cli/skills" / subject / "scripts" / (subject + ".py")
+                        script.parent.mkdir(parents=True)
+                        original = ROOT / ".agents/cli/skills" / subject / "scripts" / (subject + ".py")
+                        script.write_text(original.read_text(encoding="utf-8"), encoding="utf-8")
+                        result = subprocess.run([sys.executable, "-I", "-B", str(script), "--help"],
+                                                cwd=outer, capture_output=True, text=True, timeout=10, check=False)
+                        self.assertNotEqual(0, result.returncode)
+                        self.assertIn("missing its declared Python bundle", result.stderr)
+                        self.assertNotIn("borrowed outer package", result.stderr)
 
 if __name__ == "__main__":
     unittest.main()

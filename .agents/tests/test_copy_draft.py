@@ -14,7 +14,7 @@ import unittest
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[2]
-SCRIPT = ROOT / '.agents/cli/utility/clip/scripts/copy_draft.py'
+SCRIPT = ROOT / '.agents/cli/skills/clip/scripts/copy_draft.py'
 SPEC = importlib.util.spec_from_file_location('copy_draft', SCRIPT)
 COPY_DRAFT = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = COPY_DRAFT
