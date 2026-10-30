@@ -41,11 +41,12 @@ internal setting exists. A setting that takes effect on a later turn does not co
 current turn. Never send a host slash command through a shell or edit host databases or session files
 to simulate a change.
 
-Before an actual native switch, inspect this conversation's owned children through the supported host
-inventory. Collect completed or failed results and preserve their useful evidence, then retire only
-disposable completed or failed owned handles through supported native controls. Preserve active useful
-work and checkpoint its task, directory and pending results before switching. Leave unknown or
-unrelated handles and shared backend processes alone. Exclude the inventory/preflight process itself
+Before an actual native switch, inspect this conversation's owned child agents and background-terminal
+handles through the supported host inventory. Collect completed or failed results and preserve their
+useful evidence, then retire only disposable completed or failed owned handles through supported native
+controls. Preserve active useful work and checkpoint its task, directory and pending results. Switch
+only when that work's lifecycle permits it; otherwise wait or report the exact blocker. Leave unknown
+or unrelated handles and shared backend processes alone. Exclude the inventory/preflight process itself
 from child cleanup and await its completion before switching. An unavailable or ambiguous inventory
 does not authorize blind cleanup.
 
