@@ -3,16 +3,15 @@
 from __future__ import annotations
 
 import argparse
-from collections.abc import Callable
 import json
-from pathlib import Path
 import subprocess
 import sys
 import time
+from collections.abc import Callable
+from pathlib import Path
 from typing import cast
 
-from tj_cli import processes
-from tj_cli import close
+from tj_cli import close, processes
 
 ELIGIBILITY_MAX_AGE_SECONDS = 300
 type Guard = Callable[[], None]
@@ -255,12 +254,12 @@ def closeout(
         raise
     receipt(receipt_path, target, "closed", worktree=str(worktree), removal="pending")
     try:
-        before_remove()
         preflight(
             worktree, expected_head, expected_branch, remote_base, eligibility, target
         )
+        before_remove()
         _git(_primary_checkout(worktree), "worktree", "remove", str(worktree))
-    except Exception as error:
+    except Exception as error:  # noqa: BLE001
         receipt(
             receipt_path,
             target,
@@ -280,6 +279,8 @@ def retry_remove(
     remote_base: str,
     eligibility: Path,
     receipt_path: Path,
+    *,
+    before_remove: Guard,
 ) -> bool:
     value = _json(receipt_path)
     worktree = worktree.resolve()
@@ -304,8 +305,9 @@ def retry_remove(
             eligibility,
             valid_target,
         )
+        before_remove()
         _git(_primary_checkout(worktree), "worktree", "remove", str(worktree))
-    except (OSError, ValueError, subprocess.SubprocessError, Refusal) as error:
+    except Exception as error:  # noqa: BLE001
         receipt(
             receipt_path,
             valid_target,
@@ -356,6 +358,7 @@ def retry(args: argparse.Namespace) -> int:
             args.remote_base,
             args.eligibility,
             args.receipt,
+            before_remove=_no_guard,
         )
         else 2
     )

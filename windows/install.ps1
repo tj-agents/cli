@@ -14,7 +14,7 @@ param(
 $ErrorActionPreference = 'Stop'
 if ($IsLinux -or $IsMacOS) { throw 'install.ps1 is for Windows - use ./install.sh on Linux and macOS' }
 $repo = Split-Path -Parent $PSScriptRoot
-$target = Join-Path $BinDir 'tj.exe'
+$binaries = @('tj.exe', 'tj_hook.exe')
 $begin = '# >>> tj-agents/cli >>>'
 $end = '# <<< tj-agents/cli <<<'
 $script:status = 0
@@ -38,22 +38,28 @@ function Set-Block([string]$File, [string]$Body) {
     Say updated $File
 }
 
-function Install-Binary {
+function Install-Binaries {
     if ($Uninstall) {
-        if (Test-Path -LiteralPath $target) { Remove-Item -LiteralPath $target -Force; Say removed $target }
-        else { Say ok "$target (not installed)" }
+        foreach ($binary in $binaries) {
+            $target = Join-Path $BinDir $binary
+            if (Test-Path -LiteralPath $target) { Remove-Item -LiteralPath $target -Force; Say removed $target }
+            else { Say ok "$target (not installed)" }
+        }
         return
     }
     if ($Check) {
-        if (Test-Path -LiteralPath $target) { Say ok "$target ($(& $target --version))" }
-        else { Say missing $target; $script:status = 1 }
+        foreach ($binary in $binaries) {
+            $target = Join-Path $BinDir $binary
+            if (Test-Path -LiteralPath $target) { Say ok "$target ($((& $target --version | Out-String).Trim()))" }
+            else { Say missing $target; $script:status = 1 }
+        }
         return
     }
 
     if (Get-Command cargo -ErrorAction SilentlyContinue) {
         & cargo build --release --locked --quiet --manifest-path (Join-Path $repo 'Cargo.toml')
         if ($LASTEXITCODE -ne 0) { throw 'cargo build failed' }
-        $built = Join-Path $repo 'target\release\tj.exe'
+        $builtDirectory = Join-Path $repo 'target\release'
     }
     elseif (Get-Command gh -ErrorAction SilentlyContinue) {
         $tmp = Join-Path ([IO.Path]::GetTempPath()) ('tj-' + [guid]::NewGuid().ToString('N'))
@@ -61,16 +67,20 @@ function Install-Binary {
         & gh release download --repo tj-agents/cli --pattern 'tj-x86_64-pc-windows-msvc.zip' --dir $tmp --clobber
         if ($LASTEXITCODE -ne 0) { throw 'gh release download failed' }
         Expand-Archive -LiteralPath (Join-Path $tmp 'tj-x86_64-pc-windows-msvc.zip') -DestinationPath $tmp -Force
-        $built = Join-Path $tmp 'tj.exe'
+        $builtDirectory = $tmp
     }
     else { throw 'install needs either cargo (to build) or gh (to download a release)' }
 
-    $same = (Test-Path -LiteralPath $target) -and
-        ((Get-FileHash -LiteralPath $built).Hash -eq (Get-FileHash -LiteralPath $target).Hash)
-    if ($same) { Say ok $target; return }
     if (-not (Test-Path -LiteralPath $BinDir)) { [void](New-Item -ItemType Directory -Path $BinDir -Force) }
-    Copy-Item -LiteralPath $built -Destination $target -Force
-    Say installed "$target ($(& $target --version))"
+    foreach ($binary in $binaries) {
+        $target = Join-Path $BinDir $binary
+        $built = Join-Path $builtDirectory $binary
+        $same = (Test-Path -LiteralPath $target) -and
+            ((Get-FileHash -LiteralPath $built).Hash -eq (Get-FileHash -LiteralPath $target).Hash)
+        if ($same) { Say ok $target; continue }
+        Copy-Item -LiteralPath $built -Destination $target -Force
+        Say installed "$target ($((& $target --version | Out-String).Trim()))"
+    }
 }
 
 # The user PATH lives in the registry; this process's PATH is updated too so the rest of the script
@@ -103,7 +113,7 @@ function Test-Fzf {
     else { Say missing 'fzf - install it with: winget install junegunn.fzf'; $script:status = 1 }
 }
 
-Install-Binary
+Install-Binaries
 if ($IsWindows -or $PSVersionTable.PSEdition -eq 'Desktop') { Set-UserPath }
 Test-Fzf
 

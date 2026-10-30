@@ -8,7 +8,7 @@
     {
       "plugin": "cli",
       "distribution": "tj-cli",
-      "destination": "runtime"
+      "destination": ".agents/cli/runtime"
     }
   ]
 }
