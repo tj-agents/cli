@@ -3,6 +3,7 @@
   "dependencies": [],
   "profiles": {
     "core": [
+      "cd",
       "clip",
       "close",
       "closeout"
@@ -10,6 +11,20 @@
   },
   "compatibilitySkillAliases": {},
   "skills": [
+    {
+      "name": "cd",
+      "kind": "utility",
+      "profile": "core",
+      "applicability": [
+        "all projects"
+      ],
+      "requires": [
+        "current host directory and session interfaces when available"
+      ],
+      "provenance": [
+        "house"
+      ]
+    },
     {
       "name": "clip",
       "kind": "utility",

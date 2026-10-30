@@ -1,6 +1,6 @@
 {
   "name": "cli",
-  "description": "Deterministic CLI terminal and linked-worktree operations.",
+  "description": "CLI directory navigation, terminal and linked-worktree operations.",
   "author": {
     "name": "ThomasSeery"
   },
@@ -13,11 +13,11 @@
   ],
   "interface": {
     "displayName": "CLI operations",
-    "shortDescription": "Deterministic CLI terminal and linked-worktree operations.",
-    "longDescription": "Deterministic CLI terminal and linked-worktree operations.",
+    "shortDescription": "CLI directory navigation, terminal and linked-worktree operations.",
+    "longDescription": "CLI directory navigation, terminal and linked-worktree operations.",
     "developerName": "ThomasSeery",
     "category": "Productivity",
     "capabilities": [],
-    "defaultPrompt": "Use the selected deterministic CLI operation."
+    "defaultPrompt": "Use the selected CLI operation."
   }
 }
