@@ -275,8 +275,10 @@ class TerminalBindingTests(unittest.TestCase):
             self.assertTrue(terminal._windows_console_association(frontend, identity))
         command = run_probe.call_args.args[0]
         self.assertEqual(sys.executable, command[0])
+        self.assertEqual(["-I", "-B"], command[1:3])
+        self.assertEqual("_console_probe_entry.py", Path(command[3]).name)
         self.assertEqual(["--frontend-pid", "30", "--tab-id", "tab-b", "--inventory-adapter"],
-                         command[3:8])
+                         command[4:9])
         self.assertTrue(run_probe.call_args.kwargs["creationflags"])
         negative = subprocess.CompletedProcess([], 2, '{"associated": false}', "")
         with mock.patch.object(terminal, "os", SimpleNamespace(name="nt")), \
