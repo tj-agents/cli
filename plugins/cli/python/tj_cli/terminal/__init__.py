@@ -235,13 +235,14 @@ def _windows_console_association(
 ) -> bool:
     if os.name != "nt":
         return False
-    probe = Path(__file__).with_name("console_probe.py")
+    probe = Path(__file__).resolve().parent.parent / "_console_probe_entry.py"
     adapter = verified_close_adapter_path()
     if not probe.is_file() or not adapter.is_file():
         return False
     frontend_pid, _started = tj_cli.process.identity.valid_identity(frontend)
     command = [
         sys.executable,
+        "-I",
         "-B",
         str(probe),
         "--frontend-pid",
