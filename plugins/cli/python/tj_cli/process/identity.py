@@ -5,9 +5,12 @@ from __future__ import annotations
 import contextlib
 import math
 import os
+import platform
 import sys
 from pathlib import Path
 from typing import Any, Callable, NamedTuple
+
+from tj_cli import _windows
 
 
 class ProcessInfo(NamedTuple):
@@ -59,7 +62,7 @@ def _windows_process(pid: int) -> ProcessInfo | None:
     import ctypes
     from ctypes import wintypes
 
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32 = _windows.kernel32()
     kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
     kernel32.OpenProcess.restype = wintypes.HANDLE
     kernel32.GetProcessTimes.argtypes = [
@@ -144,7 +147,7 @@ def process_info(pid: object) -> ProcessInfo | None:
         return None
     if os.name == "nt":
         return _windows_process(pid)
-    if sys.platform.startswith("linux"):
+    if platform.system() == "Linux":
         return _linux_process(pid)
     return None
 
@@ -237,7 +240,7 @@ def _stop_windows(pid: int, started: float, before_signal: Callable[[], None]) -
     import ctypes
     from ctypes import wintypes
 
-    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel = _windows.kernel32()
     kernel.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
     kernel.OpenProcess.restype = wintypes.HANDLE
     kernel.CloseHandle.argtypes = [wintypes.HANDLE]
