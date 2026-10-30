@@ -391,6 +391,8 @@ def verify_binding(target: Target) -> None:
     verify_process_binding(terminal, wrapper)
     if not processes.descends_from(frontend, wrapper):
         raise processes.Refusal("frontend is not owned by the dedicated wrapper")
+    if terminal.get("kind") == "windows-terminal":
+        verify_process_binding(terminal, frontend)
 
 
 def close(target: Target, *, before_close: Guard = _no_guard) -> None:
@@ -414,7 +416,7 @@ def close_identity(identity: Mapping[str, object], *, before_close: Guard) -> No
     elif kind == "kitty":
         listen, window = (
             _nonempty(exact.get("listen_on")),
-            _nonempty(exact.get("window_id")),
+            _nonempty(str(exact.get("window_id", ""))),
         )
         if not listen or not window:
             raise processes.Refusal("kitty target needs listen_on and window_id")
@@ -466,11 +468,11 @@ def focus(identity: Mapping[str, object]) -> None:
         if not result.returncode:
             result = _run(_tmux_command(exact, "select-pane", "-t", pane))
         if not result.returncode:
-            _run(_tmux_command(exact, "switch-client", "-t", pane))
+            result = _run(_tmux_command(exact, "switch-client", "-t", pane))
     elif kind == "kitty":
         listen, window = (
             _nonempty(exact.get("listen_on")),
-            _nonempty(exact.get("window_id")),
+            _nonempty(str(exact.get("window_id", ""))),
         )
         if not listen or not window:
             raise processes.Refusal("kitty target needs listen_on and window_id")

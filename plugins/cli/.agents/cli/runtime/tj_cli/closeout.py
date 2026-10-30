@@ -242,7 +242,7 @@ def closeout(
             before_close()
 
         close.close(target, receipt_path, before_close=guarded_close)
-    except Refusal as error:
+    except Exception as error:
         receipt(
             receipt_path,
             target,

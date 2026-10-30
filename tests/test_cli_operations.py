@@ -175,6 +175,45 @@ class VerifiedProcessStopTests(unittest.TestCase):
 
 
 class TerminalBindingTests(unittest.TestCase):
+    def test_separate_frontend_console_refuses_before_closing_wrapper_tab(self):
+        target = {**self.target, "terminal": {"kind": "windows-terminal", "runtime_id": "tab"}}
+        with (
+            mock.patch.object(processes, "process_info", side_effect=self.processes.get),
+            mock.patch.object(close.terminal, "_one", return_value={"kind": "windows-terminal", "runtime_id": "tab"}),
+            mock.patch.object(close.terminal, "_windows_console_association", side_effect=lambda identity, _tab: identity["pid"] == 20),
+            mock.patch.object(close.terminal, "_run") as mutate,
+        ):
+            with self.assertRaisesRegex(processes.Refusal, "cannot prove frontend belongs"):
+                close.terminal.close(target)
+        mutate.assert_not_called()
+
+    def test_numeric_kitty_ids_work_for_exact_close_and_focus(self):
+        identity = {"kind": "kitty", "listen_on": "unix:/kitty", "window_id": 12}
+        item = {**identity, "window_id": "12"}
+        response = subprocess.CompletedProcess([], 0, "", "")
+        with (
+            mock.patch.object(close.terminal, "_inventory", side_effect=[[item], []]),
+            mock.patch.object(close.terminal, "_run", return_value=response) as run,
+        ):
+            close.terminal.close_identity(identity, before_close=lambda: None)
+        self.assertEqual("id:12", run.call_args.args[0][-1])
+        with (
+            mock.patch.object(close.terminal, "_inventory", return_value=[item]),
+            mock.patch.object(close.terminal, "_run", return_value=response) as run,
+        ):
+            close.terminal.focus(identity)
+        self.assertEqual("id:12", run.call_args.args[0][-1])
+
+    def test_tmux_focus_reports_a_missing_attached_client(self):
+        response = subprocess.CompletedProcess([], 0, "", "")
+        failure = subprocess.CompletedProcess([], 1, "", "no current client")
+        with (
+            mock.patch.object(close.terminal, "_one", return_value={"kind": "tmux", "pane_id": "%1"}),
+            mock.patch.object(close.terminal, "_run", side_effect=[response, response, failure]),
+        ):
+            with self.assertRaisesRegex(processes.Refusal, "no current client"):
+                close.terminal.focus({"kind": "tmux", "pane_id": "%1"})
+
     def test_packaged_probe_runs_without_site_packages(self):
         probe = ROOT / "plugins/cli/.agents/cli/runtime/tj_cli/close/probe.py"
         result = subprocess.run([sys.executable, "-I", "-B", str(probe), "--help"], cwd=ROOT,
@@ -377,6 +416,22 @@ class TerminalBindingTests(unittest.TestCase):
 
 
 class CloseoutPreflightTests(unittest.TestCase):
+    def test_guard_exception_preserves_closeout_receipt_and_worktree(self):
+        receipt = self.primary.parent / "refusal.json"
+        def terminal_close(_target, *, before_close):
+            before_close()
+        def changed_input():
+            raise RuntimeError("new input")
+        with mock.patch.object(closeout.close.terminal, "close", side_effect=terminal_close):
+            with self.assertRaisesRegex(RuntimeError, "new input"):
+                closeout.closeout(self.linked, self.head, "feature", "origin/main", self.eligibility,
+                                  self.target, receipt, before_close=changed_input, before_remove=lambda: None)
+        value = json.loads(receipt.read_text(encoding="utf-8"))
+        self.assertEqual("cli-closeout", value["operation"])
+        self.assertEqual("closure", value["phase"])
+        self.assertEqual(str(self.linked.resolve()), value["worktree"])
+        self.assertTrue(self.linked.is_dir())
+
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
