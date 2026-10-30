@@ -698,11 +698,13 @@ print(json.dumps({'name': distribution.metadata['Name'],
         ) and relative.name in {
             "INSTALLER",
             "REQUESTED",
+            "WHEEL",
             "RECORD",
             "RECORD.jws",
             "RECORD.p7s",
             "direct_url.json",
             "uv_cache.json",
+            "uv_build.json",
         }:
             continue
         if relative.suffix == ".pth":

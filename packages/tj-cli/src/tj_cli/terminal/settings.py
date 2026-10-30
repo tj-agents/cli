@@ -4,16 +4,14 @@ from __future__ import annotations
 
 import argparse
 import datetime
+import json
 import os
-import re
 import shutil
 import sys
 from collections.abc import Mapping
 from pathlib import Path
 
 CLOSE_VALUES = ("always", "graceful", "automatic", "never")
-DEFAULTS_OPEN = re.compile(r'"defaults"\s*:\s*\{')
-CLOSE_VALUE = re.compile(r'("closeOnExit"\s*:\s*")([^"]+)(")')
 
 
 def is_windows() -> bool:
@@ -34,28 +32,137 @@ def default_settings_path(environ: Mapping[str, str] | None = None) -> Path:
     )
 
 
+def _skip_space(text: str, position: int) -> int:
+    while position < len(text) and text[position] in " \t\r\n":
+        position += 1
+    return position
+
+
+def _jsonc_document(text: str) -> str:
+    characters = list(text)
+    commas = []
+    decoder = json.JSONDecoder()
+    position = 0
+    if text.startswith("\ufeff"):
+        characters[0] = " "
+    while position < len(text):
+        if text[position] == '"':
+            _, position = decoder.raw_decode(text, position)
+        elif text.startswith("//", position):
+            end = position + 2
+            while end < len(text) and text[end] not in "\r\n":
+                end += 1
+            characters[position:end] = " " * (end - position)
+            position = end
+        elif text.startswith("/*", position):
+            end = text.find("*/", position + 2)
+            if end < 0:
+                raise RuntimeError(
+                    "Invalid Windows Terminal settings JSONC: unclosed comment."
+                )
+            end += 2
+            for index in range(position, end):
+                if characters[index] not in "\r\n":
+                    characters[index] = " "
+            position = end
+        else:
+            if text[position] == ",":
+                commas.append(position)
+            position += 1
+    document = "".join(characters)
+    for comma in commas:
+        preceding = comma - 1
+        while preceding >= 0 and document[preceding] in " \t\r\n":
+            preceding -= 1
+        following = _skip_space(document, comma + 1)
+        if (
+            preceding >= 0
+            and document[preceding] not in "{[,:"
+            and following < len(document)
+            and document[following] in "}]"
+        ):
+            characters[comma] = " "
+    return "".join(characters)
+
+
+def _unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise RuntimeError(
+                "Ambiguous Windows Terminal settings: duplicate property " + key + "."
+            )
+        result[key] = value
+    return result
+
+
+def _invalid_constant(value: str) -> object:
+    raise RuntimeError(
+        "Invalid Windows Terminal settings JSONC: non-JSON constant " + value + "."
+    )
+
+
+def _member_span(document: str, opening: int, name: str) -> tuple[int, int] | None:
+    decoder = json.JSONDecoder()
+    position = _skip_space(document, opening + 1)
+    while document[position] != "}":
+        key, end = decoder.raw_decode(document, position)
+        start = _skip_space(document, _skip_space(document, end) + 1)
+        _, end = decoder.raw_decode(document, start)
+        if key == name:
+            return start, end
+        position = _skip_space(document, end)
+        if document[position] == ",":
+            position = _skip_space(document, position + 1)
+    return None
+
+
 def update_close_on_exit(text: str, value: str) -> tuple[str, bool]:
-    existing = CLOSE_VALUE.search(text)
-    if existing:
-        if existing.group(2) == value:
+    if value not in CLOSE_VALUES:
+        raise RuntimeError("Unsupported closeOnExit value: " + value + ".")
+    try:
+        document = _jsonc_document(text)
+        parsed: object = json.loads(
+            document, object_pairs_hook=_unique_object, parse_constant=_invalid_constant
+        )
+    except (json.JSONDecodeError, RecursionError) as error:
+        raise RuntimeError("Invalid Windows Terminal settings JSONC.") from error
+    if not isinstance(parsed, dict):
+        raise RuntimeError("Windows Terminal settings must be an object.")
+    opening = _skip_space(document, 0)
+    for name in ("profiles", "defaults"):
+        member = _member_span(document, opening, name)
+        if member is None or document[member[0]] != "{":
+            raise RuntimeError(
+                "No profiles.defaults block found; set closeOnExit by hand."
+            )
+        opening = member[0]
+    existing = _member_span(document, opening, "closeOnExit")
+    if existing is not None:
+        start, end = existing
+        current: object = json.loads(document[start:end])
+        if not isinstance(current, str):
+            raise RuntimeError(
+                "profiles.defaults.closeOnExit must be a string; set it by hand."
+            )
+        if current == value:
             return text, False
-        return CLOSE_VALUE.sub(r"\1" + value + r"\3", text, count=1), True
-    defaults = DEFAULTS_OPEN.search(text)
-    if not defaults:
-        raise RuntimeError("No profiles.defaults block found; set closeOnExit by hand.")
-    after_open = text[defaults.end() :]
-    close = after_open.find("}")
-    if close < 0:
-        raise RuntimeError("No profiles.defaults block found; set closeOnExit by hand.")
-    body = after_open[:close]
-    newline = "\r\n" if "\r\n" in text else "\n"
-    indent_match = re.search(r"(?:\r?\n)([ \t]*)[^\s/]", body)
-    indent = indent_match.group(1) if indent_match else "            "
+        return text[:start] + json.dumps(value) + text[end:], True
+    newline = "\r\n" if "\r\n" in text else "\r" if "\r" in text else "\n"
+    first_member = _skip_space(document, opening + 1)
+    line_start = (
+        max(text.rfind("\n", 0, first_member), text.rfind("\r", 0, first_member)) + 1
+    )
+    prefix = text[line_start:first_member]
+    indent = (
+        prefix
+        if not prefix.strip() and document[first_member] != "}"
+        else "            "
+    )
     property_text = f'{newline}{indent}"closeOnExit": "{value}"'
-    content = re.sub(r"//[^\r\n]*|/\*.*?\*/", "", body, flags=re.DOTALL)
-    if content.strip():
+    if document[first_member] != "}":
         property_text += ","
-    return text[: defaults.end()] + property_text + text[defaults.end() :], True
+    return text[: opening + 1] + property_text + text[opening + 1 :], True
 
 
 def backup_path(path: Path, now: datetime.datetime | None = None) -> Path:
