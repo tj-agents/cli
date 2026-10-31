@@ -74,6 +74,6 @@ For a separately authorized ownership transfer needed to release the directory, 
 sole owner of removal and final filesystem verification. Preserve the pending evidence in that
 transfer. After verified transfer submission the original stops repository-scoped work and never
 attempts the removal itself. The selected session lifecycle owner handles closing the predecessor;
-`cli:close` supplies only exact-target closure mechanics. The successor starts from the destination
+CLI's shared process and terminal APIs supply exact-target closure mechanics. The successor starts from the destination
 checkout and removes the old directory only after the predecessor no longer holds it. A pending manual
 directory change leaves the current owner responsible and does not complete a transfer.

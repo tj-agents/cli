@@ -9,11 +9,6 @@
       "plugin": "cli",
       "distribution": "tj-cli",
       "destination": ".agents/cli/runtime"
-    },
-    {
-      "plugin": "cli",
-      "source": ".agents/cli/utility/close/scripts",
-      "destination": "runtime/close"
     }
   ]
 }
