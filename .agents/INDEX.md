@@ -4,4 +4,5 @@ Generated from `.agents/<plugin>/<kind>/<family>/<member>/SKILL.md`; a skill's n
 
 ## cli
 
+- `cd` — utility — core — `.agents/cli/utility/cd/SKILL.md`
 - `clip` — utility — core — `.agents/cli/utility/clip/SKILL.md`

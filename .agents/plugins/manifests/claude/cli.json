@@ -1,7 +1,7 @@
 {
   "name": "cli",
   "displayName": "CLI operations",
-  "description": "Deterministic CLI terminal and linked-worktree operations.",
+  "description": "CLI directory navigation, terminal and linked-worktree operations.",
   "author": {
     "name": "ThomasSeery"
   },
