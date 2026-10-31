@@ -57,98 +57,102 @@ def _linux_process(pid: int) -> ProcessInfo | None:
     return ProcessInfo(pid, ppid, _linux_boot_time() + ticks / rate)
 
 
-def _windows_process(pid: int) -> ProcessInfo | None:
-    import ctypes
-    from ctypes import wintypes
+if sys.platform == "win32":
 
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
-    kernel32.OpenProcess.restype = wintypes.HANDLE
-    kernel32.GetProcessTimes.argtypes = [
-        wintypes.HANDLE,
-        ctypes.POINTER(wintypes.FILETIME),
-        ctypes.POINTER(wintypes.FILETIME),
-        ctypes.POINTER(wintypes.FILETIME),
-        ctypes.POINTER(wintypes.FILETIME),
-    ]
-    kernel32.GetProcessTimes.restype = wintypes.BOOL
-    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
-    kernel32.CloseHandle.restype = wintypes.BOOL
-    kernel32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
-    kernel32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
-    handle = kernel32.OpenProcess(0x1000, False, pid)
-    if not handle:
-        return None
-    try:
-        creation = wintypes.FILETIME()
-        exited = wintypes.FILETIME()
-        kernel = wintypes.FILETIME()
-        user = wintypes.FILETIME()
-        if not kernel32.GetProcessTimes(
-            handle,
-            ctypes.byref(creation),
-            ctypes.byref(exited),
-            ctypes.byref(kernel),
-            ctypes.byref(user),
-        ):
-            return None
-        ticks = (creation.dwHighDateTime << 32) | creation.dwLowDateTime
-        if not ticks:
-            return None
-        started = ticks / 10_000_000 - 11_644_473_600
-    finally:
-        kernel32.CloseHandle(handle)
+    def _windows_process(pid: int) -> ProcessInfo | None:
+        import ctypes
+        from ctypes import wintypes
 
-    class PROCESSENTRY32W(ctypes.Structure):
-        _fields_ = [
-            ("dwSize", wintypes.DWORD),
-            ("cntUsage", wintypes.DWORD),
-            ("th32ProcessID", wintypes.DWORD),
-            ("th32DefaultHeapID", ctypes.c_void_p),
-            ("th32ModuleID", wintypes.DWORD),
-            ("cntThreads", wintypes.DWORD),
-            ("th32ParentProcessID", wintypes.DWORD),
-            ("pcPriClassBase", ctypes.c_long),
-            ("dwFlags", wintypes.DWORD),
-            ("szExeFile", ctypes.c_wchar * 260),
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.GetProcessTimes.argtypes = [
+            wintypes.HANDLE,
+            ctypes.POINTER(wintypes.FILETIME),
+            ctypes.POINTER(wintypes.FILETIME),
+            ctypes.POINTER(wintypes.FILETIME),
+            ctypes.POINTER(wintypes.FILETIME),
         ]
-
-    snapshot = kernel32.CreateToolhelp32Snapshot(0x00000002, 0)
-    if not snapshot or ctypes.c_ssize_t(snapshot).value == -1:
-        return None
-    entry = PROCESSENTRY32W()
-    entry.dwSize = ctypes.sizeof(entry)
-    kernel32.Process32FirstW.argtypes = [
-        wintypes.HANDLE,
-        ctypes.POINTER(PROCESSENTRY32W),
-    ]
-    kernel32.Process32FirstW.restype = wintypes.BOOL
-    kernel32.Process32NextW.argtypes = [
-        wintypes.HANDLE,
-        ctypes.POINTER(PROCESSENTRY32W),
-    ]
-    kernel32.Process32NextW.restype = wintypes.BOOL
-    try:
-        if not kernel32.Process32FirstW(snapshot, ctypes.byref(entry)):
+        kernel32.GetProcessTimes.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        kernel32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+        kernel32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+        handle = kernel32.OpenProcess(0x1000, False, pid)
+        if not handle:
             return None
-        while True:
-            if int(entry.th32ProcessID) == pid:
-                return ProcessInfo(pid, int(entry.th32ParentProcessID), started)
-            if not kernel32.Process32NextW(snapshot, ctypes.byref(entry)):
-                break
-    finally:
-        kernel32.CloseHandle(snapshot)
-    return None
+        try:
+            creation = wintypes.FILETIME()
+            exited = wintypes.FILETIME()
+            kernel = wintypes.FILETIME()
+            user = wintypes.FILETIME()
+            if not kernel32.GetProcessTimes(
+                handle,
+                ctypes.byref(creation),
+                ctypes.byref(exited),
+                ctypes.byref(kernel),
+                ctypes.byref(user),
+            ):
+                return None
+            ticks = (creation.dwHighDateTime << 32) | creation.dwLowDateTime
+            if not ticks:
+                return None
+            started = ticks / 10_000_000 - 11_644_473_600
+        finally:
+            kernel32.CloseHandle(handle)
+
+        class PROCESSENTRY32W(ctypes.Structure):
+            _fields_ = [
+                ("dwSize", wintypes.DWORD),
+                ("cntUsage", wintypes.DWORD),
+                ("th32ProcessID", wintypes.DWORD),
+                ("th32DefaultHeapID", ctypes.c_void_p),
+                ("th32ModuleID", wintypes.DWORD),
+                ("cntThreads", wintypes.DWORD),
+                ("th32ParentProcessID", wintypes.DWORD),
+                ("pcPriClassBase", ctypes.c_long),
+                ("dwFlags", wintypes.DWORD),
+                ("szExeFile", ctypes.c_wchar * 260),
+            ]
+
+        snapshot = kernel32.CreateToolhelp32Snapshot(0x00000002, 0)
+        if not snapshot or ctypes.c_ssize_t(snapshot).value == -1:
+            return None
+        entry = PROCESSENTRY32W()
+        entry.dwSize = ctypes.sizeof(entry)
+        kernel32.Process32FirstW.argtypes = [
+            wintypes.HANDLE,
+            ctypes.POINTER(PROCESSENTRY32W),
+        ]
+        kernel32.Process32FirstW.restype = wintypes.BOOL
+        kernel32.Process32NextW.argtypes = [
+            wintypes.HANDLE,
+            ctypes.POINTER(PROCESSENTRY32W),
+        ]
+        kernel32.Process32NextW.restype = wintypes.BOOL
+        try:
+            if not kernel32.Process32FirstW(snapshot, ctypes.byref(entry)):
+                return None
+            while True:
+                if int(entry.th32ProcessID) == pid:
+                    return ProcessInfo(pid, int(entry.th32ParentProcessID), started)
+                if not kernel32.Process32NextW(snapshot, ctypes.byref(entry)):
+                    break
+        finally:
+            kernel32.CloseHandle(snapshot)
+        return None
 
 
 def process_info(pid: object) -> ProcessInfo | None:
     if not isinstance(pid, int) or pid <= 0:
         return None
-    if os.name == "nt":
-        return _windows_process(pid)
-    if sys.platform.startswith("linux"):
-        return _linux_process(pid)
-    return None
+    if sys.platform == "win32":
+        actual = _windows_process(pid)
+    elif sys.platform.startswith("linux"):
+        actual = _linux_process(pid)
+    else:
+        actual = None
+    return actual
 
 
 def valid_identity(value: object) -> tuple[int, float]:
@@ -207,7 +211,7 @@ def stop(identity: ProcessIdentity, *, before_signal: Callable[[], None]) -> Non
         raise Refusal("process identity needs positive pid and started_at")
     if not callable(before_signal):
         raise Refusal("before_signal must be callable")
-    if os.name == "nt":
+    if sys.platform == "win32":
         _stop_windows(pid, started, before_signal)
     elif sys.platform.startswith("linux"):
         _stop_linux(pid, started, before_signal)
@@ -238,53 +242,57 @@ def _stop_linux(pid: int, started: float, before_signal: Callable[[], None]) -> 
         os.close(descriptor)
 
 
-def _stop_windows(pid: int, started: float, before_signal: Callable[[], None]) -> None:
-    import ctypes
-    from ctypes import wintypes
+if sys.platform == "win32":
 
-    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
-    kernel.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
-    kernel.OpenProcess.restype = wintypes.HANDLE
-    kernel.CloseHandle.argtypes = [wintypes.HANDLE]
-    kernel.GetProcessTimes.argtypes = [
-        wintypes.HANDLE,
-        ctypes.POINTER(wintypes.FILETIME),
-        ctypes.POINTER(wintypes.FILETIME),
-        ctypes.POINTER(wintypes.FILETIME),
-        ctypes.POINTER(wintypes.FILETIME),
-    ]
-    kernel.GetProcessTimes.restype = wintypes.BOOL
-    kernel.TerminateProcess.argtypes = [wintypes.HANDLE, wintypes.UINT]
-    kernel.TerminateProcess.restype = wintypes.BOOL
-    kernel.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
-    kernel.WaitForSingleObject.restype = wintypes.DWORD
-    handle = kernel.OpenProcess(0x100001 | 0x1000, False, pid)
-    if not handle:
-        raise Refusal("cannot acquire exact frontend process handle")
-    try:
-        created, exited, kernel_time, user_time = (
-            wintypes.FILETIME() for _ in range(4)
-        )
-        if not kernel.GetProcessTimes(
-            handle,
-            ctypes.byref(created),
-            ctypes.byref(exited),
-            ctypes.byref(kernel_time),
-            ctypes.byref(user_time),
-        ):
-            raise Refusal("cannot verify exact frontend process handle")
-        actual = (
-            (created.dwHighDateTime << 32) + created.dwLowDateTime
-        ) / 10_000_000 - 11_644_473_600
-        if abs(actual - started) > TOLERANCE_SECONDS:
-            raise Refusal("frontend identity changed before close")
-        before_signal()
-        if not kernel.TerminateProcess(handle, 0):
-            raise Refusal("exact frontend process refused termination")
-        if kernel.WaitForSingleObject(handle, 10_000) != 0:
-            raise Refusal("exact frontend exit was not confirmed")
-    finally:
-        kernel.CloseHandle(handle)
+    def _stop_windows(
+        pid: int, started: float, before_signal: Callable[[], None]
+    ) -> None:
+        import ctypes
+        from ctypes import wintypes
+
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel.OpenProcess.restype = wintypes.HANDLE
+        kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel.GetProcessTimes.argtypes = [
+            wintypes.HANDLE,
+            ctypes.POINTER(wintypes.FILETIME),
+            ctypes.POINTER(wintypes.FILETIME),
+            ctypes.POINTER(wintypes.FILETIME),
+            ctypes.POINTER(wintypes.FILETIME),
+        ]
+        kernel.GetProcessTimes.restype = wintypes.BOOL
+        kernel.TerminateProcess.argtypes = [wintypes.HANDLE, wintypes.UINT]
+        kernel.TerminateProcess.restype = wintypes.BOOL
+        kernel.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+        kernel.WaitForSingleObject.restype = wintypes.DWORD
+        handle = kernel.OpenProcess(0x100001 | 0x1000, False, pid)
+        if not handle:
+            raise Refusal("cannot acquire exact frontend process handle")
+        try:
+            created, exited, kernel_time, user_time = (
+                wintypes.FILETIME() for _ in range(4)
+            )
+            if not kernel.GetProcessTimes(
+                handle,
+                ctypes.byref(created),
+                ctypes.byref(exited),
+                ctypes.byref(kernel_time),
+                ctypes.byref(user_time),
+            ):
+                raise Refusal("cannot verify exact frontend process handle")
+            actual = (
+                (created.dwHighDateTime << 32) + created.dwLowDateTime
+            ) / 10_000_000 - 11_644_473_600
+            if abs(actual - started) > TOLERANCE_SECONDS:
+                raise Refusal("frontend identity changed before close")
+            before_signal()
+            if not kernel.TerminateProcess(handle, 0):
+                raise Refusal("exact frontend process refused termination")
+            if kernel.WaitForSingleObject(handle, 10_000) != 0:
+                raise Refusal("exact frontend exit was not confirmed")
+        finally:
+            kernel.CloseHandle(handle)
 
 
 def descends_from(frontend: object, root: object) -> bool:
