@@ -6,6 +6,7 @@ import shutil
 import subprocess
 import zipfile
 from pathlib import Path
+from unittest import mock
 
 import pytest
 
@@ -52,6 +53,34 @@ def _fake_release(
 
 def test_missing_native_reports_the_pair(tmp_path: Path) -> None:
     assert native_install.missing_native(tmp_path) == native_install._binary_names()
+
+
+def test_relative_bin_override_is_bound_before_a_host_changes_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("TJ_BIN_DIR", "native bin")
+    assert native_install.default_bin_dir() == tmp_path.resolve() / "native bin"
+
+
+def test_release_requests_pin_github_even_with_a_host_override(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("GH_HOST", "other.example")
+    with mock.patch.object(
+        native_install, "_run", return_value=mock.Mock(stdout="{}")
+    ) as run:
+        native_install._gh_json("repos/tj-agents/cli/releases/latest")
+    assert run.call_args.args[0][:5] == [
+        "gh",
+        "api",
+        "--hostname",
+        "github.com",
+        "repos/tj-agents/cli/releases/latest",
+    ]
+    with mock.patch.object(native_install, "_run_download") as download:
+        native_install._download_asset(7, tmp_path / "asset")
+    assert download.call_args.args[0][2:4] == ["--hostname", "github.com"]
 
 
 def test_invalid_digest_leaves_existing_pair_untouched(
