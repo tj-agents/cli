@@ -96,6 +96,11 @@ def uninstall_native(directory: Path) -> tuple[str, ...]:
     """Remove only receipt-owned native files, returning the names removed."""
     receipt = _read_receipt(directory)
     if receipt is None:
+        if any((directory / name).exists() for name in _binary_names()):
+            raise NativeInstallError(
+                "native binaries have no ownership receipt; "
+                "run install before uninstall"
+            )
         return ()
     hashes = receipt.get("hashes")
     if not isinstance(hashes, dict):
@@ -349,6 +354,23 @@ def _replace_pair(
     hashes: dict[str, str],
     archive_digest: str | None = None,
 ) -> None:
+    # Reserved names are files, never containers for user data. Check every name
+    # before moving any target into the disposable transaction directory.
+    for name in (*_binary_names(), _RECEIPT):
+        target = directory / name
+        if target.is_symlink() or (target.exists() and not target.is_file()):
+            raise NativeInstallError(
+                f"native install target must be a regular file: {target}"
+            )
+        if platform.system() == "Windows" and target.is_file():
+            try:
+                with target.open("r+b"):
+                    pass
+            except OSError as error:
+                raise NativeInstallError(
+                    "native install target is in use or not writable; "
+                    f"retry after it exits: {target}"
+                ) from error
     with tempfile.TemporaryDirectory(prefix=".tj-native-", dir=directory) as temporary:
         stage = Path(temporary)
         staged = stage / "new"
