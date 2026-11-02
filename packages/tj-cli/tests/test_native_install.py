@@ -176,7 +176,7 @@ def test_running_windows_binary_defers_upgrade_without_changing_the_pair(
         [str(executable), "-n", "30", "127.0.0.1"],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
-        creationflags=subprocess.CREATE_NO_WINDOW,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
     )
     try:
         assert child.poll() is None
