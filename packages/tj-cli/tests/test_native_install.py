@@ -1,7 +1,9 @@
 import hashlib
 import json
+import os
 import platform as platform_module
 import shutil
+import subprocess
 import zipfile
 from pathlib import Path
 
@@ -123,6 +125,69 @@ def test_missing_installed_binary_is_repaired(
     (directory / names[1]).unlink()
     assert native_install.ensure_native(directory) == names
     assert not native_install.missing_native(directory)
+
+
+@pytest.mark.parametrize("reserved", ["binary", "receipt"])
+def test_directory_collision_preserves_user_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, reserved: str
+) -> None:
+    archive = tmp_path / "native.zip"
+    names = native_install._binary_names()
+    digest = _archive(archive, {names[0]: b"tj", names[1]: b"hook"})
+    _fake_release(monkeypatch, archive, digest)
+    directory = tmp_path / "bin"
+    collision = directory / (
+        names[0] if reserved == "binary" else native_install._RECEIPT
+    )
+    collision.mkdir(parents=True)
+    important = collision / "user-data"
+    important.write_bytes(b"preserve")
+    with pytest.raises(native_install.NativeInstallError, match="regular file"):
+        native_install.ensure_native(directory)
+    assert important.read_bytes() == b"preserve"
+    assert not (directory / names[1]).exists()
+
+
+def test_uninstall_does_not_claim_unreceipted_binaries_are_absent(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / native_install._binary_names()[0]).write_bytes(b"previous install")
+    with pytest.raises(
+        native_install.NativeInstallError, match="run install before uninstall"
+    ):
+        native_install.uninstall_native(tmp_path)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows executable sharing semantics")
+def test_running_windows_binary_defers_upgrade_without_changing_the_pair(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    archive = tmp_path / "native.zip"
+    names = native_install._binary_names()
+    directory = tmp_path / "bin"
+    directory.mkdir()
+    executable = directory / names[0]
+    shutil.copyfile(Path(os.environ["SYSTEMROOT"]) / "System32/ping.exe", executable)
+    (directory / names[1]).write_bytes(b"old-hook")
+    before = executable.read_bytes()
+    digest = _archive(archive, {names[0]: b"new-tj", names[1]: b"new-hook"})
+    _fake_release(monkeypatch, archive, digest)
+    child = subprocess.Popen(
+        [str(executable), "-n", "30", "127.0.0.1"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        creationflags=subprocess.CREATE_NO_WINDOW,
+    )
+    try:
+        assert child.poll() is None
+        with pytest.raises(native_install.NativeInstallError, match="in use"):
+            native_install.ensure_native(directory)
+        assert executable.read_bytes() == before
+        assert (directory / names[1]).read_bytes() == b"old-hook"
+        assert not (directory / native_install._RECEIPT).exists()
+    finally:
+        child.terminate()
+        child.wait(timeout=10)
 
 
 def test_failed_pair_replacement_restores_old_pair(
