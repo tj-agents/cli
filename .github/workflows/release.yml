@@ -112,4 +112,9 @@ jobs:
             # this qualified build before making either platform visible.
             gh release upload "$tag" "$asset" --repo "$REPOSITORY" --clobber
           done
+          current_sha="$(gh api "repos/$REPOSITORY/git/ref/heads/$default_branch" --jq .object.sha)"
+          if [ "$current_sha" != "$SHA" ]; then
+            echo "superseded during upload; leaving $tag unpublished"
+            exit 0
+          fi
           gh release edit "$tag" --repo "$REPOSITORY" --draft=false --latest

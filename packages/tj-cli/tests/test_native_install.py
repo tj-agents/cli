@@ -111,6 +111,20 @@ def test_exact_revision_mismatch_rejects_release(
         native_install.ensure_native(tmp_path / "bin", revision="b" * 40)
 
 
+def test_missing_installed_binary_is_repaired(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    archive = tmp_path / "native.zip"
+    names = native_install._binary_names()
+    digest = _archive(archive, {names[0]: b"tj", names[1]: b"hook"})
+    _fake_release(monkeypatch, archive, digest)
+    directory = tmp_path / "bin"
+    native_install.ensure_native(directory)
+    (directory / names[1]).unlink()
+    assert native_install.ensure_native(directory) == names
+    assert not native_install.missing_native(directory)
+
+
 def test_failed_pair_replacement_restores_old_pair(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
