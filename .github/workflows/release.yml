@@ -27,7 +27,9 @@ jobs:
     outputs:
       sha: ${{ steps.qualify.outputs.sha }}
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
       - id: qualify
         env:
           GH_TOKEN: ${{ github.token }}
@@ -47,9 +49,10 @@ jobs:
           - os: windows-latest
             target: x86_64-pc-windows-msvc
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           ref: ${{ needs.qualify.outputs.sha }}
+          persist-credentials: false
       - name: install Rust
         shell: bash
         run: rustup toolchain install stable --profile minimal && rustup default stable
@@ -61,10 +64,12 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: Compress-Archive -Path target/release/tj.exe,target/release/tj_hook.exe -DestinationPath tj-${{ matrix.target }}.zip
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: tj-${{ matrix.target }}
           path: tj-${{ matrix.target }}.*
+          if-no-files-found: error
+          retention-days: 7
 
   publish:
     needs: [qualify, build]
@@ -73,7 +78,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           merge-multiple: true
       - name: publish exact current main revision
