@@ -16,6 +16,9 @@
       "tj-agents/base"
     ],
     "hooks": [],
+    "setup": {
+      "script": ".agents/cli/utility/clip/scripts/user_command.py"
+    },
     "permissions": {
       "claude_allow": [],
       "codex_prefix_rules": []
