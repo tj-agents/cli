@@ -113,6 +113,37 @@ class BuildHtmlFragmentTests(unittest.TestCase):
         self.assertNotIn('<div>', fragment)
 
 
+class LinkTests(unittest.TestCase):
+    def test_a_markdown_link_becomes_clickable_link_text(self):
+        fragment = COPY_DRAFT.build_html_fragment('see [these two pages](https://example.com/a?x=1&y=2) now')
+        self.assertEqual(fragment, 'see <a href="https://example.com/a?x=1&amp;y=2">these two pages</a> now')
+
+    def test_backticks_inside_link_text_render_as_code_inside_the_link(self):
+        fragment = COPY_DRAFT.build_html_fragment('[`Orders` page](https://example.com)')
+        self.assertEqual(
+            fragment,
+            '<a href="https://example.com"><code style="font-family:Consolas,\'Courier New\',monospace;">'
+            'Orders</code> page</a>',
+        )
+
+    def test_a_link_inside_a_code_span_stays_literal(self):
+        fragment = COPY_DRAFT.build_html_fragment('`[x](https://example.com)`')
+        self.assertNotIn('<a ', fragment)
+        self.assertIn('[x](https://example.com)', fragment)
+
+    def test_brackets_without_an_http_url_are_left_as_text(self):
+        self.assertEqual(COPY_DRAFT.build_html_fragment('[x](y) and [z]'), '[x](y) and [z]')
+
+    def test_markdown_links_and_visible_text_match_what_the_html_renders(self):
+        text = 'the [`a` pages](https://example.com/a) and [b](http://example.com/b) and `c`'
+        fragment = COPY_DRAFT.build_html_fragment(text)
+        expected = [('https://example.com/a', 'a pages'), ('http://example.com/b', 'b')]
+        self.assertEqual(COPY_DRAFT.markdown_links(text), expected)
+        self.assertEqual(COPY_DRAFT.html_links(fragment), expected)
+        self.assertEqual(COPY_DRAFT.markdown_visible_text(text), COPY_DRAFT.html_visible_text(fragment))
+        self.assertEqual(COPY_DRAFT.markdown_visible_text(text), 'the a pages and b and c')
+
+
 class BuildFullHtmlTests(unittest.TestCase):
     def test_wraps_the_fragment_in_a_minimal_utf8_document(self):
         document = COPY_DRAFT.build_full_html('a <code>b</code>')
@@ -408,6 +439,34 @@ class CopyPosixTests(unittest.TestCase):
                 environ={'WAYLAND_DISPLAY': 'wayland-0'}, which=which_only('wl-copy', 'wl-paste'), run=run,
             )
 
+    def test_a_link_is_copied_as_html_and_verified(self):
+        text = 'ready: [these two pages](https://example.com/pages)'
+        run = make_run([
+            FakeResult(stdout=''),
+            FakeResult(stdout=COPY_DRAFT.build_full_html(COPY_DRAFT.build_html_fragment(text))),
+        ])
+        message = COPY_DRAFT.copy_posix(
+            text, plain_only=False,
+            environ={'WAYLAND_DISPLAY': 'wayland-0'}, which=which_only('wl-copy', 'wl-paste'), run=run,
+        )
+        self.assertIn('<a href="https://example.com/pages">these two pages</a>', run.calls[0][1]['input'])
+        self.assertIn('1 links', message)
+
+    def test_an_html_readback_with_a_different_href_is_an_error_even_with_matching_text(self):
+        landed = '<html><body>ready: <a href="https://example.com/other">these two pages</a></body></html>'
+        run = make_run([FakeResult(stdout='')] + [FakeResult(stdout=landed)] * 5)
+        with self.assertRaisesRegex(COPY_DRAFT.ClipboardError, 'did not read back the HTML flavour'):
+            COPY_DRAFT.copy_posix(
+                'ready: [these two pages](https://example.com/pages)', plain_only=False,
+                environ={'WAYLAND_DISPLAY': 'wayland-0'}, which=which_only('wl-copy', 'wl-paste'), run=run,
+            )
+
+    def test_xsel_keeps_the_markdown_link_in_the_plain_fallback(self):
+        text = 'ready: [these two pages](https://example.com/pages)'
+        run = make_run([FakeResult(stdout=''), FakeResult(stdout=text)])
+        COPY_DRAFT.copy_posix(text, plain_only=False, environ={'DISPLAY': ':0'}, which=which_only('xsel'), run=run)
+        self.assertEqual(run.calls[0][1]['input'], text)
+
     def test_the_html_readback_is_retried_past_a_stale_selection_before_matching(self):
         run = make_run([
             FakeResult(stdout=''),
@@ -685,6 +744,18 @@ class WindowsCtypesRoundTripTests(unittest.TestCase):
         self.assertIsNotNone(fragment)
         self.assertIn('<code', fragment)
         self.assertEqual(plain, COPY_DRAFT.unwrap_backtick_spans(text))
+
+    def test_a_link_round_trips_as_an_anchor_and_stays_markdown_in_plain(self):
+        text = 'ready: [these `two` pages](https://example.com/pages)'
+        message = COPY_DRAFT.copy_windows(text, plain_only=False)
+        self.assertIn('1 links', message)
+
+        user32, kernel32 = COPY_DRAFT._windows_api()
+        html_format = user32.RegisterClipboardFormatW('HTML Format')
+        cf_html, plain = self._read_clipboard(user32, kernel32, html_format)
+        fragment = COPY_DRAFT.extract_cf_html_fragment(cf_html)
+        self.assertEqual(COPY_DRAFT.html_links(fragment), [('https://example.com/pages', 'these two pages')])
+        self.assertEqual(plain, 'ready: [these two pages](https://example.com/pages)')
 
     def test_plain_only_writes_literal_text_with_no_html_flavour_and_is_verified(self):
         text = 'a literal `command` to run'

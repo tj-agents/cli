@@ -38,7 +38,8 @@ emoji, and a heredoc through PowerShell is worse. The file is the interface.
 **The message with its markdown intact** — that is the point of copying rather than having him
 drag-select. Teams renders markdown in the compose box, so backticks around a service, identity,
 resource group, role or flag survive as inline code and make the specifics stand out, and a triple
-backtick fence renders a command as a block he can copy straight out. Keep them in.
+backtick fence renders a command as a block he can copy straight out. Keep them in. A markdown link
+`[link text](https://...)` lands in the HTML flavour as clickable link text; plain flavours keep the markdown.
 
 What stays out is anything that belongs to the transcript rather than the message: no "here's the
 message:" preamble, no `>` quoting, no bullet markers you added for readability, no surrounding
