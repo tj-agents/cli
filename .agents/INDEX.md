@@ -6,3 +6,4 @@ Generated from `.agents/<plugin>/<kind>/<family>/<member>/SKILL.md`; a skill's n
 
 - `cd` — utility — core — `.agents/cli/utility/cd/SKILL.md`
 - `clip` — utility — core — `.agents/cli/utility/clip/SKILL.md`
+- `teams-message` — utility — core — `.agents/cli/utility/teams-message/SKILL.md`

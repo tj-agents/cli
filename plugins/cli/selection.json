@@ -4,7 +4,8 @@
   "profiles": {
     "core": [
       "cd",
-      "clip"
+      "clip",
+      "teams-message"
     ]
   },
   "compatibilitySkillAliases": {},
@@ -25,6 +26,20 @@
     },
     {
       "name": "clip",
+      "kind": "utility",
+      "profile": "core",
+      "applicability": [
+        "all projects"
+      ],
+      "requires": [
+        "python"
+      ],
+      "provenance": [
+        "house"
+      ]
+    },
+    {
+      "name": "teams-message",
       "kind": "utility",
       "profile": "core",
       "applicability": [
