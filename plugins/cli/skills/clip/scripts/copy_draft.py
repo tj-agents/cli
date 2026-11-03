@@ -5,8 +5,9 @@ Run as `python3 copy_draft.py --path <file> [--plain-only]` (`python` on Windows
 exec bit are not relied on.
 
 On Windows, without `--plain-only`, this writes BOTH an `HTML Format` flavour (CF_HTML, with single
-backtick spans rendered as monospace `<code>`) and a plain Unicode text flavour (backticks unwrapped),
-then verifies both off the live clipboard. `--plain-only` writes only the literal text, unchanged, as
+backtick spans rendered as monospace `<code>` and `[label](https://...)` links as clickable `<a>` text) and
+a plain Unicode text flavour (backticks unwrapped, links left as markdown), then verifies both off the
+live clipboard. `--plain-only` writes only the literal text, unchanged, as
 CF_UNICODETEXT, and that is still verified by reading it back.
 
 On Linux, default mode copies a `text/html` flavour built from the same escaped-and-code-spanned fragment
@@ -52,6 +53,7 @@ class ClipboardError(Exception):
 # --- pure text transforms -----------------------------------------------------------------------
 
 _BACKTICK_SPAN = re.compile(r'`([^`]+)`')
+_INLINE_MARKUP = re.compile(r'`(?P<code>[^`]+)`|\[(?P<label>[^\]\n]+)\]\((?P<url>https?://[^\s)]+)\)')
 _TRAILING_WHITESPACE = re.compile(r'\s+\Z')
 _WHITESPACE_RUN = re.compile(r'\s+')
 
@@ -94,19 +96,51 @@ def count_code_spans(fragment):
     return fragment.count('<code')
 
 
+def _code_element(escaped):
+    return f'<code style="font-family:Consolas,\'Courier New\',monospace;">{escaped}</code>'
+
+
+def _render_inline_markup(match):
+    if match['code'] is not None:
+        return _code_element(escape_html(match['code']))
+    label = _BACKTICK_SPAN.sub(lambda m: _code_element(m.group(1)), escape_html(match['label']))
+    return f'<a href="{html.escape(match["url"], quote=True)}">{label}</a>'
+
+
+def _visible_inline_markup(match):
+    return match['code'] if match['code'] is not None else unwrap_backtick_spans(match['label'])
+
+
+def markdown_visible_text(text):
+    """The words `text`'s HTML flavour renders as, whitespace collapsed, to compare with a read-back."""
+    return collapse_whitespace(_INLINE_MARKUP.sub(_visible_inline_markup, text))
+
+
+def markdown_links(text):
+    """Each `[label](url)` link in `text` as (url, visible label), in order."""
+    return [
+        (match['url'], collapse_whitespace(unwrap_backtick_spans(match['label'])))
+        for match in _INLINE_MARKUP.finditer(text)
+        if match['url'] is not None
+    ]
+
+
 def build_html_fragment(text):
-    """The HTML fragment for `text`: escaped, backtick spans as monospace `<code>`, no block elements.
+    """The HTML fragment for `text`: escaped, backtick spans as monospace `<code>`, `[label](url)` links as
+    `<a href>` link text, no block elements.
 
     Teams gives `<p>` and `<div>` their own margins and indent on paste, so paragraphs (separated by a
     blank line) are joined with a double `<br>` instead, and a single newline within a paragraph becomes
     one `<br>`.
     """
-    escaped = escape_html(text)
-    with_code = _BACKTICK_SPAN.sub(
-        lambda m: f'<code style="font-family:Consolas,\'Courier New\',monospace;">{m.group(1)}</code>',
-        escaped,
-    )
-    paragraphs = re.split(r'\n{2,}', with_code)
+    parts = []
+    position = 0
+    for match in _INLINE_MARKUP.finditer(text):
+        parts.append(escape_html(text[position:match.start()]))
+        parts.append(_render_inline_markup(match))
+        position = match.end()
+    parts.append(escape_html(text[position:]))
+    paragraphs = re.split(r'\n{2,}', ''.join(parts))
     return '<br><br>'.join(paragraph.replace('\n', '<br>') for paragraph in paragraphs)
 
 
@@ -164,6 +198,36 @@ def html_visible_text(markup):
     stripper.feed(markup)
     stripper.close()
     return collapse_whitespace(html.unescape(stripper.text()))
+
+
+class _LinkCollector(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.links = []
+        self._href = None
+        self._text = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag == 'a':
+            self._href = dict(attrs).get('href') or ''
+            self._text = []
+
+    def handle_endtag(self, tag):
+        if tag == 'a' and self._href is not None:
+            self.links.append((self._href, collapse_whitespace(''.join(self._text))))
+            self._href = None
+
+    def handle_data(self, data):
+        if self._href is not None:
+            self._text.append(data)
+
+
+def html_links(markup):
+    """Each `<a href>` in `markup` as (href, visible text), in order."""
+    collector = _LinkCollector()
+    collector.feed(markup)
+    collector.close()
+    return collector.links
 
 
 _CF_HTML_HEADER = (
@@ -413,19 +477,24 @@ def copy_posix(text, plain_only, environ=None, which=shutil.which, run=subproces
     if not plain_only and tool.html_copy_argv:
         fragment = build_html_fragment(text)
         spans = count_code_spans(fragment)
+        links = markdown_links(text)
         html_document = build_full_html(fragment)
-        expected_visible = collapse_whitespace(unwrap_backtick_spans(text))
+        expected_visible = markdown_visible_text(text)
         _run_copy(run, tool.html_copy_argv, html_document, f'{tool.label} copy', env=env)
 
         def html_ok(output):
-            return html_visible_text(output) == expected_visible and count_code_spans(output) == spans
+            return (
+                html_visible_text(output) == expected_visible
+                and count_code_spans(output) == spans
+                and html_links(output) == links
+            )
 
         landed_html = _read_back_with_retry(run, tool.html_paste_argv, f'{tool.label} paste', html_ok, env=env)
         if not html_ok(landed_html):
             raise ClipboardError(
                 f'Clipboard verification failed: {tool.label} did not read back the HTML flavour that was copied.'
             )
-        return f'Copied {len(text)} chars, {spans} code spans, HTML verified on the clipboard.'
+        return f'Copied {len(text)} chars, {spans} code spans, {len(links)} links, HTML verified on the clipboard.'
 
     plain = text
     _run_copy(run, tool.copy_argv, plain, f'{tool.label} copy', env=env)
@@ -588,11 +657,13 @@ def copy_windows(text, plain_only):
 
     cf_html_bytes = None
     spans = 0
+    links = []
     expected_visible = None
     if not plain_only:
         fragment = build_html_fragment(text)
         spans = count_code_spans(fragment)
-        expected_visible = collapse_whitespace(unwrap_backtick_spans(text))
+        links = markdown_links(text)
+        expected_visible = markdown_visible_text(text)
         cf_html_text, *_ = build_cf_html(fragment)
         cf_html_bytes = cf_html_text.encode('utf-8') + b'\x00'
 
@@ -635,8 +706,10 @@ def copy_windows(text, plain_only):
         raise ClipboardError(
             f'Clipboard verification failed: expected {spans} code spans, found {landed_spans} on the clipboard.'
         )
+    if html_links(landed_fragment) != links:
+        raise ClipboardError('Clipboard verification failed: links did not round-trip.')
 
-    return f'Copied {len(plain)} chars, {spans} code spans, HTML + plain verified on the clipboard.'
+    return f'Copied {len(plain)} chars, {spans} code spans, {len(links)} links, HTML + plain verified on the clipboard.'
 
 
 # --- CLI -------------------------------------------------------------------------------------------
