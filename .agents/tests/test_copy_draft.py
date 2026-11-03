@@ -144,6 +144,32 @@ class LinkTests(unittest.TestCase):
         self.assertEqual(COPY_DRAFT.markdown_visible_text(text), 'the a pages and b and c')
 
 
+class FencedBlockTests(unittest.TestCase):
+    TEXT = 'Run this:\n```bash\naz login --tenant x\naz account show\n```\nthen check `foo`.'
+
+    def test_a_fence_becomes_one_pre_code_block_with_its_lines_intact(self):
+        self.assertEqual(
+            COPY_DRAFT.build_html_fragment(self.TEXT),
+            'Run this:<pre><code style="font-family:Consolas,\'Courier New\',monospace;">az login --tenant x\n'
+            'az account show</code></pre>then check '
+            '<code style="font-family:Consolas,\'Courier New\',monospace;">foo</code>.',
+        )
+
+    def test_the_fence_verifies_by_visible_text_and_code_count(self):
+        fragment = COPY_DRAFT.build_html_fragment(self.TEXT)
+        self.assertEqual(COPY_DRAFT.markdown_visible_text(self.TEXT), COPY_DRAFT.html_visible_text(fragment))
+        self.assertEqual(COPY_DRAFT.count_code_spans(fragment), 2)
+
+    def test_the_plain_flavour_keeps_the_fence_and_unwraps_inline_code(self):
+        self.assertEqual(
+            COPY_DRAFT.build_plain_text(self.TEXT),
+            'Run this:\n```bash\naz login --tenant x\naz account show\n```\nthen check foo.',
+        )
+
+    def test_inline_code_never_spans_lines(self):
+        self.assertNotIn('<code', COPY_DRAFT.build_html_fragment('a `b\nc` d'))
+
+
 class BuildFullHtmlTests(unittest.TestCase):
     def test_wraps_the_fragment_in_a_minimal_utf8_document(self):
         document = COPY_DRAFT.build_full_html('a <code>b</code>')
