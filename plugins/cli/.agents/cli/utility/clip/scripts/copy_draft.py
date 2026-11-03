@@ -26,7 +26,6 @@ a real clipboard.
 """
 
 import argparse
-from collections import namedtuple
 import ctypes
 import html
 from html.parser import HTMLParser
@@ -38,8 +37,14 @@ import subprocess
 import sys
 import tempfile
 import time
+from collections.abc import Callable, Mapping, Sequence
+from typing import IO, Any, NamedTuple
 
 IS_WINDOWS = os.name == 'nt'
+
+RunFunction = Callable[..., 'subprocess.CompletedProcess[str]']
+WhichFunction = Callable[[str], str | None]
+Link = tuple[str, str]
 
 GMEM_MOVEABLE = 0x0002
 CF_UNICODETEXT = 13
@@ -58,13 +63,13 @@ _TRAILING_WHITESPACE = re.compile(r'\s+\Z')
 _WHITESPACE_RUN = re.compile(r'\s+')
 
 
-def normalise_draft(raw):
+def normalise_draft(raw: str) -> str:
     """CRLF -> LF, then whitespace trimmed off only the very end of the text (not per line)."""
     text = raw.replace('\r\n', '\n')
     return _TRAILING_WHITESPACE.sub('', text)
 
 
-def read_draft_file(path):
+def read_draft_file(path: str) -> str:
     """The normalised draft text, or a ClipboardError naming a missing, non-UTF-8 or empty draft.
 
     Read as `utf-8-sig` rather than `utf-8` so a leading BOM -- common from Windows editors -- is
@@ -83,40 +88,40 @@ def read_draft_file(path):
     return text
 
 
-def unwrap_backtick_spans(text):
+def unwrap_backtick_spans(text: str) -> str:
     """Backticks are markup, not content. The plain flavour an app without HTML receives has them removed."""
     return _BACKTICK_SPAN.sub(lambda m: m.group(1), text)
 
 
-def escape_html(text):
+def escape_html(text: str) -> str:
     return text.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
 
 
-def count_code_spans(fragment):
+def count_code_spans(fragment: str) -> int:
     return fragment.count('<code')
 
 
-def _code_element(escaped):
+def _code_element(escaped: str) -> str:
     return f'<code style="font-family:Consolas,\'Courier New\',monospace;">{escaped}</code>'
 
 
-def _render_inline_markup(match):
+def _render_inline_markup(match: re.Match[str]) -> str:
     if match['code'] is not None:
         return _code_element(escape_html(match['code']))
     label = _BACKTICK_SPAN.sub(lambda m: _code_element(m.group(1)), escape_html(match['label']))
     return f'<a href="{html.escape(match["url"], quote=True)}">{label}</a>'
 
 
-def _visible_inline_markup(match):
+def _visible_inline_markup(match: re.Match[str]) -> str:
     return match['code'] if match['code'] is not None else unwrap_backtick_spans(match['label'])
 
 
-def markdown_visible_text(text):
+def markdown_visible_text(text: str) -> str:
     """The words `text`'s HTML flavour renders as, whitespace collapsed, to compare with a read-back."""
     return collapse_whitespace(_INLINE_MARKUP.sub(_visible_inline_markup, text))
 
 
-def markdown_links(text):
+def markdown_links(text: str) -> list[Link]:
     """Each `[label](url)` link in `text` as (url, visible label), in order."""
     return [
         (match['url'], collapse_whitespace(unwrap_backtick_spans(match['label'])))
@@ -125,7 +130,7 @@ def markdown_links(text):
     ]
 
 
-def build_html_fragment(text):
+def build_html_fragment(text: str) -> str:
     """The HTML fragment for `text`: escaped, backtick spans as monospace `<code>`, `[label](url)` links as
     `<a href>` link text, no block elements.
 
@@ -144,7 +149,7 @@ def build_html_fragment(text):
     return '<br><br>'.join(paragraph.replace('\n', '<br>') for paragraph in paragraphs)
 
 
-def build_full_html(fragment):
+def build_full_html(fragment: str) -> str:
     """A minimal standalone HTML document carrying `fragment`, for the Linux `text/html` MIME flavour.
 
     Unlike CF_HTML there is no fragment-offset header to construct: `wl-copy`/`xclip` set the bytes given
@@ -153,7 +158,7 @@ def build_full_html(fragment):
     return f'<html><head><meta charset="utf-8"></head><body>{fragment}</body></html>'
 
 
-def collapse_whitespace(text):
+def collapse_whitespace(text: str) -> str:
     return _WHITESPACE_RUN.sub(' ', text).strip()
 
 
@@ -165,28 +170,28 @@ class _TagStripper(HTMLParser):
     `html.unescape`, in `html_visible_text` below, rather than every call site reimplementing that step.
     """
 
-    def __init__(self):
+    def __init__(self) -> None:
         super().__init__(convert_charrefs=False)
-        self._parts = []
+        self._parts: list[str] = []
 
-    def handle_starttag(self, tag, attrs):
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         if tag == 'br':
             self._parts.append('\n')
 
-    def handle_data(self, data):
+    def handle_data(self, data: str) -> None:
         self._parts.append(data)
 
-    def handle_entityref(self, name):
+    def handle_entityref(self, name: str) -> None:
         self._parts.append(f'&{name};')
 
-    def handle_charref(self, name):
+    def handle_charref(self, name: str) -> None:
         self._parts.append(f'&#{name};')
 
-    def text(self):
+    def text(self) -> str:
         return ''.join(self._parts)
 
 
-def html_visible_text(markup):
+def html_visible_text(markup: str) -> str:
     """The human-readable text `markup` renders as: tags stripped via `html.parser` (not regex), entities
     unescaped, `<br>` turned into a newline, and runs of whitespace collapsed to one space.
 
@@ -201,28 +206,28 @@ def html_visible_text(markup):
 
 
 class _LinkCollector(HTMLParser):
-    def __init__(self):
+    def __init__(self) -> None:
         super().__init__()
-        self.links = []
-        self._href = None
-        self._text = []
+        self.links: list[Link] = []
+        self._href: str | None = None
+        self._text: list[str] = []
 
-    def handle_starttag(self, tag, attrs):
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         if tag == 'a':
             self._href = dict(attrs).get('href') or ''
             self._text = []
 
-    def handle_endtag(self, tag):
+    def handle_endtag(self, tag: str) -> None:
         if tag == 'a' and self._href is not None:
             self.links.append((self._href, collapse_whitespace(''.join(self._text))))
             self._href = None
 
-    def handle_data(self, data):
+    def handle_data(self, data: str) -> None:
         if self._href is not None:
             self._text.append(data)
 
 
-def html_links(markup):
+def html_links(markup: str) -> list[Link]:
     """Each `<a href>` in `markup` as (href, visible text), in order."""
     collector = _LinkCollector()
     collector.feed(markup)
@@ -241,7 +246,7 @@ _CF_HTML_PRE = '<html><body><!--StartFragment-->'
 _CF_HTML_POST = '<!--EndFragment--></body></html>'
 
 
-def build_cf_html(fragment):
+def build_cf_html(fragment: str) -> tuple[str, int, int, int, int]:
     """The CF_HTML text for `fragment`, with its header's byte offsets into its own UTF-8 encoding.
 
     Returns (text, start_html, end_html, start_fragment, end_fragment). Offsets are UTF-8 byte offsets,
@@ -257,7 +262,7 @@ def build_cf_html(fragment):
     return text, start_html, end_html, start_fragment, end_fragment
 
 
-def extract_cf_html_fragment(cf_html_text):
+def extract_cf_html_fragment(cf_html_text: str) -> str | None:
     """The payload between CF_HTML's `<!--StartFragment-->`/`<!--EndFragment-->` markers, or None.
 
     Reading back a decoded CF_HTML string by its own HTML comment markers avoids re-deriving byte offsets
@@ -279,10 +284,14 @@ def extract_cf_html_fragment(cf_html_text):
 # no_html_reason (also None when the tool does support HTML) to say why in the success line.
 # env_overrides is a dict merged over the real environment for this tool's own invocations -- empty for
 # every tool except pbcopy.
-PosixTool = namedtuple(
-    'PosixTool',
-    'label copy_argv paste_argv html_copy_argv html_paste_argv env_overrides no_html_reason',
-)
+class PosixTool(NamedTuple):
+    label: str
+    copy_argv: list[str]
+    paste_argv: list[str]
+    html_copy_argv: list[str] | None
+    html_paste_argv: list[str] | None
+    env_overrides: dict[str, str]
+    no_html_reason: str | None
 
 _WL_COPY = PosixTool(
     'wl-copy',
@@ -309,7 +318,7 @@ _PBCOPY = PosixTool(
 )
 
 
-def posix_clipboard_tool(environ, which):
+def posix_clipboard_tool(environ: Mapping[str, str], which: WhichFunction) -> PosixTool:
     """The PosixTool this environment selects, or a ClipboardError naming what to install.
 
     Wayland is checked first because a Wayland session under XWayland can still have DISPLAY set; without
@@ -351,7 +360,7 @@ def posix_clipboard_tool(environ, which):
     )
 
 
-def _clipboard_failure(label, returncode, stderr):
+def _clipboard_failure(label: str, returncode: int, stderr: str | None) -> ClipboardError:
     detail = (stderr or '').strip()
     message = f'{label} failed (exit {returncode})'
     return ClipboardError(f'{message}: {detail}' if detail else f'{message}.')
@@ -360,7 +369,7 @@ def _clipboard_failure(label, returncode, stderr):
 _TRANSIENT_READBACK_PATTERNS = ('nothing is copied', 'no suitable type', 'target not available', 'no selection')
 
 
-def _is_transient_readback_failure(stderr):
+def _is_transient_readback_failure(stderr: str | None) -> bool:
     """Whether a nonzero read-back exit names a known "owner not ready yet" shape worth retrying.
 
     wl-paste says "Nothing is copied" when no owner has claimed the selection yet; xclip says "No suitable
@@ -372,8 +381,9 @@ def _is_transient_readback_failure(stderr):
     return any(pattern in lowered for pattern in _TRANSIENT_READBACK_PATTERNS)
 
 
-def _run_clipboard_process(run, argv, label, env=None, timeout=10, input_text=None, capture_stdout=False,
-                            may_fork=False):
+def _run_clipboard_process(run: RunFunction, argv: list[str], label: str, env: Mapping[str, str] | None = None,
+                            timeout: float = 10, input_text: str | None = None, capture_stdout: bool = False,
+                            may_fork: bool = False) -> tuple[int, str, str]:
     """Runs one clipboard tool invocation; returns (returncode, stdout_text, stderr_text).
 
     Never raises for a nonzero exit -- that is left to the caller, since a read-back's nonzero exit can be
@@ -394,7 +404,7 @@ def _run_clipboard_process(run, argv, label, env=None, timeout=10, input_text=No
     Both streams are decoded explicitly as UTF-8 with decoding errors replaced, rather than left to the
     process's locale -- the locale is exactly what forcing LANG/LC_CTYPE for pbcopy/pbpaste routes around.
     """
-    kwargs = dict(timeout=timeout, encoding='utf-8', errors='replace')
+    kwargs: dict[str, Any] = dict(timeout=timeout, encoding='utf-8', errors='replace')
     if input_text is None:
         kwargs['stdin'] = subprocess.DEVNULL
     else:
@@ -403,16 +413,18 @@ def _run_clipboard_process(run, argv, label, env=None, timeout=10, input_text=No
     if env is not None:
         kwargs['env'] = env
 
-    stderr_file = tempfile.TemporaryFile(mode='w+', encoding='utf-8', errors='replace') if may_fork else None
+    stderr_file: IO[str] | None = (
+        tempfile.TemporaryFile(mode='w+', encoding='utf-8', errors='replace') if may_fork else None
+    )
     try:
-        kwargs['stderr'] = stderr_file if may_fork else subprocess.PIPE
+        kwargs['stderr'] = stderr_file if stderr_file is not None else subprocess.PIPE
         try:
             result = run(argv, **kwargs)
         except subprocess.TimeoutExpired:
             raise ClipboardError(f'{label} did not answer within {timeout} seconds.') from None
         except OSError as exc:
             raise ClipboardError(f'{label} could not be run: {exc}') from None
-        if may_fork:
+        if stderr_file is not None:
             stderr_file.seek(0)
             stderr_text = stderr_file.read()
         else:
@@ -425,7 +437,8 @@ def _run_clipboard_process(run, argv, label, env=None, timeout=10, input_text=No
     return result.returncode, (stdout_text or ''), stderr_text
 
 
-def _run_copy(run, argv, text, label, env=None, timeout=10):
+def _run_copy(run: RunFunction, argv: list[str], text: str, label: str, env: Mapping[str, str] | None = None,
+              timeout: float = 10) -> None:
     returncode, _, stderr = _run_clipboard_process(
         run, argv, label, env=env, timeout=timeout, input_text=text, capture_stdout=False, may_fork=True,
     )
@@ -433,7 +446,9 @@ def _run_copy(run, argv, text, label, env=None, timeout=10):
         raise _clipboard_failure(label, returncode, stderr)
 
 
-def _read_back_with_retry(run, argv, label, is_ok, env=None, attempts=5, total_timeout=1.0):
+def _read_back_with_retry(run: RunFunction, argv: list[str], label: str, is_ok: Callable[[str], bool],
+                          env: Mapping[str, str] | None = None, attempts: int = 5,
+                          total_timeout: float = 1.0) -> str:
     """Reads back up to `attempts` times, pausing between tries, until `is_ok` accepts the output.
 
     A nonzero exit is retried only when `_is_transient_readback_failure` recognises its stderr as the
@@ -446,7 +461,7 @@ def _read_back_with_retry(run, argv, label, is_ok, env=None, attempts=5, total_t
     """
     delay = total_timeout / attempts
     returncode, stderr = 1, ''
-    last_zero_exit_output = None
+    last_zero_exit_output: str | None = None
     for attempt in range(attempts):
         returncode, output, stderr = _run_clipboard_process(run, argv, label, env=env, capture_stdout=True)
         if returncode == 0:
@@ -462,7 +477,8 @@ def _read_back_with_retry(run, argv, label, is_ok, env=None, attempts=5, total_t
     return last_zero_exit_output
 
 
-def copy_posix(text, plain_only, environ=None, which=shutil.which, run=subprocess.run):
+def copy_posix(text: str, plain_only: bool, environ: Mapping[str, str] | None = None,
+               which: WhichFunction = shutil.which, run: RunFunction = subprocess.run) -> str:
     """Copy `text` through the clipboard tool this environment selects, and verify it round-trips.
 
     Default mode copies an HTML flavour (so Teams renders backtick spans as monospace) when the selected
@@ -474,7 +490,7 @@ def copy_posix(text, plain_only, environ=None, which=shutil.which, run=subproces
     tool = posix_clipboard_tool(environ, which)
     env = {**environ, **tool.env_overrides} if tool.env_overrides else None
 
-    if not plain_only and tool.html_copy_argv:
+    if not plain_only and tool.html_copy_argv and tool.html_paste_argv:
         fragment = build_html_fragment(text)
         spans = count_code_spans(fragment)
         links = markdown_links(text)
@@ -482,7 +498,7 @@ def copy_posix(text, plain_only, environ=None, which=shutil.which, run=subproces
         expected_visible = markdown_visible_text(text)
         _run_copy(run, tool.html_copy_argv, html_document, f'{tool.label} copy', env=env)
 
-        def html_ok(output):
+        def html_ok(output: str) -> bool:
             return (
                 html_visible_text(output) == expected_visible
                 and count_code_spans(output) == spans
@@ -499,7 +515,7 @@ def copy_posix(text, plain_only, environ=None, which=shutil.which, run=subproces
     plain = text
     _run_copy(run, tool.copy_argv, plain, f'{tool.label} copy', env=env)
 
-    def plain_ok(output):
+    def plain_ok(output: str) -> bool:
         return _TRAILING_WHITESPACE.sub('', output) == plain
 
     landed_plain = _read_back_with_retry(run, tool.paste_argv, f'{tool.label} paste', plain_ok, env=env)
@@ -516,13 +532,14 @@ def copy_posix(text, plain_only, environ=None, which=shutil.which, run=subproces
 # --- Windows backend -----------------------------------------------------------------------------
 
 
-def _windows_api():
+def _windows_api() -> tuple[Any, Any]:
     # Imported and bound lazily: ctypes.windll only exists on Windows, and this module must still import
     # cleanly on Linux/macOS so the pure functions and the POSIX backend stay testable there.
     import ctypes.wintypes as wintypes
 
-    user32 = ctypes.windll.user32
-    kernel32 = ctypes.windll.kernel32
+    windll: Any = getattr(ctypes, 'windll')
+    user32 = windll.user32
+    kernel32 = windll.kernel32
 
     user32.CreateWindowExW.argtypes = [
         wintypes.DWORD, wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD,
@@ -564,7 +581,7 @@ def _windows_api():
     return user32, kernel32
 
 
-def _create_message_window(user32):
+def _create_message_window(user32: Any) -> Any:
     """A hidden message-only window, so SetClipboardData has a real owner to attach the data to.
 
     OpenClipboard(NULL) leaves the clipboard with no owning window at all; EmptyClipboard followed by
@@ -582,7 +599,7 @@ def _create_message_window(user32):
     return hwnd
 
 
-def _open_clipboard(user32, hwnd, retries=10, delay=0.05):
+def _open_clipboard(user32: Any, hwnd: Any, retries: int = 10, delay: float = 0.05) -> None:
     # Another process (often the previous clipboard owner tearing down) can hold the clipboard for a
     # moment; a short retry loop rides that out instead of failing a copy that would succeed a beat later.
     for _ in range(retries):
@@ -592,7 +609,7 @@ def _open_clipboard(user32, hwnd, retries=10, delay=0.05):
     raise ClipboardError('Could not open the clipboard; another process held it.')
 
 
-def _set_clipboard_bytes(user32, kernel32, clipboard_format, data):
+def _set_clipboard_bytes(user32: Any, kernel32: Any, clipboard_format: int, data: bytes) -> None:
     size = len(data)
     handle = kernel32.GlobalAlloc(GMEM_MOVEABLE, ctypes.c_size_t(size))
     if not handle:
@@ -612,10 +629,10 @@ def _set_clipboard_bytes(user32, kernel32, clipboard_format, data):
         raise ClipboardError('SetClipboardData failed.')
 
 
-def _read_windows_clipboard(user32, kernel32, html_format, hwnd):
+def _read_windows_clipboard(user32: Any, kernel32: Any, html_format: int, hwnd: Any) -> tuple[str | None, str | None]:
     _open_clipboard(user32, hwnd)
     try:
-        cf_html = None
+        cf_html: str | None = None
         if user32.IsClipboardFormatAvailable(html_format):
             handle = user32.GetClipboardData(html_format)
             if handle:
@@ -628,7 +645,7 @@ def _read_windows_clipboard(user32, kernel32, html_format, hwnd):
                         kernel32.GlobalUnlock(handle)
                     cf_html = raw.split(b'\x00', 1)[0].decode('utf-8', errors='replace')
 
-        plain = None
+        plain: str | None = None
         if user32.IsClipboardFormatAvailable(CF_UNICODETEXT):
             handle = user32.GetClipboardData(CF_UNICODETEXT)
             if handle:
@@ -643,7 +660,7 @@ def _read_windows_clipboard(user32, kernel32, html_format, hwnd):
         user32.CloseClipboard()
 
 
-def copy_windows(text, plain_only):
+def copy_windows(text: str, plain_only: bool) -> str:
     """Copy `text` on Windows via ctypes: CF_UNICODETEXT always, plus CF_HTML unless `plain_only`.
 
     Always verifies off the live clipboard afterwards, including in `--plain-only` mode, and raises
@@ -655,10 +672,10 @@ def copy_windows(text, plain_only):
     plain = text if plain_only else unwrap_backtick_spans(text)
     unicode_bytes = plain.encode('utf-16-le') + b'\x00\x00'
 
-    cf_html_bytes = None
+    cf_html_bytes: bytes | None = None
     spans = 0
-    links = []
-    expected_visible = None
+    links: list[Link] = []
+    expected_visible = ''
     if not plain_only:
         fragment = build_html_fragment(text)
         spans = count_code_spans(fragment)
@@ -715,7 +732,7 @@ def copy_windows(text, plain_only):
 # --- CLI -------------------------------------------------------------------------------------------
 
 
-def parse_args(argv):
+def parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description='Copy a drafted file onto the system clipboard.')
     parser.add_argument('--path', required=True, help='Path to the UTF-8 draft file to copy.')
     parser.add_argument(
@@ -725,10 +742,10 @@ def parse_args(argv):
     return parser.parse_args(argv)
 
 
-def main(argv=None):
+def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
     try:
-        text = read_draft_file(args.path)
+        text = read_draft_file(str(args.path))
         message = copy_windows(text, args.plain_only) if IS_WINDOWS else copy_posix(text, args.plain_only)
         print(message)
         return 0
