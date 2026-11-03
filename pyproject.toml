@@ -31,7 +31,6 @@ files = [
     "packages/tj-cli/src",
     "packages/tj-cli/tests",
     ".agents/cli/utility/clip/scripts",
-    ".agents/cli/utility/teams-message/scripts",
 ]
 
 [tool.pytest]
