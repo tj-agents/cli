@@ -3,13 +3,26 @@
   "dependencies": [],
   "profiles": {
     "core": [
-      "clip",
-      "close",
-      "closeout"
+      "cd",
+      "clip"
     ]
   },
   "compatibilitySkillAliases": {},
   "skills": [
+    {
+      "name": "cd",
+      "kind": "utility",
+      "profile": "core",
+      "applicability": [
+        "all projects"
+      ],
+      "requires": [
+        "current host directory and session interfaces when available"
+      ],
+      "provenance": [
+        "house"
+      ]
+    },
     {
       "name": "clip",
       "kind": "utility",
@@ -19,35 +32,6 @@
       ],
       "requires": [
         "python"
-      ],
-      "provenance": [
-        "house"
-      ]
-    },
-    {
-      "name": "close",
-      "kind": "utility",
-      "profile": "core",
-      "applicability": [
-        "all projects"
-      ],
-      "requires": [
-        "python"
-      ],
-      "provenance": [
-        "house"
-      ]
-    },
-    {
-      "name": "closeout",
-      "kind": "utility",
-      "profile": "core",
-      "applicability": [
-        "all projects"
-      ],
-      "requires": [
-        "python",
-        "git"
       ],
       "provenance": [
         "house"

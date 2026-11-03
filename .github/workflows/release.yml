@@ -24,11 +24,11 @@ jobs:
       - run: cargo build --release --locked
       - name: package (Linux)
         if: runner.os == 'Linux'
-        run: tar -czf tj-${{ matrix.target }}.tar.gz -C target/release tj
+        run: tar -czf tj-${{ matrix.target }}.tar.gz -C target/release tj tj_hook
       - name: package (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
-        run: Compress-Archive -Path target/release/tj.exe -DestinationPath tj-${{ matrix.target }}.zip
+        run: Compress-Archive -Path target/release/tj.exe,target/release/tj_hook.exe -DestinationPath tj-${{ matrix.target }}.zip
       - uses: actions/upload-artifact@v4
         with:
           name: tj-${{ matrix.target }}

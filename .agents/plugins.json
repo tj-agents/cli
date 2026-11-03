@@ -15,6 +15,7 @@
     "personal@tj-agents",
     "python@tj-agents",
     "rust@tj-agents",
+    "skill@tj-agents",
     "template@tj-agents",
     "workflow@tj-agents"
   ]

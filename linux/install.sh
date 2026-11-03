@@ -9,7 +9,8 @@ set -euo pipefail
 
 repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 bin_dir="${TJ_BIN_DIR:-$HOME/.local/bin}"
-target="$bin_dir/tj"
+binaries=(tj tj_hook)
+download_dir=""
 mode="install"
 case "${1:-}" in
     --check) mode="check" ;;
@@ -62,40 +63,49 @@ wire() {
     esac
 }
 
-install_binary() {
+install_binaries() {
+    local binary target built
     if [ "$mode" = "uninstall" ]; then
-        if [ -e "$target" ]; then rm -f "$target"; say removed "$target"; else say ok "$target (not installed)"; fi
+        for binary in "${binaries[@]}"; do
+            target="$bin_dir/$binary"
+            if [ -e "$target" ]; then rm -f "$target"; say removed "$target"; else say ok "$target (not installed)"; fi
+        done
         return
     fi
     if [ "$mode" = "check" ]; then
-        if [ -x "$target" ]; then say ok "$target ($("$target" --version))"; else say missing "$target"; status=1; fi
+        for binary in "${binaries[@]}"; do
+            target="$bin_dir/$binary"
+            if [ -x "$target" ]; then say ok "$target ($("$target" --version))"; else say missing "$target"; status=1; fi
+        done
         return
     fi
 
-    local built
+    local built_dir
     if command -v cargo >/dev/null 2>&1; then
         cargo build --release --locked --quiet --manifest-path "$repo/Cargo.toml"
-        built="$repo/target/release/tj"
+        built_dir="$repo/target/release"
     elif command -v gh >/dev/null 2>&1; then
-        local tmp
-        tmp="$(mktemp -d)"
-        trap 'rm -rf "$tmp"' EXIT
-        gh release download --repo tj-agents/cli --pattern 'tj-x86_64-unknown-linux-gnu.tar.gz' --dir "$tmp" --clobber
-        tar -xzf "$tmp/tj-x86_64-unknown-linux-gnu.tar.gz" -C "$tmp"
-        built="$tmp/tj"
+        download_dir="$(mktemp -d)"
+        trap 'rm -rf -- "$download_dir"' EXIT
+        gh release download --repo tj-agents/cli --pattern 'tj-x86_64-unknown-linux-gnu.tar.gz' --dir "$download_dir" --clobber
+        tar -xzf "$download_dir/tj-x86_64-unknown-linux-gnu.tar.gz" -C "$download_dir"
+        built_dir="$download_dir"
     else
         echo "install needs either cargo (to build) or gh (to download a release)" >&2
         exit 1
     fi
 
-    if [ -x "$target" ] && cmp -s "$built" "$target"; then
-        say ok "$target"
-    else
-        mkdir -p "$bin_dir"
-        # Copy then rename, so a running `tj` is never left with a half-written binary.
-        cp "$built" "$target.new" && chmod 755 "$target.new" && mv -f "$target.new" "$target"
-        say installed "$target ($("$target" --version))"
-    fi
+    mkdir -p "$bin_dir"
+    for binary in "${binaries[@]}"; do
+        target="$bin_dir/$binary"
+        built="$built_dir/$binary"
+        if [ -x "$target" ] && cmp -s "$built" "$target"; then
+            say ok "$target"
+        else
+            cp "$built" "$target.new" && chmod 755 "$target.new" && mv -f "$target.new" "$target"
+            say installed "$target ($("$target" --version))"
+        fi
+    done
 }
 
 check_deps() {
@@ -120,7 +130,7 @@ check_deps() {
     esac
 }
 
-install_binary
+install_binaries
 check_deps
 
 posix='command -v tj >/dev/null 2>&1 && eval "$(tj init bash)"'
