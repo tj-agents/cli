@@ -13,6 +13,7 @@ The shared `tj-agents` marketplace also publishes `cli@tj-agents`:
 
 - [`cli:cd`](.agents/cli/utility/cd/SKILL.md) continues an authorized task in a nested directory or linked worktree, using supported native session control when available.
 - [`cli:clip`](.agents/cli/utility/clip/SKILL.md) puts text on the OS clipboard (Windows, Linux or macOS) so it can be pasted elsewhere.
+- [`cli:teams-message`](.agents/cli/utility/teams-message/SKILL.md) checks a Teams message draft against its markdown rules, then copies it through `cli:clip`.
 
 `tj-cli` supplies deterministic process, terminal, and linked-worktree mechanics to Agent. Agent owns
 session-aware target resolution and lifecycle decisions. Native control supports Windows Terminal, tmux and

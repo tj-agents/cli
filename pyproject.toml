@@ -27,7 +27,12 @@ select = ["E", "W", "F", "I", "N", "UP", "B", "A", "BLE", "C4", "SIM", "PTH", "P
 [tool.mypy]
 strict = true
 warn_unreachable = true
-files = ["packages/tj-cli/src", "packages/tj-cli/tests"]
+files = [
+    "packages/tj-cli/src",
+    "packages/tj-cli/tests",
+    ".agents/cli/utility/clip/scripts",
+    ".agents/cli/utility/teams-message/scripts",
+]
 
 [tool.pytest]
 strict = true

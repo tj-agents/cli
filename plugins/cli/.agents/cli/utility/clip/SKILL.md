@@ -35,6 +35,8 @@ emoji, and a heredoc through PowerShell is worse. The file is the interface.
 
 ## What goes on the clipboard
 
+A Teams message goes through `cli:teams-message`, which checks it before calling this script.
+
 **The message with its markdown intact** — that is the point of copying rather than having him
 drag-select. Teams renders markdown in the compose box, so backticks around a service, identity,
 resource group, role or flag survive as inline code and make the specifics stand out, and a triple
