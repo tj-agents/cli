@@ -57,8 +57,12 @@ class ClipboardError(Exception):
 
 # --- pure text transforms -----------------------------------------------------------------------
 
-_BACKTICK_SPAN = re.compile(r'`([^`]+)`')
-_INLINE_MARKUP = re.compile(r'`(?P<code>[^`]+)`|\[(?P<label>[^\]\n]+)\]\((?P<url>https?://[^\s)]+)\)')
+_BACKTICK_SPAN = re.compile(r'`([^`\n]+)`')
+_INLINE_MARKUP = re.compile(
+    r'(?ms:^```[^\n]*\n(?P<block>.*?)\n```[ \t]*$)'
+    r'|`(?P<code>[^`\n]+)`'
+    r'|\[(?P<label>[^\]\n]+)\]\((?P<url>https?://[^\s)]+)\)'
+)
 _TRAILING_WHITESPACE = re.compile(r'\s+\Z')
 _WHITESPACE_RUN = re.compile(r'\s+')
 
@@ -89,8 +93,20 @@ def read_draft_file(path: str) -> str:
 
 
 def unwrap_backtick_spans(text: str) -> str:
-    """Backticks are markup, not content. The plain flavour an app without HTML receives has them removed."""
     return _BACKTICK_SPAN.sub(lambda m: m.group(1), text)
+
+
+def _plain_inline_markup(match: re.Match[str]) -> str:
+    if match['block'] is not None:
+        return match.group(0)
+    if match['code'] is not None:
+        return match['code']
+    return f'[{unwrap_backtick_spans(match["label"])}]({match["url"]})'
+
+
+def build_plain_text(text: str) -> str:
+    """The plain flavour an app without HTML receives: inline backticks removed, fences and links kept."""
+    return _INLINE_MARKUP.sub(_plain_inline_markup, text)
 
 
 def escape_html(text: str) -> str:
@@ -112,7 +128,18 @@ def _render_inline_markup(match: re.Match[str]) -> str:
     return f'<a href="{html.escape(match["url"], quote=True)}">{label}</a>'
 
 
+def _render_block(content: str) -> str:
+    return f'<pre>{_code_element(escape_html(content))}</pre>'
+
+
+def _render_prose(rendered: str) -> str:
+    paragraphs = re.split(r'\n{2,}', rendered)
+    return '<br><br>'.join(paragraph.replace('\n', '<br>') for paragraph in paragraphs)
+
+
 def _visible_inline_markup(match: re.Match[str]) -> str:
+    if match['block'] is not None:
+        return f' {match["block"]} '
     return match['code'] if match['code'] is not None else unwrap_backtick_spans(match['label'])
 
 
@@ -132,21 +159,31 @@ def markdown_links(text: str) -> list[Link]:
 
 def build_html_fragment(text: str) -> str:
     """The HTML fragment for `text`: escaped, backtick spans as monospace `<code>`, `[label](url)` links as
-    `<a href>` link text, no block elements.
+    `<a href>` link text, and each fenced block as one `<pre>` code block.
 
     Teams gives `<p>` and `<div>` their own margins and indent on paste, so paragraphs (separated by a
     blank line) are joined with a double `<br>` instead, and a single newline within a paragraph becomes
-    one `<br>`.
+    one `<br>`. The newline on each side of a fenced block is dropped because `<pre>` already breaks the line.
     """
-    parts = []
+    output: list[str] = []
+    prose: list[str] = []
     position = 0
     for match in _INLINE_MARKUP.finditer(text):
-        parts.append(escape_html(text[position:match.start()]))
-        parts.append(_render_inline_markup(match))
+        before = text[position:match.start()]
         position = match.end()
-    parts.append(escape_html(text[position:]))
-    paragraphs = re.split(r'\n{2,}', ''.join(parts))
-    return '<br><br>'.join(paragraph.replace('\n', '<br>') for paragraph in paragraphs)
+        if match['block'] is None:
+            prose.append(escape_html(before))
+            prose.append(_render_inline_markup(match))
+            continue
+        prose.append(escape_html(before.removesuffix('\n')))
+        output.append(_render_prose(''.join(prose)))
+        output.append(_render_block(match['block']))
+        prose = []
+        if text.startswith('\n', position):
+            position += 1
+    prose.append(escape_html(text[position:]))
+    output.append(_render_prose(''.join(prose)))
+    return ''.join(output)
 
 
 def build_full_html(fragment: str) -> str:
@@ -163,7 +200,7 @@ def collapse_whitespace(text: str) -> str:
 
 
 class _TagStripper(HTMLParser):
-    """Collects the literal text data between tags, with `<br>` recorded as a newline.
+    """Collects the literal text data between tags, with `<br>` and each `<pre>` edge recorded as a newline.
 
     `convert_charrefs=False` so entities reach `handle_entityref`/`handle_charref` rather than being
     unescaped here; they are re-emitted as their original `&name;`/`&#name;` text and unescaped once, by
@@ -175,7 +212,11 @@ class _TagStripper(HTMLParser):
         self._parts: list[str] = []
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
-        if tag == 'br':
+        if tag in ('br', 'pre'):
+            self._parts.append('\n')
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag == 'pre':
             self._parts.append('\n')
 
     def handle_data(self, data: str) -> None:
@@ -669,7 +710,7 @@ def copy_windows(text: str, plain_only: bool) -> str:
     user32, kernel32 = _windows_api()
     html_format = user32.RegisterClipboardFormatW('HTML Format')
 
-    plain = text if plain_only else unwrap_backtick_spans(text)
+    plain = text if plain_only else build_plain_text(text)
     unicode_bytes = plain.encode('utf-16-le') + b'\x00\x00'
 
     cf_html_bytes: bytes | None = None
