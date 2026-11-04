@@ -20,3 +20,8 @@ pub fn run(arguments: &[OsString], preserve_descendants: bool) -> io::Result<u32
         Err(std::process::Command::new(&arguments[0]).args(&arguments[1..]).exec())
     }
 }
+
+#[cfg(windows)]
+pub fn batch_dispatch(arguments: &[OsString]) -> io::Result<u32> {
+    windows::batch_dispatch(arguments)
+}

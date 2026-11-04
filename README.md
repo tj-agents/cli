@@ -134,6 +134,9 @@ environment and working directory, returning its exit status. On Windows the lau
 has no console window and starts the command in a console hidden from creation. Ordinary
 descendants inherit that hidden console. A Windows Job Object keeps the command tree
 owned by the launcher: exiting or terminating the launcher also terminates its descendants.
+Windows `.cmd` and `.bat` targets run automatically through the same hidden, job-owned launcher;
+paths containing `%`, a matching `.cmd.exe`/`.bat.exe` sidecar, or arguments containing line breaks
+or batch shell characters are rejected rather than interpreted as batch source.
 Use `tj_hook --preserve-descendants -- <executable> [arguments...]` only when descendants
 must outlive a normally exiting root command; cancellation before that exit still terminates
 the owned tree. On Linux this option retains the launcher's existing `exec` behavior.

@@ -3,21 +3,24 @@ use std::io;
 use std::mem::{size_of, zeroed};
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+use std::process::Command;
 use std::ptr::{null, null_mut};
 
 use windows_sys::Win32::Foundation::{
     DUPLICATE_SAME_ACCESS, DuplicateHandle, ERROR_CANT_ACCESS_FILE, HANDLE, INVALID_HANDLE_VALUE, WAIT_FAILED,
 };
-use windows_sys::Win32::System::Console::{GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE};
+use windows_sys::Win32::System::Console::{
+    AllocConsole, GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+};
 use windows_sys::Win32::System::JobObjects::{
-    CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+    CreateJobObjectW, IsProcessInJob, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
     JobObjectExtendedLimitInformation, SetInformationJobObject,
 };
 use windows_sys::Win32::System::Threading::{
     CREATE_NEW_CONSOLE, CreateProcessW, DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess,
-    GetExitCodeProcess, INFINITE, InitializeProcThreadAttributeList, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
-    PROC_THREAD_ATTRIBUTE_JOB_LIST, PROCESS_INFORMATION, STARTF_USESHOWWINDOW, STARTF_USESTDHANDLES, STARTUPINFOEXW,
-    UpdateProcThreadAttribute, WaitForSingleObject,
+    GetExitCodeProcess, GetStartupInfoW, INFINITE, InitializeProcThreadAttributeList,
+    PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROC_THREAD_ATTRIBUTE_JOB_LIST, PROCESS_INFORMATION, STARTF_USESHOWWINDOW,
+    STARTF_USESTDHANDLES, STARTUPINFOEXW, UpdateProcThreadAttribute, WaitForSingleObject,
 };
 
 struct AttributeList(Vec<usize>);
@@ -137,6 +140,75 @@ fn raw(handle: &Option<OwnedHandle>) -> HANDLE {
     handle.as_ref().map_or(null_mut(), AsRawHandle::as_raw_handle)
 }
 
+fn is_batch(path: &std::path::Path) -> bool {
+    path.extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("cmd") || extension.eq_ignore_ascii_case("bat"))
+}
+
+fn validate_batch(arguments: &[OsString], batch: &std::path::Path) -> io::Result<()> {
+    if arguments.iter().any(|argument| argument.to_string_lossy().contains(['\r', '\n', '&', '|', '<', '>', '^', '%']))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "batch arguments contain unsupported shell characters",
+        ));
+    }
+    if !batch.is_absolute() || !is_batch(batch) {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "batch target must be an absolute cmd or bat file"));
+    }
+    let canonical = batch.canonicalize()?;
+    if canonical != batch {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "batch target must be canonical"));
+    }
+    if batch.as_os_str().encode_wide().any(|character| character == u16::from(b'%')) {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "batch target path cannot contain percent"));
+    }
+    let mut sidecar = batch.as_os_str().to_os_string();
+    sidecar.push(".exe");
+    if std::path::Path::new(&sidecar).is_file() {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "batch target executable sidecar exists"));
+    }
+    Ok(())
+}
+
+fn batch_command(arguments: &[OsString], batch: &std::path::Path) -> io::Result<Vec<OsString>> {
+    validate_batch(arguments, batch)?;
+    Ok([
+        vec![
+            std::env::current_exe()?.into_os_string(),
+            OsString::from("--tj-hook-batch-dispatch"),
+            OsString::from("--"),
+            batch.as_os_str().to_os_string(),
+        ],
+        arguments[1..].to_vec(),
+    ]
+    .concat())
+}
+
+pub(super) fn batch_dispatch(arguments: &[OsString]) -> io::Result<u32> {
+    if arguments.is_empty() {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid internal batch dispatch arguments"));
+    }
+    let batch = std::path::Path::new(&arguments[0]);
+    validate_batch(arguments, batch)?;
+    unsafe {
+        let mut startup = zeroed();
+        GetStartupInfoW(&mut startup);
+        if startup.dwFlags & STARTF_USESHOWWINDOW == 0 || startup.wShowWindow != 0 {
+            return Err(io::Error::new(io::ErrorKind::PermissionDenied, "internal batch dispatch is not hidden"));
+        }
+        let mut in_job = 0;
+        if IsProcessInJob(GetCurrentProcess(), null_mut(), &mut in_job) == 0 || in_job == 0 {
+            return Err(io::Error::new(io::ErrorKind::PermissionDenied, "internal batch dispatch is not job-owned"));
+        }
+        if AllocConsole() == 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    let status = Command::new(batch).args(&arguments[1..]).status()?;
+    Ok(status.code().unwrap_or(127) as u32)
+}
+
 pub(super) fn run(arguments: &[OsString], preserve_descendants: bool) -> io::Result<u32> {
     let executable = std::path::absolute(
         which::which(&arguments[0]).map_err(|error| io::Error::new(io::ErrorKind::NotFound, error))?,
@@ -146,18 +218,17 @@ pub(super) fn run(arguments: &[OsString], preserve_descendants: bool) -> io::Res
         Err(error) if error.raw_os_error() == Some(ERROR_CANT_ACCESS_FILE as i32) => executable.clone(),
         Err(error) => return Err(error),
     };
-    if canonical
-        .extension()
-        .is_some_and(|extension| extension.eq_ignore_ascii_case("cmd") || extension.eq_ignore_ascii_case("bat"))
-    {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "batch files require an explicit cmd.exe command"));
-    }
-    let mut command = if canonical.file_name().is_some_and(|name| name.eq_ignore_ascii_case("cmd.exe")) {
+    let batch = is_batch(&canonical);
+    let broker = batch.then(|| batch_command(arguments, &canonical)).transpose()?;
+    let launch_arguments = broker.as_deref().unwrap_or(arguments);
+    let mut command = if batch {
+        command_line(launch_arguments)?
+    } else if canonical.file_name().is_some_and(|name| name.eq_ignore_ascii_case("cmd.exe")) {
         shell_command_line(arguments)?
     } else {
-        command_line(arguments)?
+        command_line(launch_arguments)?
     };
-    let executable = wide(executable.as_os_str())?;
+    let executable = wide(if batch { launch_arguments[0].as_os_str() } else { executable.as_os_str() })?;
     let stdin = inherited_handle(STD_INPUT_HANDLE)?;
     let stdout = inherited_handle(STD_OUTPUT_HANDLE)?;
     let stderr = inherited_handle(STD_ERROR_HANDLE)?;
