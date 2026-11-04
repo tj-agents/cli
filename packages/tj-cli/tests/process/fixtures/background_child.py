@@ -10,7 +10,9 @@ user = ctypes.WinDLL("user32")
 kernel.GetConsoleWindow.restype = ctypes.c_void_p
 user.IsWindowVisible.argtypes = [ctypes.c_void_p]
 console = kernel.GetConsoleWindow()
-Path(sys.argv[1]).write_text(
+report = Path(sys.argv[1])
+pending = report.with_suffix(".pending")
+pending.write_text(
     json.dumps(
         {
             "pid": os.getpid(),
@@ -20,4 +22,5 @@ Path(sys.argv[1]).write_text(
     ),
     encoding="utf-8",
 )
+pending.replace(report)
 time.sleep(float(sys.argv[2]))
