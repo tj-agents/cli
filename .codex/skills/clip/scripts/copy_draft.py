@@ -6,8 +6,8 @@ exec bit are not relied on.
 
 On Windows, without `--plain-only`, this writes BOTH an `HTML Format` flavour (CF_HTML, with single
 backtick spans rendered as monospace `<code>` and `[label](https://...)` links as clickable `<a>` text) and
-a plain Unicode text flavour (backticks unwrapped, links left as markdown), then verifies both off the
-live clipboard. `--plain-only` writes only the literal text, unchanged, as
+a plain Unicode text flavour (backticks unwrapped, each link reduced to its text), then verifies both off
+the live clipboard. `--plain-only` writes only the literal text, unchanged, as
 CF_UNICODETEXT, and that is still verified by reading it back.
 
 On Linux, default mode copies a `text/html` flavour built from the same escaped-and-code-spanned fragment
@@ -101,11 +101,15 @@ def _plain_inline_markup(match: re.Match[str]) -> str:
         return match.group(0)
     if match['code'] is not None:
         return match['code']
-    return f'[{unwrap_backtick_spans(match["label"])}]({match["url"]})'
+    return unwrap_backtick_spans(match['label'])
 
 
 def build_plain_text(text: str) -> str:
-    """The plain flavour an app without HTML receives: inline backticks removed, fences and links kept."""
+    """The plain flavour beside the HTML: inline backticks removed, fences kept, each link reduced to its text.
+
+    No URL may appear here: when text is selected, Teams turns the whole selection into one link to any URL
+    it finds in the plain flavour instead of pasting.
+    """
     return _INLINE_MARKUP.sub(_plain_inline_markup, text)
 
 
