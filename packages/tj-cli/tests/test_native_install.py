@@ -55,6 +55,140 @@ def test_missing_native_reports_the_pair(tmp_path: Path) -> None:
     assert native_install.missing_native(tmp_path) == native_install._binary_names()
 
 
+def _native_pair(directory: Path) -> None:
+    directory.mkdir()
+    for name in native_install._binary_names():
+        path = directory / name
+        path.write_text("native", encoding="utf-8")
+        path.chmod(path.stat().st_mode | 0o111)
+
+
+@pytest.mark.parametrize(
+    ("output", "pending"),
+    [
+        ("tj_hook 0.1.9\n", True),
+        ("tj_hook 0.2.0\n", False),
+        ("tj_hook 0.2.1\n", False),
+        ("tj_hook 1.0.0\n", False),
+        ("tj_hook development\n", True),
+        ("tj_hook 00.2.0\n", True),
+        ("tj 0.2.0\n", True),
+    ],
+)
+def test_pending_native_probes_the_absolute_managed_hook(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, output: str, pending: bool
+) -> None:
+    directory = tmp_path / "managed"
+    _native_pair(directory)
+    shadow = tmp_path / native_install._binary_names()[1]
+    shadow.write_text("shadow", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("PATH", str(tmp_path))
+    with mock.patch.object(
+        native_install,
+        "_run",
+        return_value=subprocess.CompletedProcess([], 0, output, ""),
+    ) as run:
+        assert native_install.pending_native(directory) == (
+            native_install._binary_names() if pending else ()
+        )
+    assert run.call_args.args[0] == [
+        str(directory.resolve() / native_install._binary_names()[1]),
+        "--version",
+    ]
+    assert run.call_args.kwargs == {"timeout": native_install._VERSION_TIMEOUT}
+
+
+def test_pending_native_reports_absent_names_without_probing(tmp_path: Path) -> None:
+    with mock.patch.object(native_install, "_run") as run:
+        assert native_install.pending_native(tmp_path) == native_install._binary_names()
+    run.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        subprocess.CalledProcessError(1, ["tj_hook"]),
+        subprocess.TimeoutExpired(["tj_hook"], 0.1),
+        UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid byte"),
+    ],
+)
+def test_pending_native_reports_nonzero_or_timed_out_hook(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: Exception
+) -> None:
+    directory = tmp_path / "managed"
+    _native_pair(directory)
+    monkeypatch.setattr(subprocess, "run", mock.Mock(side_effect=failure))
+    assert native_install.pending_native(directory) == native_install._binary_names()
+
+
+def test_pending_native_reports_unexecutable_hook(tmp_path: Path) -> None:
+    directory = tmp_path / "managed"
+    _native_pair(directory)
+    with mock.patch.object(native_install, "_is_executable", return_value=False):
+        assert (
+            native_install.pending_native(directory) == native_install._binary_names()
+        )
+
+
+def test_run_translates_timeout_to_native_install_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        mock.Mock(side_effect=subprocess.TimeoutExpired(["tj_hook"], 0.1)),
+    )
+    with pytest.raises(native_install.NativeInstallError, match="timed out: tj_hook"):
+        native_install._run(["tj_hook"], timeout=0.1)
+
+
+def test_pending_native_probe_does_not_write_or_fetch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    directory = tmp_path / "managed"
+    _native_pair(directory)
+    before = {path.name: path.read_bytes() for path in directory.iterdir()}
+    monkeypatch.setattr(
+        native_install,
+        "_run",
+        lambda *_args, **_kwargs: subprocess.CompletedProcess(
+            [], 0, "tj_hook 0.2.0\n", ""
+        ),
+    )
+    monkeypatch.setattr(
+        native_install,
+        "_gh_json",
+        lambda _endpoint: pytest.fail("readiness probe must not fetch a release"),
+    )
+    assert native_install.pending_native(directory) == ()
+    assert {path.name: path.read_bytes() for path in directory.iterdir()} == before
+
+
+def test_built_hook_reports_the_pending_native_version(tmp_path: Path) -> None:
+    root = Path(__file__).resolve().parents[3]
+    subprocess.run(
+        ["cargo", "build", "--locked", "--bin", "tj_hook"],
+        cwd=root,
+        check=True,
+        capture_output=True,
+    )
+    filename = native_install._binary_names()[1]
+    hook = root / "target" / "debug" / filename
+    directory = tmp_path / "managed"
+    directory.mkdir()
+    for name in native_install._binary_names():
+        shutil.copy2(hook, directory / name)
+    result = subprocess.run(
+        [str(directory / filename), "--version"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert result.stdout == "tj_hook 0.2.0\n"
+    assert native_install.pending_native(directory) == ()
+
+
 def test_relative_bin_override_is_bound_before_a_host_changes_directory(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
