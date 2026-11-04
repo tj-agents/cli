@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib
 import json
 import os
 import platform
@@ -16,10 +17,31 @@ class HandyInstallError(RuntimeError):
     pass
 
 
+def _registered_windows_handy() -> Path | None:
+    registry = importlib.import_module("winreg")
+    key_name = r"Software\Microsoft\Windows\CurrentVersion\Uninstall\Handy"
+    for hive in (registry.HKEY_CURRENT_USER, registry.HKEY_LOCAL_MACHINE):
+        for view in (registry.KEY_WOW64_64KEY, registry.KEY_WOW64_32KEY):
+            try:
+                with registry.OpenKey(
+                    hive, key_name, 0, registry.KEY_READ | view
+                ) as key:
+                    location, _ = registry.QueryValueEx(key, "InstallLocation")
+            except FileNotFoundError:
+                continue
+            if isinstance(location, str) and location:
+                executable = Path(location.strip('"')) / "handy.exe"
+                if executable.is_file():
+                    return executable
+    return None
+
+
 def find_handy() -> Path | None:
     if executable := shutil.which("handy"):
         return Path(executable)
     if platform.system() == "Windows":
+        if registered := _registered_windows_handy():
+            return registered
         for variable in ("LOCALAPPDATA", "ProgramW6432", "ProgramFiles"):
             if directory := os.environ.get(variable):
                 executable_path = Path(directory) / "Handy" / "handy.exe"
@@ -166,13 +188,13 @@ def main(argv: list[str] | None = None) -> int:
     if system not in {"Windows", "Linux"}:
         print(f"error      Handy setup does not support {system}", file=sys.stderr)
         return 1
-    if installed := find_handy():
-        print(f"ok         Handy ({installed})")
-        return 0
-    if arguments.check:
-        print("missing    Handy (rerun setup without --check to install)")
-        return 1
     try:
+        if installed := find_handy():
+            print(f"ok         Handy ({installed})")
+            return 0
+        if arguments.check:
+            print("missing    Handy (rerun setup without --check to install)")
+            return 1
         if system == "Windows":
             _install_windows()
         else:

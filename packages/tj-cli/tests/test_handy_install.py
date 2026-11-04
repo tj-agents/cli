@@ -1,15 +1,50 @@
+import contextlib
 import hashlib
 import json
 import os
 import platform
 import shutil
 import subprocess
+import sys
+import types
 from pathlib import Path
 from typing import Any
 
 import pytest
 
 from tj_cli import handy_install
+
+
+@pytest.fixture(autouse=True)
+def windows_registry(monkeypatch: pytest.MonkeyPatch) -> dict[tuple[int, int], str]:
+    entries: dict[tuple[int, int], str] = {}
+
+    def open_key(
+        hive: int, name: str, reserved: int, access: int
+    ) -> contextlib.nullcontext[tuple[int, int]]:
+        assert name == r"Software\Microsoft\Windows\CurrentVersion\Uninstall\Handy"
+        key = (hive, access)
+        if key not in entries:
+            raise FileNotFoundError
+        return contextlib.nullcontext(key)
+
+    def query_value(key: tuple[int, int], name: str) -> tuple[str, int]:
+        assert name == "InstallLocation"
+        return entries[key], 1
+
+    registry = types.ModuleType("winreg")
+    for name, value in {
+        "HKEY_CURRENT_USER": 1,
+        "HKEY_LOCAL_MACHINE": 2,
+        "KEY_READ": 1,
+        "KEY_WOW64_64KEY": 256,
+        "KEY_WOW64_32KEY": 512,
+        "OpenKey": open_key,
+        "QueryValueEx": query_value,
+    }.items():
+        setattr(registry, name, value)
+    monkeypatch.setitem(sys.modules, "winreg", registry)
+    return entries
 
 
 @pytest.fixture(autouse=True)
@@ -49,6 +84,22 @@ def test_existing_windows_installation_is_unchanged(
     assert handy_install.main(["--check"]) == 0
     assert executable.stat().st_mtime_ns == before
     assert capsys.readouterr().out.count("ok         Handy") == 2
+
+
+@pytest.mark.parametrize("hive", [1, 2])
+@pytest.mark.parametrize("view", [256, 512])
+def test_registered_windows_custom_location_is_recognized(
+    tmp_path: Path, windows_registry: dict[tuple[int, int], str], hive: int, view: int
+) -> None:
+    directory = tmp_path / "custom apps é" / "voice"
+    directory.mkdir(parents=True)
+    executable = directory / "handy.exe"
+    executable.write_bytes(b"installed")
+    windows_registry[(hive, 1 | view)] = f'"{directory}"'
+    assert handy_install.main(["--check"]) == 0
+    assert handy_install.main([]) == 0
+    executable.unlink()
+    assert handy_install.main(["--check"]) == 1
 
 
 def test_windows_installs_once_and_verifies_the_result(
@@ -231,3 +282,5 @@ def test_linux_unsupported_package_manager_gives_manual_resolution(
     monkeypatch.setenv("DISPLAY", ":0")
     assert handy_install.main([]) == 1
     assert "handy on PATH" in capsys.readouterr().err
+
+
