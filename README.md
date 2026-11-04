@@ -12,7 +12,7 @@ Fast shell tools for agentic programming, on Windows and Linux. `tj` provides tw
 The shared `tj-agents` marketplace also publishes `cli@tj-agents`:
 
 - [`cli:cd`](.agents/cli/utility/cd/SKILL.md) continues an authorized task in a nested directory or linked worktree, using supported native session control when available.
-- [`cli:clip`](.agents/cli/utility/clip/SKILL.md) puts text on the OS clipboard (Windows, Linux or macOS) so it can be pasted elsewhere.
+- [`cli:clip`](.agents/cli/utility/clip/SKILL.md) puts plain text on the OS clipboard (Windows, Linux or macOS), verified, so it can be pasted elsewhere; Teams messages use `teams:message`.
 
 `tj-cli` supplies deterministic process, terminal, and linked-worktree mechanics to Agent. Agent owns
 session-aware target resolution and lifecycle decisions. Native control supports Windows Terminal, tmux and
