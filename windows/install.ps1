@@ -1,5 +1,5 @@
 # Installs `tj` and wires the `f` and `cr` functions into PowerShell. Safe to run any number of times:
-# each step reports "ok" when there is nothing to change. Needs no administrator rights.
+# each step reports "ok" when there is nothing to change.
 #
 #   windows\install.ps1              install or update
 #   windows\install.ps1 -Check       report what is and isn't set up, change nothing
@@ -49,6 +49,12 @@ function Install-Binaries {
         if ($Uninstall) { $arguments += '--uninstall' }
         & $python.Source @arguments
         if ($LASTEXITCODE -ne 0) { $script:status = 1 }
+        if (-not $Uninstall) {
+            $handyArguments = @('-m', 'tj_cli.handy_install')
+            if ($Check) { $handyArguments += '--check' }
+            & $python.Source @handyArguments
+            if ($LASTEXITCODE -ne 0) { $script:status = 1 }
+        }
     }
     finally { $env:PYTHONPATH = $previousPythonPath }
 }
