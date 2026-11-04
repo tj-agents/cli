@@ -162,6 +162,10 @@ explicitly. `run` owns a separate process session on Linux and kills that proces
 on timeout or interruption. `start` returns a `Popen` handle for callers managing its
 lifetime themselves. Timeout and nonzero-exit errors identify the requested command.
 
+`native_install.pending_native(directory)` checks the managed pair locally and reports missing or
+incompatible binaries. It probes the helper's version without downloading or changing files;
+the current runtime requires native version 0.2.0 or newer.
+
 Both functions accept typed options for standard streams, working directory, environment,
 text encoding, buffering and process creation. Unknown options fail before launch.
 `run` additionally supports input, output capture, timeout and exit-status checking.
