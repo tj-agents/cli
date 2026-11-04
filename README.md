@@ -134,6 +134,9 @@ environment and working directory, returning its exit status. On Windows the lau
 has no console window and starts the command in a console hidden from creation. Ordinary
 descendants inherit that hidden console. A Windows Job Object keeps the command tree
 owned by the launcher: exiting or terminating the launcher also terminates its descendants.
+Use `tj_hook --preserve-descendants -- <executable> [arguments...]` only when descendants
+must outlive a normally exiting root command; cancellation before that exit still terminates
+the owned tree. On Linux this option retains the launcher's existing `exec` behavior.
 On Linux the launcher replaces itself with the command, retaining its process identity
 and signal behavior.
 

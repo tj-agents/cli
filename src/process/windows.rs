@@ -137,7 +137,7 @@ fn raw(handle: &Option<OwnedHandle>) -> HANDLE {
     handle.as_ref().map_or(null_mut(), AsRawHandle::as_raw_handle)
 }
 
-pub(super) fn run(arguments: &[OsString]) -> io::Result<u32> {
+pub(super) fn run(arguments: &[OsString], preserve_descendants: bool) -> io::Result<u32> {
     let executable = std::path::absolute(
         which::which(&arguments[0]).map_err(|error| io::Error::new(io::ErrorKind::NotFound, error))?,
     )?;
@@ -241,6 +241,18 @@ pub(super) fn run(arguments: &[OsString]) -> io::Result<u32> {
         let mut code = 127;
         if GetExitCodeProcess(child.as_raw_handle(), &mut code) == 0 {
             return Err(io::Error::last_os_error());
+        }
+        if preserve_descendants {
+            limits.BasicLimitInformation.LimitFlags = 0;
+            if SetInformationJobObject(
+                job.as_raw_handle(),
+                JobObjectExtendedLimitInformation,
+                (&limits as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
+                size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            ) == 0
+            {
+                return Err(io::Error::last_os_error());
+            }
         }
         Ok(code)
     }
