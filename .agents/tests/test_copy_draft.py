@@ -170,6 +170,12 @@ class FencedBlockTests(unittest.TestCase):
         self.assertNotIn('<code', COPY_DRAFT.build_html_fragment('a `b\nc` d'))
 
 
+class BuildPlainTextTests(unittest.TestCase):
+    def test_links_are_reduced_to_their_text_so_no_url_reaches_the_plain_flavour(self):
+        text = 'see [AuthZ design](https://example.com/101) and [`cris-authz` worker](https://example.com/102)'
+        self.assertEqual(COPY_DRAFT.build_plain_text(text), 'see AuthZ design and cris-authz worker')
+
+
 class BuildFullHtmlTests(unittest.TestCase):
     def test_wraps_the_fragment_in_a_minimal_utf8_document(self):
         document = COPY_DRAFT.build_full_html('a <code>b</code>')
@@ -771,7 +777,7 @@ class WindowsCtypesRoundTripTests(unittest.TestCase):
         self.assertIn('<code', fragment)
         self.assertEqual(plain, COPY_DRAFT.unwrap_backtick_spans(text))
 
-    def test_a_link_round_trips_as_an_anchor_and_stays_markdown_in_plain(self):
+    def test_a_link_round_trips_as_an_anchor_and_only_its_text_reaches_plain(self):
         text = 'ready: [these `two` pages](https://example.com/pages)'
         message = COPY_DRAFT.copy_windows(text, plain_only=False)
         self.assertIn('1 links', message)
@@ -781,7 +787,7 @@ class WindowsCtypesRoundTripTests(unittest.TestCase):
         cf_html, plain = self._read_clipboard(user32, kernel32, html_format)
         fragment = COPY_DRAFT.extract_cf_html_fragment(cf_html)
         self.assertEqual(COPY_DRAFT.html_links(fragment), [('https://example.com/pages', 'these two pages')])
-        self.assertEqual(plain, 'ready: [these two pages](https://example.com/pages)')
+        self.assertEqual(plain, 'ready: these two pages')
 
     def test_plain_only_writes_literal_text_with_no_html_flavour_and_is_verified(self):
         text = 'a literal `command` to run'
