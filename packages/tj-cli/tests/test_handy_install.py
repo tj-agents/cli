@@ -161,6 +161,37 @@ def test_windows_failed_or_ineffective_install_is_not_success(
     assert "error      Handy" in output.err
 
 
+@pytest.mark.parametrize("binary_output", [False, True])
+@pytest.mark.parametrize("timeout", [False, True])
+def test_subprocess_failure_keeps_stdout_and_stderr(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    binary_output: bool,
+    timeout: bool,
+) -> None:
+    monkeypatch.setattr(
+        shutil, "which", lambda name: "winget.exe" if name == "winget" else None
+    )
+    stdout = b"dependency missing" if binary_output else "dependency missing"
+    stderr = (
+        b"install dependency first" if binary_output else "install dependency first"
+    )
+
+    def run(arguments: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        if timeout:
+            raise subprocess.TimeoutExpired(
+                arguments, 600, output=stdout, stderr=stderr
+            )
+        raise subprocess.CalledProcessError(1, arguments, output=stdout, stderr=stderr)
+
+    monkeypatch.setattr(subprocess, "run", run)
+    assert handy_install.main([]) == 1
+    output = capsys.readouterr()
+    assert "dependency missing" in output.err
+    assert "install dependency first" in output.err
+    assert "installed  Handy" not in output.out
+
+
 @pytest.mark.parametrize("variable", ["DISPLAY", "WAYLAND_DISPLAY"])
 def test_linux_desktop_requires_handy(
     monkeypatch: pytest.MonkeyPatch,
@@ -282,5 +313,3 @@ def test_linux_unsupported_package_manager_gives_manual_resolution(
     monkeypatch.setenv("DISPLAY", ":0")
     assert handy_install.main([]) == 1
     assert "handy on PATH" in capsys.readouterr().err
-
-

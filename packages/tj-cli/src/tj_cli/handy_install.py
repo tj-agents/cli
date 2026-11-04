@@ -202,6 +202,17 @@ def main(argv: list[str] | None = None) -> int:
         installed = find_handy()
         if installed is None:
             raise HandyInstallError("installer finished but Handy could not be found")
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
+        print(f"error      Handy: {error}", file=sys.stderr)
+        for output in (error.stdout, error.stderr):
+            if output:
+                detail = (
+                    output.decode("utf-8", errors="replace")
+                    if isinstance(output, bytes)
+                    else output
+                )
+                print(detail.rstrip(), file=sys.stderr)
+        return 1
     except (
         HandyInstallError,
         OSError,
