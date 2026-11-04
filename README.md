@@ -32,7 +32,7 @@ git clone https://github.com/tj-agents/cli ~/projects/tj-agents/cli
 ~/projects/tj-agents/cli/linux/install.sh
 ```
 
-**Windows** (PowerShell, no administrator rights needed)
+**Windows** (PowerShell)
 
 ```powershell
 git clone https://github.com/tj-agents/cli $HOME\source\repos\tj-agents\cli
@@ -48,7 +48,12 @@ for everything else, so re-running it after a `git pull` is how you upgrade. It:
    `%LOCALAPPDATA%\Programs\tj` on Windows, adding that folder to your user PATH on Windows;
 2. checks for fzf. On Windows it installs fzf with winget if it's missing; on Linux it tells you
    the package to install;
-3. adds one marked block to each shell startup file it finds (bash, zsh, fish, PowerShell):
+3. installs [Handy](https://github.com/cjpais/Handy) for voice dictation on desktop machines:
+   Windows uses winget; Linux desktops use a SHA-256-verified upstream package through APT or DNF,
+   with GitHub CLI and sudo required for a non-root installation. Other Linux distributions need Handy
+   installed with `handy` on PATH before setup. CI and Linux sessions without a display report this step
+   as not applicable; for SSH or WSL terminal use, run setup on the desktop host;
+4. adds one marked block to each shell startup file it finds (bash, zsh, fish, PowerShell):
 
    ```bash
    # >>> tj-agents/cli >>>
@@ -59,7 +64,24 @@ for everything else, so re-running it after a `git pull` is how you upgrade. It:
 | | Linux | Windows |
 | --- | --- | --- |
 | Check what's set up, change nothing | `linux/install.sh --check` | `windows\install.ps1 -Check` |
-| Remove everything it added | `linux/install.sh --uninstall` | `windows\install.ps1 -Uninstall` |
+| Remove CLI binaries and shell wiring | `linux/install.sh --uninstall` | `windows\install.ps1 -Uninstall` |
+
+### Voice dictation in Claude and Codex
+
+Handy is a desktop prerequisite provisioned by the existing installer. A clone alone does not install
+software. Setup checks for Handy on each run, installs it only when missing, and fails if installation
+fails. Check mode reports a missing application without installing or downloading anything. CLI uninstall
+preserves Handy and its models, as it preserves the shared fzf prerequisite.
+
+Open Handy once, download a speech model, select your microphone and hold-to-talk shortcut, and enable
+launch at login in Handy's settings. Use `Shift+Insert` as the paste method for Windows terminals, or the
+paste shortcut your terminal accepts. Then focus the Claude or Codex input, speak, review the transcript,
+and press Enter yourself. This uses the terminal's normal text input; no per-agent skill injection is
+needed. Setup verifies installation, not microphone access, model readiness or successful dictation.
+
+Linux desktop shortcuts and paste helpers depend on X11 or Wayland; complete
+[Handy's Linux setup](https://handy.computer/docs/linux) before using dictation. Headless setup does not
+claim voice input is ready.
 
 ## `cr`: find and resume a session
 
