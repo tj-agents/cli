@@ -1,36 +1,17 @@
 #!/usr/bin/env python3
-"""Copy a drafted file onto the system clipboard, verifying off the live clipboard afterwards.
+"""Copy a drafted file onto the system clipboard as plain text, verifying off the live clipboard afterwards.
 
-Run as `python3 copy_draft.py --path <file> [--plain-only]` (`python` on Windows); the shebang and
-exec bit are not relied on.
+Run as `python3 copy_draft.py --path <file>` (`python` on Windows); the shebang and exec bit are not relied
+on. The text is copied exactly as written: CF_UNICODETEXT on Windows, `wl-copy`/`xclip`/`xsel` on Linux and
+`pbcopy` on macOS, then read back and compared. Rendered Teams messages are `teams:message`'s job.
 
-On Windows, without `--plain-only`, this writes BOTH an `HTML Format` flavour (CF_HTML, with single
-backtick spans rendered as monospace `<code>` and `[label](https://...)` links as clickable `<a>` text) and
-a plain Unicode text flavour (backticks unwrapped, each link reduced to its text), then verifies both off
-the live clipboard. `--plain-only` writes only the literal text, unchanged, as
-CF_UNICODETEXT, and that is still verified by reading it back.
-
-On Linux, default mode copies a `text/html` flavour built from the same escaped-and-code-spanned fragment
-Windows uses, via `wl-copy`/`xclip`, so a paste into Teams still renders backtick spans as monospace (see
-https://github.com/tj-agents/core/issues/389). `--plain-only` copies the literal text as plain instead,
-everywhere. `xsel` cannot set an explicit MIME type, so with
-only `xsel` available (no `xclip`, no Wayland) default mode falls back to plain text with the markdown
-left intact and says so. macOS's `pbcopy` has no HTML flavour either, so macOS always copies plain text
-with the markdown intact, and says so.
-
-The pure text transforms (normalising, backtick unwrapping, HTML escaping, HTML fragment/document
-construction, CF_HTML offset construction, visible-text extraction, code span counting) are plain
-functions, testable on any OS. The clipboard backends are small, platform- or environment-selected
-functions that take `run`/`which`/`environ` as arguments so tests can inject stubs without ever touching
-a real clipboard.
+The clipboard backends take `run`/`which`/`environ` as arguments so tests can inject stubs without ever
+touching a real clipboard.
 """
 
 import argparse
 import ctypes
-import html
-from html.parser import HTMLParser
 import os
-from pathlib import Path
 import re
 import shutil
 import subprocess
@@ -38,13 +19,13 @@ import sys
 import tempfile
 import time
 from collections.abc import Callable, Mapping, Sequence
+from pathlib import Path
 from typing import IO, Any, NamedTuple
 
 IS_WINDOWS = os.name == 'nt'
 
 RunFunction = Callable[..., 'subprocess.CompletedProcess[str]']
 WhichFunction = Callable[[str], str | None]
-Link = tuple[str, str]
 
 GMEM_MOVEABLE = 0x0002
 CF_UNICODETEXT = 13
@@ -55,16 +36,10 @@ class ClipboardError(Exception):
     """A copy or verification step failed; the message is the whole report."""
 
 
-# --- pure text transforms -----------------------------------------------------------------------
-
-_BACKTICK_SPAN = re.compile(r'`([^`\n]+)`')
-_INLINE_MARKUP = re.compile(
-    r'(?ms:^```[^\n]*\n(?P<block>.*?)\n```[ \t]*$)'
-    r'|`(?P<code>[^`\n]+)`'
-    r'|\[(?P<label>[^\]\n]+)\]\((?P<url>https?://[^\s)]+)\)'
-)
 _TRAILING_WHITESPACE = re.compile(r'\s+\Z')
-_WHITESPACE_RUN = re.compile(r'\s+')
+
+
+# --- draft file -----------------------------------------------------------------------------------
 
 
 def normalise_draft(raw: str) -> str:
@@ -92,274 +67,24 @@ def read_draft_file(path: str) -> str:
     return text
 
 
-def unwrap_backtick_spans(text: str) -> str:
-    return _BACKTICK_SPAN.sub(lambda m: m.group(1), text)
-
-
-def _plain_inline_markup(match: re.Match[str]) -> str:
-    if match['block'] is not None:
-        return match.group(0)
-    if match['code'] is not None:
-        return match['code']
-    return unwrap_backtick_spans(match['label'])
-
-
-def build_plain_text(text: str) -> str:
-    """The plain flavour beside the HTML: inline backticks removed, fences kept, each link reduced to its text.
-
-    No URL may appear here: when text is selected, Teams turns the whole selection into one link to any URL
-    it finds in the plain flavour instead of pasting.
-    """
-    return _INLINE_MARKUP.sub(_plain_inline_markup, text)
-
-
-def escape_html(text: str) -> str:
-    return text.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
-
-
-def count_code_spans(fragment: str) -> int:
-    return fragment.count('<code')
-
-
-def _code_element(escaped: str) -> str:
-    return f'<code style="font-family:Consolas,\'Courier New\',monospace;">{escaped}</code>'
-
-
-def _render_inline_markup(match: re.Match[str]) -> str:
-    if match['code'] is not None:
-        return _code_element(escape_html(match['code']))
-    label = _BACKTICK_SPAN.sub(lambda m: _code_element(m.group(1)), escape_html(match['label']))
-    return f'<a href="{html.escape(match["url"], quote=True)}">{label}</a>'
-
-
-def _render_block(content: str) -> str:
-    return f'<pre>{_code_element(escape_html(content))}</pre>'
-
-
-def _render_prose(rendered: str) -> str:
-    paragraphs = re.split(r'\n{2,}', rendered)
-    return '<br><br>'.join(paragraph.replace('\n', '<br>') for paragraph in paragraphs)
-
-
-def _visible_inline_markup(match: re.Match[str]) -> str:
-    if match['block'] is not None:
-        return f' {match["block"]} '
-    return match['code'] if match['code'] is not None else unwrap_backtick_spans(match['label'])
-
-
-def markdown_visible_text(text: str) -> str:
-    """The words `text`'s HTML flavour renders as, whitespace collapsed, to compare with a read-back."""
-    return collapse_whitespace(_INLINE_MARKUP.sub(_visible_inline_markup, text))
-
-
-def markdown_links(text: str) -> list[Link]:
-    """Each `[label](url)` link in `text` as (url, visible label), in order."""
-    return [
-        (match['url'], collapse_whitespace(unwrap_backtick_spans(match['label'])))
-        for match in _INLINE_MARKUP.finditer(text)
-        if match['url'] is not None
-    ]
-
-
-def build_html_fragment(text: str) -> str:
-    """The HTML fragment for `text`: escaped, backtick spans as monospace `<code>`, `[label](url)` links as
-    `<a href>` link text, and each fenced block as one `<pre>` code block.
-
-    Teams gives `<p>` and `<div>` their own margins and indent on paste, so paragraphs (separated by a
-    blank line) are joined with a double `<br>` instead, and a single newline within a paragraph becomes
-    one `<br>`. The newline on each side of a fenced block is dropped because `<pre>` already breaks the line.
-    """
-    output: list[str] = []
-    prose: list[str] = []
-    position = 0
-    for match in _INLINE_MARKUP.finditer(text):
-        before = text[position:match.start()]
-        position = match.end()
-        if match['block'] is None:
-            prose.append(escape_html(before))
-            prose.append(_render_inline_markup(match))
-            continue
-        prose.append(escape_html(before.removesuffix('\n')))
-        output.append(_render_prose(''.join(prose)))
-        output.append(_render_block(match['block']))
-        prose = []
-        if text.startswith('\n', position):
-            position += 1
-    prose.append(escape_html(text[position:]))
-    output.append(_render_prose(''.join(prose)))
-    return ''.join(output)
-
-
-def build_full_html(fragment: str) -> str:
-    """A minimal standalone HTML document carrying `fragment`, for the Linux `text/html` MIME flavour.
-
-    Unlike CF_HTML there is no fragment-offset header to construct: `wl-copy`/`xclip` set the bytes given
-    as the whole `text/html` value, so this -- not a CF_HTML payload -- is what a paste target receives.
-    """
-    return f'<html><head><meta charset="utf-8"></head><body>{fragment}</body></html>'
-
-
-def collapse_whitespace(text: str) -> str:
-    return _WHITESPACE_RUN.sub(' ', text).strip()
-
-
-class _TagStripper(HTMLParser):
-    """Collects the literal text data between tags, with `<br>` and each `<pre>` edge recorded as a newline.
-
-    `convert_charrefs=False` so entities reach `handle_entityref`/`handle_charref` rather than being
-    unescaped here; they are re-emitted as their original `&name;`/`&#name;` text and unescaped once, by
-    `html.unescape`, in `html_visible_text` below, rather than every call site reimplementing that step.
-    """
-
-    def __init__(self) -> None:
-        super().__init__(convert_charrefs=False)
-        self._parts: list[str] = []
-
-    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
-        if tag in ('br', 'pre'):
-            self._parts.append('\n')
-
-    def handle_endtag(self, tag: str) -> None:
-        if tag == 'pre':
-            self._parts.append('\n')
-
-    def handle_data(self, data: str) -> None:
-        self._parts.append(data)
-
-    def handle_entityref(self, name: str) -> None:
-        self._parts.append(f'&{name};')
-
-    def handle_charref(self, name: str) -> None:
-        self._parts.append(f'&#{name};')
-
-    def text(self) -> str:
-        return ''.join(self._parts)
-
-
-def html_visible_text(markup: str) -> str:
-    """The human-readable text `markup` renders as: tags stripped via `html.parser` (not regex), entities
-    unescaped, `<br>` turned into a newline, and runs of whitespace collapsed to one space.
-
-    Used to verify an HTML clipboard read-back against the draft's own text regardless of how a
-    clipboard tool re-serves the markup -- different attribute order, an added attribute, or reformatted
-    whitespace must not fail verification; a change in the actual words must.
-    """
-    stripper = _TagStripper()
-    stripper.feed(markup)
-    stripper.close()
-    return collapse_whitespace(html.unescape(stripper.text()))
-
-
-class _LinkCollector(HTMLParser):
-    def __init__(self) -> None:
-        super().__init__()
-        self.links: list[Link] = []
-        self._href: str | None = None
-        self._text: list[str] = []
-
-    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
-        if tag == 'a':
-            self._href = dict(attrs).get('href') or ''
-            self._text = []
-
-    def handle_endtag(self, tag: str) -> None:
-        if tag == 'a' and self._href is not None:
-            self.links.append((self._href, collapse_whitespace(''.join(self._text))))
-            self._href = None
-
-    def handle_data(self, data: str) -> None:
-        if self._href is not None:
-            self._text.append(data)
-
-
-def html_links(markup: str) -> list[Link]:
-    """Each `<a href>` in `markup` as (href, visible text), in order."""
-    collector = _LinkCollector()
-    collector.feed(markup)
-    collector.close()
-    return collector.links
-
-
-_CF_HTML_HEADER = (
-    'Version:0.9\r\n'
-    'StartHTML:{0:010d}\r\n'
-    'EndHTML:{1:010d}\r\n'
-    'StartFragment:{2:010d}\r\n'
-    'EndFragment:{3:010d}\r\n'
-)
-_CF_HTML_PRE = '<html><body><!--StartFragment-->'
-_CF_HTML_POST = '<!--EndFragment--></body></html>'
-
-
-def build_cf_html(fragment: str) -> tuple[str, int, int, int, int]:
-    """The CF_HTML text for `fragment`, with its header's byte offsets into its own UTF-8 encoding.
-
-    Returns (text, start_html, end_html, start_fragment, end_fragment). Offsets are UTF-8 byte offsets,
-    so text.encode('utf-8')[start_fragment:end_fragment] is exactly `fragment`'s own UTF-8 bytes, and
-    [start_html:end_html] is exactly the `<html>...</html>` bytes.
-    """
-    start_html = len(_CF_HTML_HEADER.format(0, 0, 0, 0).encode('utf-8'))
-    start_fragment = start_html + len(_CF_HTML_PRE.encode('utf-8'))
-    end_fragment = start_fragment + len(fragment.encode('utf-8'))
-    end_html = end_fragment + len(_CF_HTML_POST.encode('utf-8'))
-    header = _CF_HTML_HEADER.format(start_html, end_html, start_fragment, end_fragment)
-    text = header + _CF_HTML_PRE + fragment + _CF_HTML_POST
-    return text, start_html, end_html, start_fragment, end_fragment
-
-
-def extract_cf_html_fragment(cf_html_text: str) -> str | None:
-    """The payload between CF_HTML's `<!--StartFragment-->`/`<!--EndFragment-->` markers, or None.
-
-    Reading back a decoded CF_HTML string by its own HTML comment markers avoids re-deriving byte offsets
-    from a `str` that has already been through UTF-8 decoding -- the markers are exactly where this
-    module's own `build_cf_html` put them, and that is what a paste target actually keys off too.
-    """
-    start_marker, end_marker = '<!--StartFragment-->', '<!--EndFragment-->'
-    start = cf_html_text.find(start_marker)
-    end = cf_html_text.find(end_marker)
-    if start == -1 or end == -1 or end < start:
-        return None
-    return cf_html_text[start + len(start_marker):end]
-
-
 # --- POSIX (Linux, macOS) backend ---------------------------------------------------------------
 
-# html_copy_argv/html_paste_argv are None for a tool that cannot set an explicit MIME type (xsel) or has
-# no HTML concept at all (pbcopy); copy_posix falls back to the plain flavour for those, using
-# no_html_reason (also None when the tool does support HTML) to say why in the success line.
-# env_overrides is a dict merged over the real environment for this tool's own invocations -- empty for
-# every tool except pbcopy.
+
 class PosixTool(NamedTuple):
     label: str
     copy_argv: list[str]
     paste_argv: list[str]
-    html_copy_argv: list[str] | None
-    html_paste_argv: list[str] | None
     env_overrides: dict[str, str]
-    no_html_reason: str | None
 
-_WL_COPY = PosixTool(
-    'wl-copy',
-    ['wl-copy'], ['wl-paste', '--no-newline'],
-    ['wl-copy', '--type', 'text/html'], ['wl-paste', '--type', 'text/html'],
-    {}, None,
-)
-_XCLIP = PosixTool(
-    'xclip',
-    ['xclip', '-selection', 'clipboard'], ['xclip', '-selection', 'clipboard', '-o'],
-    ['xclip', '-selection', 'clipboard', '-t', 'text/html'],
-    ['xclip', '-selection', 'clipboard', '-t', 'text/html', '-o'],
-    {}, None,
-)
-_XSEL = PosixTool(
-    'xsel', ['xsel', '--clipboard', '--input'], ['xsel', '--clipboard', '--output'], None, None,
-    {}, 'xsel cannot set an HTML flavour',
-)
+
+_WL_COPY = PosixTool('wl-copy', ['wl-copy'], ['wl-paste', '--no-newline'], {})
+_XCLIP = PosixTool('xclip', ['xclip', '-selection', 'clipboard'], ['xclip', '-selection', 'clipboard', '-o'], {})
+_XSEL = PosixTool('xsel', ['xsel', '--clipboard', '--input'], ['xsel', '--clipboard', '--output'], {})
 _PBCOPY = PosixTool(
-    'pbcopy', ['pbcopy'], ['pbpaste'], None, None,
+    'pbcopy', ['pbcopy'], ['pbpaste'],
     # pbcopy/pbpaste pick their text encoding from the locale; forcing a UTF-8 one here is what keeps
     # non-ASCII draft text (accents, emoji) intact rather than silently mangled on some machines.
-    {'LANG': 'en_US.UTF-8', 'LC_CTYPE': 'en_US.UTF-8'}, 'pbcopy has no HTML flavour',
+    {'LANG': 'en_US.UTF-8', 'LC_CTYPE': 'en_US.UTF-8'},
 )
 
 
@@ -522,56 +247,21 @@ def _read_back_with_retry(run: RunFunction, argv: list[str], label: str, is_ok: 
     return last_zero_exit_output
 
 
-def copy_posix(text: str, plain_only: bool, environ: Mapping[str, str] | None = None,
+def copy_posix(text: str, environ: Mapping[str, str] | None = None,
                which: WhichFunction = shutil.which, run: RunFunction = subprocess.run) -> str:
-    """Copy `text` through the clipboard tool this environment selects, and verify it round-trips.
-
-    Default mode copies an HTML flavour (so Teams renders backtick spans as monospace) when the selected
-    tool supports setting one; otherwise -- xsel, or macOS's pbcopy -- it falls back to the plain flavour
-    with the markdown left intact, and the returned message says so. `--plain-only` always copies the
-    literal text as plain, on every tool. See https://github.com/tj-agents/core/issues/389.
-    """
+    """Copy `text` through the clipboard tool this environment selects, and verify it round-trips."""
     environ = os.environ if environ is None else environ
     tool = posix_clipboard_tool(environ, which)
     env = {**environ, **tool.env_overrides} if tool.env_overrides else None
-
-    if not plain_only and tool.html_copy_argv and tool.html_paste_argv:
-        fragment = build_html_fragment(text)
-        spans = count_code_spans(fragment)
-        links = markdown_links(text)
-        html_document = build_full_html(fragment)
-        expected_visible = markdown_visible_text(text)
-        _run_copy(run, tool.html_copy_argv, html_document, f'{tool.label} copy', env=env)
-
-        def html_ok(output: str) -> bool:
-            return (
-                html_visible_text(output) == expected_visible
-                and count_code_spans(output) == spans
-                and html_links(output) == links
-            )
-
-        landed_html = _read_back_with_retry(run, tool.html_paste_argv, f'{tool.label} paste', html_ok, env=env)
-        if not html_ok(landed_html):
-            raise ClipboardError(
-                f'Clipboard verification failed: {tool.label} did not read back the HTML flavour that was copied.'
-            )
-        return f'Copied {len(text)} chars, {spans} code spans, {len(links)} links, HTML verified on the clipboard.'
-
-    plain = text
-    _run_copy(run, tool.copy_argv, plain, f'{tool.label} copy', env=env)
+    _run_copy(run, tool.copy_argv, text, f'{tool.label} copy', env=env)
 
     def plain_ok(output: str) -> bool:
-        return _TRAILING_WHITESPACE.sub('', output) == plain
+        return _TRAILING_WHITESPACE.sub('', output) == text
 
-    landed_plain = _read_back_with_retry(run, tool.paste_argv, f'{tool.label} paste', plain_ok, env=env)
-    if not plain_ok(landed_plain):
+    landed = _read_back_with_retry(run, tool.paste_argv, f'{tool.label} paste', plain_ok, env=env)
+    if not plain_ok(landed):
         raise ClipboardError(f'Clipboard verification failed: {tool.label} did not read back what was copied.')
-
-    if plain_only:
-        return f'Copied {len(plain)} chars (plain text only).'
-    if tool.no_html_reason:
-        return f'Copied {len(plain)} chars (plain text; markdown kept for the paste target; {tool.no_html_reason}).'
-    return f'Copied {len(plain)} chars (plain text; markdown kept for the paste target).'
+    return f'Copied {len(text)} chars.'
 
 
 # --- Windows backend -----------------------------------------------------------------------------
@@ -605,8 +295,6 @@ def _windows_api() -> tuple[Any, Any]:
     user32.GetClipboardData.restype = wintypes.HANDLE
     user32.SetClipboardData.argtypes = [wintypes.UINT, wintypes.HANDLE]
     user32.SetClipboardData.restype = wintypes.HANDLE
-    user32.RegisterClipboardFormatW.argtypes = [wintypes.LPCWSTR]
-    user32.RegisterClipboardFormatW.restype = wintypes.UINT
     user32.IsClipboardFormatAvailable.argtypes = [wintypes.UINT]
     user32.IsClipboardFormatAvailable.restype = wintypes.BOOL
 
@@ -674,61 +362,28 @@ def _set_clipboard_bytes(user32: Any, kernel32: Any, clipboard_format: int, data
         raise ClipboardError('SetClipboardData failed.')
 
 
-def _read_windows_clipboard(user32: Any, kernel32: Any, html_format: int, hwnd: Any) -> tuple[str | None, str | None]:
+def _read_windows_clipboard(user32: Any, kernel32: Any, hwnd: Any) -> str | None:
     _open_clipboard(user32, hwnd)
     try:
-        cf_html: str | None = None
-        if user32.IsClipboardFormatAvailable(html_format):
-            handle = user32.GetClipboardData(html_format)
-            if handle:
-                pointer = kernel32.GlobalLock(handle)
-                if pointer:
-                    try:
-                        size = kernel32.GlobalSize(handle)
-                        raw = ctypes.string_at(pointer, size)
-                    finally:
-                        kernel32.GlobalUnlock(handle)
-                    cf_html = raw.split(b'\x00', 1)[0].decode('utf-8', errors='replace')
-
-        plain: str | None = None
-        if user32.IsClipboardFormatAvailable(CF_UNICODETEXT):
-            handle = user32.GetClipboardData(CF_UNICODETEXT)
-            if handle:
-                pointer = kernel32.GlobalLock(handle)
-                if pointer:
-                    try:
-                        plain = ctypes.wstring_at(pointer)
-                    finally:
-                        kernel32.GlobalUnlock(handle)
-        return cf_html, plain
+        if not user32.IsClipboardFormatAvailable(CF_UNICODETEXT):
+            return None
+        handle = user32.GetClipboardData(CF_UNICODETEXT)
+        if not handle:
+            return None
+        pointer = kernel32.GlobalLock(handle)
+        if not pointer:
+            return None
+        try:
+            return ctypes.wstring_at(pointer)
+        finally:
+            kernel32.GlobalUnlock(handle)
     finally:
         user32.CloseClipboard()
 
 
-def copy_windows(text: str, plain_only: bool) -> str:
-    """Copy `text` on Windows via ctypes: CF_UNICODETEXT always, plus CF_HTML unless `plain_only`.
-
-    Always verifies off the live clipboard afterwards, including in `--plain-only` mode, and raises
-    ClipboardError on any mismatch, so a success message means it truly landed at that moment.
-    """
+def copy_windows(text: str) -> str:
+    """Copy `text` on Windows as CF_UNICODETEXT via ctypes, then verify it off the live clipboard."""
     user32, kernel32 = _windows_api()
-    html_format = user32.RegisterClipboardFormatW('HTML Format')
-
-    plain = text if plain_only else build_plain_text(text)
-    unicode_bytes = plain.encode('utf-16-le') + b'\x00\x00'
-
-    cf_html_bytes: bytes | None = None
-    spans = 0
-    links: list[Link] = []
-    expected_visible = ''
-    if not plain_only:
-        fragment = build_html_fragment(text)
-        spans = count_code_spans(fragment)
-        links = markdown_links(text)
-        expected_visible = markdown_visible_text(text)
-        cf_html_text, *_ = build_cf_html(fragment)
-        cf_html_bytes = cf_html_text.encode('utf-8') + b'\x00'
-
     # Raises before the clipboard is ever opened or emptied if no owner window can be created.
     hwnd = _create_message_window(user32)
     try:
@@ -736,54 +391,23 @@ def copy_windows(text: str, plain_only: bool) -> str:
         try:
             if not user32.EmptyClipboard():
                 raise ClipboardError('EmptyClipboard failed.')
-            _set_clipboard_bytes(user32, kernel32, CF_UNICODETEXT, unicode_bytes)
-            if cf_html_bytes is not None:
-                _set_clipboard_bytes(user32, kernel32, html_format, cf_html_bytes)
+            _set_clipboard_bytes(user32, kernel32, CF_UNICODETEXT, text.encode('utf-16-le') + b'\x00\x00')
         finally:
             user32.CloseClipboard()
-
-        # Verify off the live clipboard, in every mode: a plain-only round trip can pass on its own, but
-        # verifying nothing is what let a stale or empty clipboard pass for a successful plain-only copy.
-        landed_cf_html, landed_plain = _read_windows_clipboard(user32, kernel32, html_format, hwnd)
+        landed = _read_windows_clipboard(user32, kernel32, hwnd)
     finally:
         user32.DestroyWindow(hwnd)
-
-    if _TRAILING_WHITESPACE.sub('', landed_plain or '') != plain:
-        raise ClipboardError('Clipboard verification failed: plain flavour did not round-trip.')
-
-    if plain_only:
-        return f'Copied {len(plain)} chars (plain text only).'
-
-    # Verify BOTH flavours off the live clipboard. A plain-only round trip can pass while the HTML is
-    # absent, which is exactly how a paste loses its code formatting.
-    if landed_cf_html is None:
-        raise ClipboardError(
-            'Clipboard verification failed: no HTML flavour present. Something overwrote the clipboard.'
-        )
-    landed_fragment = extract_cf_html_fragment(landed_cf_html) or ''
-    if html_visible_text(landed_fragment) != expected_visible:
-        raise ClipboardError('Clipboard verification failed: HTML flavour did not round-trip.')
-    landed_spans = count_code_spans(landed_fragment)
-    if landed_spans != spans:
-        raise ClipboardError(
-            f'Clipboard verification failed: expected {spans} code spans, found {landed_spans} on the clipboard.'
-        )
-    if html_links(landed_fragment) != links:
-        raise ClipboardError('Clipboard verification failed: links did not round-trip.')
-
-    return f'Copied {len(plain)} chars, {spans} code spans, {len(links)} links, HTML + plain verified on the clipboard.'
+    if _TRAILING_WHITESPACE.sub('', landed or '') != text:
+        raise ClipboardError('Clipboard verification failed: the text did not round-trip.')
+    return f'Copied {len(text)} chars.'
 
 
 # --- CLI -------------------------------------------------------------------------------------------
 
 
 def parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description='Copy a drafted file onto the system clipboard.')
+    parser = argparse.ArgumentParser(description='Copy a drafted file onto the system clipboard as plain text.')
     parser.add_argument('--path', required=True, help='Path to the UTF-8 draft file to copy.')
-    parser.add_argument(
-        '--plain-only', action='store_true',
-        help='Copy the literal text only; no HTML flavour, backticks left exactly as typed.',
-    )
     return parser.parse_args(argv)
 
 
@@ -791,8 +415,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
     try:
         text = read_draft_file(str(args.path))
-        message = copy_windows(text, args.plain_only) if IS_WINDOWS else copy_posix(text, args.plain_only)
-        print(message)
+        print(copy_windows(text) if IS_WINDOWS else copy_posix(text))
         return 0
     except ClipboardError as exc:
         print(str(exc), file=sys.stderr)
