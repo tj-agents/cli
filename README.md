@@ -12,7 +12,7 @@ Fast shell tools for agentic programming, on Windows and Linux. `tj` provides tw
 The shared `tj-agents` marketplace also publishes `cli@tj-agents`:
 
 - [`cli:cd`](.agents/cli/utility/cd/SKILL.md) continues an authorized task in a nested directory or linked worktree, using supported native session control when available.
-- [`cli:clip`](.agents/cli/utility/clip/SKILL.md) puts text on the OS clipboard (Windows, Linux or macOS) so it can be pasted elsewhere.
+- [`cli:clip`](.agents/cli/utility/clip/SKILL.md) puts plain text on the OS clipboard (Windows, Linux or macOS), verified, so it can be pasted elsewhere; Teams messages use `teams:message`.
 
 `tj-cli` supplies deterministic process, terminal, and linked-worktree mechanics to Agent. Agent owns
 session-aware target resolution and lifecycle decisions. Native control supports Windows Terminal, tmux and
@@ -21,8 +21,9 @@ updates so the console-to-tab association can be verified.
 
 ## Install
 
-You need [fzf](https://github.com/junegunn/fzf) 0.54 or newer and either a Rust toolchain (to build) or the
-[GitHub CLI](https://cli.github.com) (to download a prebuilt release).
+You need Python 3.12 or newer, [fzf](https://github.com/junegunn/fzf) 0.54 or newer, and either a Rust
+toolchain (to build from this checkout) or the [GitHub CLI](https://cli.github.com) (to download a verified
+prebuilt release).
 
 **Linux**
 
@@ -43,7 +44,7 @@ Then open a new terminal.
 You can run the installer as often as you like. It updates whatever is out of date and reports `ok`
 for everything else, so re-running it after a `git pull` is how you upgrade. It:
 
-1. builds `tj` and `tj_hook` (or downloads the latest release) and puts them in `~/.local/bin` on Linux or
+1. builds `tj` and `tj_hook` (or downloads the latest verified release) and puts them in `~/.local/bin` on Linux or
    `%LOCALAPPDATA%\Programs\tj` on Windows, adding that folder to your user PATH on Windows;
 2. checks for fzf. On Windows it installs fzf with winget if it's missing; on Linux it tells you
    the package to install;
@@ -206,7 +207,7 @@ cargo fmt
 ```
 
 CI runs all three on Linux and Windows. It then runs each installer twice and fails if the second
-run changes anything. To publish prebuilt binaries, push a tag such as `v0.2.0`.
+run changes anything. A successful current `main` commit automatically publishes the paired prebuilt binaries.
 
 | Path | Owns |
 | --- | --- |

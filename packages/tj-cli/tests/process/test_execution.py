@@ -7,6 +7,7 @@ import sys
 import time
 from collections.abc import Callable
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -338,9 +339,33 @@ def _alive(pid: int) -> bool:
         try:
             if status.read_text(encoding="utf-8").rpartition(")")[2].split()[0] == "Z":
                 return False
-        except FileNotFoundError:
+        except (FileNotFoundError, ProcessLookupError):
             return False
         return True
+
+
+@pytest.mark.parametrize(
+    "failure", [FileNotFoundError, ProcessLookupError, PermissionError]
+)
+def test_alive_handles_process_exit_during_procfs_read(
+    monkeypatch: pytest.MonkeyPatch, failure: type[OSError]
+) -> None:
+    def probe(pid: int, signal: int) -> None:
+        assert pid == 123 and signal == 0
+
+    def read_status(_path: Path, **_kwargs: object) -> str:
+        raise failure("process status unavailable")
+
+    monkeypatch.setitem(
+        _alive.__globals__, "os", SimpleNamespace(name="posix", kill=probe)
+    )
+    monkeypatch.setitem(_alive.__globals__, "sys", SimpleNamespace(platform="linux"))
+    monkeypatch.setattr(Path, "read_text", read_status)
+    if failure is PermissionError:
+        with pytest.raises(PermissionError, match="process status unavailable"):
+            _alive(123)
+    else:
+        assert not _alive(123)
 
 
 def test_run_timeout_identifies_requested_command() -> None:
