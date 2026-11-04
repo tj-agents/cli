@@ -13,6 +13,9 @@ import pytest
 
 from tj_cli import process
 
+BACKGROUND_ROOT = Path(__file__).with_name("fixtures") / "background_root.py"
+BACKGROUND_CHILD = Path(__file__).with_name("fixtures") / "background_child.py"
+
 
 def test_run_preserves_arguments_streams_environment_directory_and_exit(
     tmp_path: Path,
@@ -56,6 +59,14 @@ def test_run_missing_executable_reports_diagnostic() -> None:
     )
     assert result.returncode == 127
     assert "tj_hook:" in result.stderr
+
+
+def test_native_launcher_reports_its_version(native_launcher: Path) -> None:
+    result = subprocess.run(
+        [str(native_launcher), "--version"], capture_output=True, text=True, timeout=30
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.startswith("tj_hook ")
 
 
 def test_run_requires_installed_launcher(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -344,6 +355,45 @@ def _alive(pid: int) -> bool:
         return True
 
 
+def _wait_for_record(path: Path) -> dict[str, object]:
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline:
+        if path.is_file():
+            return json.loads(path.read_text(encoding="utf-8"))
+        time.sleep(0.01)
+    pytest.fail(f"background process did not write {path}")
+
+
+def _wait_for_exit(pid: int) -> None:
+    deadline = time.monotonic() + 5
+    while _alive(pid) and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert not _alive(pid)
+
+
+def _stop_background(pid: int) -> None:
+    if _alive(pid):
+        process.run(
+            ["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True, timeout=30
+        )
+        _wait_for_exit(pid)
+
+
+def _background_command(
+    report: Path, exit_code: int, delay: float, preserve: bool
+) -> list[str]:
+    command = [
+        str(BACKGROUND_ROOT),
+        str(BACKGROUND_CHILD),
+        str(report),
+        "60",
+        str(exit_code),
+        str(delay),
+    ]
+    options = ["--preserve-descendants"] if preserve else []
+    return [*options, "--", sys.executable, *command]
+
+
 @pytest.mark.parametrize(
     "failure", [FileNotFoundError, ProcessLookupError, PermissionError]
 )
@@ -412,6 +462,95 @@ def test_terminating_launcher_kills_ready_descendant(
     while _alive(pid) and time.monotonic() < deadline:
         time.sleep(0.01)
     assert not _alive(pid)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows launcher job ownership")
+@pytest.mark.parametrize("exit_code", [0, 23])
+def test_preserve_descendants_releases_hidden_background_child_after_root_exit(
+    native_launcher: Path, tmp_path: Path, exit_code: int
+) -> None:
+    report = tmp_path / "child.json"
+    result = subprocess.run(
+        [
+            str(native_launcher),
+            *_background_command(report, exit_code, 0, preserve=True),
+        ],
+        timeout=30,
+    )
+    assert result.returncode == exit_code
+    child = _wait_for_record(report)
+    pid = child["pid"]
+    assert isinstance(pid, int)
+    try:
+        assert _alive(pid)
+        assert child == {"pid": pid, "console": True, "visible": False}
+    finally:
+        _stop_background(pid)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows launcher job ownership")
+def test_preserve_descendants_cancellation_kills_the_owned_tree(
+    native_launcher: Path, tmp_path: Path
+) -> None:
+    report = tmp_path / "child.json"
+    launcher = subprocess.Popen(
+        [str(native_launcher), *_background_command(report, 0, 60, preserve=True)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        child = _wait_for_record(report)
+        pid = child["pid"]
+        assert isinstance(pid, int)
+        launcher.kill()
+        launcher.communicate(timeout=30)
+        _wait_for_exit(pid)
+    finally:
+        if launcher.poll() is None:
+            launcher.kill()
+            launcher.communicate(timeout=30)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows launcher job ownership")
+def test_preserve_descendants_cancellation_does_not_kill_an_unrelated_sentinel(
+    native_launcher: Path, tmp_path: Path
+) -> None:
+    sentinel_report = tmp_path / "sentinel.json"
+    sentinel = subprocess.Popen(
+        [
+            str(native_launcher),
+            *_background_command(sentinel_report, 0, 60, preserve=False),
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    report = tmp_path / "child.json"
+    launcher = subprocess.Popen(
+        [str(native_launcher), *_background_command(report, 0, 60, preserve=True)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        sentinel_child = _wait_for_record(sentinel_report)
+        child = _wait_for_record(report)
+        sentinel_pid = sentinel_child["pid"]
+        pid = child["pid"]
+        assert isinstance(sentinel_pid, int)
+        assert isinstance(pid, int)
+        launcher.kill()
+        launcher.communicate(timeout=30)
+        _wait_for_exit(pid)
+        assert _alive(sentinel_pid)
+    finally:
+        if launcher.poll() is None:
+            launcher.kill()
+            launcher.communicate(timeout=30)
+        if sentinel.poll() is None:
+            sentinel.kill()
+            sentinel.communicate(timeout=30)
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="Linux process group ownership")
