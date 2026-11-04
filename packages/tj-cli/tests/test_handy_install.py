@@ -1,0 +1,233 @@
+import hashlib
+import json
+import os
+import platform
+import shutil
+import subprocess
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+from tj_cli import handy_install
+
+
+@pytest.fixture(autouse=True)
+def isolated_desktop(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(platform, "system", lambda: "Windows")
+    monkeypatch.setattr(shutil, "which", lambda command: None)
+    for variable in ("CI", "DISPLAY", "WAYLAND_DISPLAY", "ProgramW6432"):
+        monkeypatch.delenv(variable, raising=False)
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "local data"))
+    monkeypatch.setenv("ProgramFiles", str(tmp_path / "program files"))
+
+
+def _windows_installation() -> Path:
+    executable = Path(os.environ["LOCALAPPDATA"]) / "Handy" / "handy.exe"
+    executable.parent.mkdir(parents=True)
+    executable.write_bytes(b"installed")
+    return executable
+
+
+def test_check_reports_missing_without_starting_a_process(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def unexpected_process(*args: object, **kwargs: object) -> None:
+        pytest.fail("check mode must not run a package manager or download")
+
+    monkeypatch.setattr(subprocess, "run", unexpected_process)
+    assert handy_install.main(["--check"]) == 1
+    assert "missing    Handy" in capsys.readouterr().out
+
+
+def test_existing_windows_installation_is_unchanged(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    executable = _windows_installation()
+    before = executable.stat().st_mtime_ns
+    assert handy_install.main([]) == 0
+    assert handy_install.main(["--check"]) == 0
+    assert executable.stat().st_mtime_ns == before
+    assert capsys.readouterr().out.count("ok         Handy") == 2
+
+
+def test_windows_installs_once_and_verifies_the_result(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    commands: list[list[str]] = []
+    monkeypatch.setattr(
+        shutil, "which", lambda name: "winget.exe" if name == "winget" else None
+    )
+
+    def run(arguments: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        commands.append(arguments)
+        _windows_installation()
+        return subprocess.CompletedProcess(arguments, 0, "", "")
+
+    monkeypatch.setattr(subprocess, "run", run)
+    assert handy_install.main([]) == 0
+    assert handy_install.main([]) == 0
+    assert len(commands) == 1
+    assert commands[0][:5] == [
+        "winget.exe",
+        "install",
+        "--id",
+        "cjpais.Handy",
+        "--exact",
+    ]
+    assert commands[0][commands[0].index("--scope") + 1] == "user"
+    output = capsys.readouterr().out
+    assert "installed  Handy" in output
+    assert "ok         Handy" in output
+
+
+def test_windows_missing_winget_is_actionable(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    assert handy_install.main([]) == 1
+    assert "App Installer (winget)" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("failure", [False, True])
+def test_windows_failed_or_ineffective_install_is_not_success(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    failure: bool,
+) -> None:
+    monkeypatch.setattr(
+        shutil, "which", lambda name: "winget.exe" if name == "winget" else None
+    )
+
+    def run(arguments: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        if failure:
+            raise subprocess.CalledProcessError(1, arguments)
+        return subprocess.CompletedProcess(arguments, 0, "", "")
+
+    monkeypatch.setattr(subprocess, "run", run)
+    assert handy_install.main([]) == 1
+    output = capsys.readouterr()
+    assert "installed  Handy" not in output.out
+    assert "error      Handy" in output.err
+
+
+@pytest.mark.parametrize("variable", ["DISPLAY", "WAYLAND_DISPLAY"])
+def test_linux_desktop_requires_handy(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    variable: str,
+) -> None:
+    monkeypatch.setattr(platform, "system", lambda: "Linux")
+    monkeypatch.setenv(variable, "desktop")
+    assert handy_install.main(["--check"]) == 1
+    assert "missing    Handy" in capsys.readouterr().out
+
+
+def test_headless_linux_does_not_install_desktop_software(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(platform, "system", lambda: "Linux")
+    assert handy_install.main([]) == 0
+    assert "no desktop session" in capsys.readouterr().out
+
+
+def test_ci_does_not_install_desktop_software(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("CI", "true")
+    assert handy_install.main([]) == 0
+    assert "Handy (CI)" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    ("manager", "machine", "suffix"),
+    [
+        ("apt-get", "x86_64", "_amd64.deb"),
+        ("apt-get", "aarch64", "_arm64.deb"),
+        ("dnf", "x86_64", ".x86_64.rpm"),
+        ("dnf", "aarch64", ".aarch64.rpm"),
+    ],
+)
+def test_linux_installs_verified_package_once(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    manager: str,
+    machine: str,
+    suffix: str,
+) -> None:
+    monkeypatch.setattr(platform, "system", lambda: "Linux")
+    monkeypatch.setattr(platform, "machine", lambda: machine)
+    monkeypatch.setenv("DISPLAY", ":0")
+    installed = tmp_path / "handy"
+    package = b"upstream package"
+    commands: list[list[str]] = []
+
+    def which(command: str) -> str | None:
+        if command == "handy":
+            return str(installed) if installed.exists() else None
+        return f"/tools/{command}" if command in {manager, "gh", "sudo"} else None
+
+    def run(arguments: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        commands.append(arguments)
+        if arguments == ["id", "-u"]:
+            return subprocess.CompletedProcess(arguments, 0, "1000\n", "")
+        if arguments[-1] == "repos/cjpais/Handy/releases/latest":
+            release = {
+                "assets": [
+                    {
+                        "id": 123,
+                        "name": f"Handy_1.0{suffix}",
+                        "digest": f"sha256:{hashlib.sha256(package).hexdigest()}",
+                    }
+                ]
+            }
+            return subprocess.CompletedProcess(arguments, 0, json.dumps(release), "")
+        if arguments[0] == "/tools/gh":
+            kwargs["stdout"].write(package)
+        else:
+            assert arguments[:4] == ["/tools/sudo", manager, "install", "-y"]
+            assert Path(arguments[-1]).read_bytes() == package
+            installed.write_bytes(b"executable")
+        return subprocess.CompletedProcess(arguments, 0, "", "")
+
+    monkeypatch.setattr(shutil, "which", which)
+    monkeypatch.setattr(subprocess, "run", run)
+    assert handy_install.main([]) == 0
+    assert handy_install.main([]) == 0
+    assert len(commands) == 4
+    assert commands[1][2:4] == ["--hostname", "github.com"]
+    assert commands[2][2:4] == ["--hostname", "github.com"]
+    assert not Path(commands[-1][-1]).exists()
+
+
+@pytest.mark.parametrize("digest", [None, "sha256:" + "0" * 64])
+def test_linux_unverified_download_never_reaches_package_manager(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    digest: str | None,
+) -> None:
+    commands: list[list[str]] = []
+
+    def run(arguments: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        commands.append(arguments)
+        if "stdout" in kwargs:
+            kwargs["stdout"].write(b"corrupt")
+            return subprocess.CompletedProcess(arguments, 0, "", "")
+        release = {
+            "assets": [{"id": 123, "name": "Handy_1_amd64.deb", "digest": digest}]
+        }
+        return subprocess.CompletedProcess(arguments, 0, json.dumps(release), "")
+
+    monkeypatch.setattr(subprocess, "run", run)
+    with pytest.raises(handy_install.HandyInstallError, match="SHA-256"):
+        handy_install._download_linux_package("gh", "_amd64.deb", tmp_path)
+    assert all(arguments[0] == "gh" for arguments in commands)
+
+
+def test_linux_unsupported_package_manager_gives_manual_resolution(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(platform, "system", lambda: "Linux")
+    monkeypatch.setattr(platform, "machine", lambda: "x86_64")
+    monkeypatch.setenv("DISPLAY", ":0")
+    assert handy_install.main([]) == 1
+    assert "handy on PATH" in capsys.readouterr().err
