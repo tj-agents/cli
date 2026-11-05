@@ -4,6 +4,7 @@ import os
 import platform as platform_module
 import shutil
 import subprocess
+import sys
 import zipfile
 from pathlib import Path
 from unittest import mock
@@ -11,6 +12,45 @@ from unittest import mock
 import pytest
 
 from tj_cli import native_install
+
+
+def test_installer_check_rejects_present_but_incompatible_pair_without_writing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    tmp_path = tmp_path / "managed"
+    _native_pair(tmp_path)
+    before = {path.name: path.read_bytes() for path in tmp_path.iterdir()}
+    monkeypatch.setattr(
+        sys, "argv", ["native-install", "--bin-dir", str(tmp_path), "--check"]
+    )
+    with (
+        mock.patch.object(
+            native_install,
+            "pending_native",
+            return_value=native_install._binary_names(),
+        ) as pending,
+        mock.patch.object(native_install, "ensure_native") as ensure,
+    ):
+        assert native_install._main() == 1
+    pending.assert_called_once_with(tmp_path)
+    ensure.assert_not_called()
+    assert {path.name: path.read_bytes() for path in tmp_path.iterdir()} == before
+
+
+@pytest.mark.parametrize("compatible", [False, True])
+def test_installer_noop_acknowledges_only_a_compatible_pair(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, compatible: bool
+) -> None:
+    tmp_path = tmp_path / "managed"
+    _native_pair(tmp_path)
+    monkeypatch.setattr(sys, "argv", ["native-install", "--bin-dir", str(tmp_path)])
+    pending = () if compatible else native_install._binary_names()
+    with (
+        mock.patch.object(native_install, "pending_native", return_value=pending),
+        mock.patch.object(native_install, "ensure_native", return_value=()) as ensure,
+    ):
+        assert native_install._main() == int(not compatible)
+    ensure.assert_called_once_with(tmp_path, source=None, revision=None)
 
 
 def _archive(path: Path, entries: dict[str, bytes]) -> str:
