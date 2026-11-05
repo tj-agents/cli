@@ -13,6 +13,12 @@ import pytest
 
 from tj_cli import process
 
+BACKGROUND_ROOT = Path(__file__).with_name("fixtures") / "background_root.py"
+BACKGROUND_CHILD = Path(__file__).with_name("fixtures") / "background_child.py"
+BATCH_ECHO = Path(__file__).with_name("fixtures") / "batch_echo.cmd"
+BATCH_FORWARD = Path(__file__).with_name("fixtures") / "batch_forward.cmd"
+BATCH_ARGV = Path(__file__).with_name("fixtures") / "batch_argv.py"
+
 
 def test_run_preserves_arguments_streams_environment_directory_and_exit(
     tmp_path: Path,
@@ -56,6 +62,151 @@ def test_run_missing_executable_reports_diagnostic() -> None:
     )
     assert result.returncode == 127
     assert "tj_hook:" in result.stderr
+
+
+def test_native_launcher_reports_its_version(native_launcher: Path) -> None:
+    result = subprocess.run(
+        [str(native_launcher), "--version"], capture_output=True, text=True, timeout=30
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.startswith("tj_hook ")
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows native batch dispatch")
+@pytest.mark.parametrize("exit_code", [0, 23])
+def test_native_launcher_runs_batch_targets_with_normal_arguments(
+    native_launcher: Path, exit_code: int
+) -> None:
+    result = subprocess.run(
+        [str(native_launcher), str(BATCH_ECHO), "space value", str(exit_code)],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == exit_code, result.stderr
+    assert result.stdout == "space value\n"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows native batch dispatch")
+def test_native_launcher_forwards_safely_encodable_batch_arguments(
+    native_launcher: Path, tmp_path: Path
+) -> None:
+    output = tmp_path / "argv.json"
+    values = ["space value", "ü", 'quote"value']
+    result = subprocess.run(
+        [
+            str(native_launcher),
+            str(BATCH_FORWARD),
+            sys.executable,
+            str(BATCH_ARGV),
+            str(output),
+            *values,
+        ],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    assert json.loads(output.read_text(encoding="utf-8")) == values
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows native batch dispatch")
+def test_native_launcher_refuses_batch_dispatch_misuse_and_unsafe_targets(
+    native_launcher: Path, tmp_path: Path
+) -> None:
+    direct = subprocess.run(
+        [
+            str(native_launcher),
+            "--tj-hook-batch-dispatch",
+            "--",
+            str(BATCH_ECHO),
+            "ran",
+            "0",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert direct.returncode == 127
+    assert direct.stdout == ""
+    forwarded = subprocess.run(
+        [
+            str(native_launcher),
+            "--",
+            "--tj-hook-batch-dispatch",
+            str(BATCH_ECHO),
+            "ran",
+            "0",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert forwarded.returncode == 127
+    assert forwarded.stdout == ""
+    percent = tmp_path / "target%.cmd"
+    shutil.copy2(BATCH_ECHO, percent)
+    rejected = subprocess.run(
+        [str(native_launcher), str(percent), "ran", "0"],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert rejected.returncode == 127
+    assert rejected.stdout == ""
+    line_break = subprocess.run(
+        [str(native_launcher), str(BATCH_ECHO), "never\r\nrun", "0"],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert line_break.returncode == 127
+    assert line_break.stdout == ""
+    for shell_character in "&|^%":
+        sentinel = tmp_path / f"injected-{ord(shell_character)}"
+        rejected = subprocess.run(
+            [
+                str(native_launcher),
+                str(BATCH_ECHO),
+                f"safe{shell_character}echo injected>{sentinel}",
+                "0",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        assert rejected.returncode == 127
+        assert rejected.stdout == ""
+        assert not sentinel.exists()
+    sidecar = tmp_path / "target.cmd"
+    shutil.copy2(BATCH_ECHO, sidecar)
+    (tmp_path / "target.cmd.exe").write_text("not executable", encoding="utf-8")
+    rejected = subprocess.run(
+        [str(native_launcher), str(sidecar), "ran", "0"],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert rejected.returncode == 127
+    assert rejected.stdout == ""
+    nested = subprocess.run(
+        [
+            str(native_launcher),
+            "--",
+            str(native_launcher),
+            "--tj-hook-batch-dispatch",
+            "--",
+            str(percent),
+            "ran",
+            "0",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert nested.returncode == 127
+    assert nested.stdout == ""
 
 
 def test_run_requires_installed_launcher(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -344,6 +495,63 @@ def _alive(pid: int) -> bool:
         return True
 
 
+def _wait_for_record(path: Path) -> dict[str, object]:
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline:
+        if path.is_file():
+            record: dict[str, object] = json.loads(path.read_text(encoding="utf-8"))
+            return record
+        time.sleep(0.01)
+    pytest.fail(f"background process did not write {path}")
+
+
+def _wait_for_exit(pid: int) -> None:
+    deadline = time.monotonic() + 5
+    while _alive(pid) and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert not _alive(pid)
+
+
+def _stop_background(pid: int) -> None:
+    if _alive(pid):
+        process.run(
+            ["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True, timeout=30
+        )
+        _wait_for_exit(pid)
+
+
+def _background_command(
+    report: Path, exit_code: int, delay: float, preserve: bool
+) -> list[str]:
+    command = [
+        str(BACKGROUND_ROOT),
+        str(BACKGROUND_CHILD),
+        str(report),
+        "60",
+        str(exit_code),
+        str(delay),
+    ]
+    options = ["--preserve-descendants"] if preserve else []
+    return [*options, "--", sys.executable, *command]
+
+
+def _batch_background_command(
+    report: Path, exit_code: int, delay: float, preserve: bool
+) -> list[str]:
+    command = [
+        str(BATCH_FORWARD),
+        sys.executable,
+        str(BACKGROUND_ROOT),
+        str(BACKGROUND_CHILD),
+        str(report),
+        "60",
+        str(exit_code),
+        str(delay),
+    ]
+    options = ["--preserve-descendants"] if preserve else []
+    return [*options, "--", *command]
+
+
 @pytest.mark.parametrize(
     "failure", [FileNotFoundError, ProcessLookupError, PermissionError]
 )
@@ -412,6 +620,158 @@ def test_terminating_launcher_kills_ready_descendant(
     while _alive(pid) and time.monotonic() < deadline:
         time.sleep(0.01)
     assert not _alive(pid)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows launcher job ownership")
+@pytest.mark.parametrize("exit_code", [0, 23])
+def test_preserve_descendants_releases_hidden_background_child_after_root_exit(
+    native_launcher: Path, tmp_path: Path, exit_code: int
+) -> None:
+    report = tmp_path / "child.json"
+    result = subprocess.run(
+        [
+            str(native_launcher),
+            *_background_command(report, exit_code, 0, preserve=True),
+        ],
+        timeout=30,
+    )
+    assert result.returncode == exit_code
+    child = _wait_for_record(report)
+    pid = child["pid"]
+    assert isinstance(pid, int)
+    try:
+        assert _alive(pid)
+        assert child == {"pid": pid, "console": True, "visible": False}
+    finally:
+        _stop_background(pid)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows launcher job ownership")
+def test_preserve_descendants_cancellation_kills_the_owned_tree(
+    native_launcher: Path, tmp_path: Path
+) -> None:
+    report = tmp_path / "child.json"
+    launcher = subprocess.Popen(
+        [str(native_launcher), *_background_command(report, 0, 60, preserve=True)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        child = _wait_for_record(report)
+        pid = child["pid"]
+        assert isinstance(pid, int)
+        launcher.kill()
+        launcher.communicate(timeout=30)
+        _wait_for_exit(pid)
+    finally:
+        if launcher.poll() is None:
+            launcher.kill()
+            launcher.communicate(timeout=30)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows launcher job ownership")
+def test_preserve_descendants_cancellation_does_not_kill_an_unrelated_sentinel(
+    native_launcher: Path, tmp_path: Path
+) -> None:
+    sentinel_report = tmp_path / "sentinel.json"
+    sentinel = subprocess.Popen(
+        [
+            str(native_launcher),
+            *_background_command(sentinel_report, 0, 60, preserve=False),
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    report = tmp_path / "child.json"
+    launcher = subprocess.Popen(
+        [str(native_launcher), *_background_command(report, 0, 60, preserve=True)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        sentinel_child = _wait_for_record(sentinel_report)
+        child = _wait_for_record(report)
+        sentinel_pid = sentinel_child["pid"]
+        pid = child["pid"]
+        assert isinstance(sentinel_pid, int)
+        assert isinstance(pid, int)
+        launcher.kill()
+        launcher.communicate(timeout=30)
+        _wait_for_exit(pid)
+        assert _alive(sentinel_pid)
+    finally:
+        if launcher.poll() is None:
+            launcher.kill()
+            launcher.communicate(timeout=30)
+        if sentinel.poll() is None:
+            sentinel.kill()
+            sentinel.communicate(timeout=30)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows native batch dispatch")
+def test_batch_broker_preserves_hidden_children_and_cancellation_owns_them(
+    native_launcher: Path, tmp_path: Path
+) -> None:
+    report = tmp_path / "child.json"
+    normal = subprocess.run(
+        [str(native_launcher), *_batch_background_command(report, 0, 0, preserve=True)],
+        timeout=30,
+    )
+    assert normal.returncode == 0
+    child = _wait_for_record(report)
+    pid = child["pid"]
+    assert isinstance(pid, int)
+    try:
+        assert child == {"pid": pid, "console": True, "visible": False}
+        assert _alive(pid)
+    finally:
+        _stop_background(pid)
+    report = tmp_path / "cancelled.json"
+    launcher = subprocess.Popen(
+        [
+            str(native_launcher),
+            *_batch_background_command(report, 0, 60, preserve=True),
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        child = _wait_for_record(report)
+        pid = child["pid"]
+        assert isinstance(pid, int)
+        launcher.kill()
+        launcher.communicate(timeout=30)
+        _wait_for_exit(pid)
+    finally:
+        if launcher.poll() is None:
+            launcher.kill()
+            launcher.communicate(timeout=30)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows native batch dispatch")
+def test_run_timeout_kills_batch_descendant(tmp_path: Path) -> None:
+    report = tmp_path / "child.json"
+    command = [
+        str(BATCH_FORWARD),
+        sys.executable,
+        str(BACKGROUND_ROOT),
+        str(BACKGROUND_CHILD),
+        str(report),
+        "60",
+        "0",
+        "60",
+    ]
+    with pytest.raises(subprocess.TimeoutExpired) as caught:
+        process.run(command, capture_output=True, timeout=1)
+    assert caught.value.cmd == command
+    child = _wait_for_record(report)
+    pid = child["pid"]
+    assert isinstance(pid, int)
+    _wait_for_exit(pid)
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="Linux process group ownership")
