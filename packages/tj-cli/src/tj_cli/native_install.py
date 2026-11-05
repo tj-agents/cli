@@ -534,9 +534,11 @@ def _main() -> int:
     arguments = parser.parse_args()
     try:
         if arguments.check:
-            missing = missing_native(arguments.bin_dir)
-            if missing:
-                print(f"missing native binaries: {', '.join(missing)}")
+            pending = pending_native(arguments.bin_dir)
+            if pending:
+                print(
+                    f"native binaries need installation or update: {', '.join(pending)}"
+                )
                 return 1
             print("ok native binaries")
             return 0
@@ -551,6 +553,12 @@ def _main() -> int:
         changed = ensure_native(
             arguments.bin_dir, source=arguments.source, revision=arguments.revision
         )
+        if pending := pending_native(arguments.bin_dir):
+            raise NativeInstallError(
+                "installed native binaries remain incompatible: "
+                + ", ".join(pending)
+                + "; install a compatible release or build the current CLI source"
+            )
         print(
             f"installed native binaries: {', '.join(changed)}"
             if changed
