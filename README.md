@@ -156,6 +156,12 @@ environment and working directory, returning its exit status. On Windows the lau
 has no console window and starts the command in a console hidden from creation. Ordinary
 descendants inherit that hidden console. A Windows Job Object keeps the command tree
 owned by the launcher: exiting or terminating the launcher also terminates its descendants.
+Windows `.cmd` and `.bat` targets run automatically through the same hidden, job-owned launcher;
+paths containing `%`, a matching `.cmd.exe`/`.bat.exe` sidecar, or arguments containing line breaks
+or batch shell characters are rejected rather than interpreted as batch source.
+Use `tj_hook --preserve-descendants -- <executable> [arguments...]` only when descendants
+must outlive a normally exiting root command; cancellation before that exit still terminates
+the owned tree. On Linux this option retains the launcher's existing `exec` behavior.
 On Linux the launcher replaces itself with the command, retaining its process identity
 and signal behavior.
 
@@ -177,6 +183,10 @@ the Python wheel alone does not install the native binaries. A missing launcher 
 explicitly. `run` owns a separate process session on Linux and kills that process group
 on timeout or interruption. `start` returns a `Popen` handle for callers managing its
 lifetime themselves. Timeout and nonzero-exit errors identify the requested command.
+
+`native_install.pending_native(directory)` checks the managed pair locally and reports missing or
+incompatible binaries. It probes the helper's version without downloading or changing files;
+the current runtime requires native version 0.2.0 or newer.
 
 Both functions accept typed options for standard streams, working directory, environment,
 text encoding, buffering and process creation. Unknown options fail before launch.
