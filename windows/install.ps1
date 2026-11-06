@@ -1,5 +1,5 @@
 # Installs `tj` and wires the `f` and `cr` functions into PowerShell. Safe to run any number of times:
-# each step reports "ok" when there is nothing to change. Needs no administrator rights.
+# each step reports "ok" when there is nothing to change.
 #
 #   windows\install.ps1              install or update
 #   windows\install.ps1 -Check       report what is and isn't set up, change nothing
@@ -14,7 +14,6 @@ param(
 $ErrorActionPreference = 'Stop'
 if ($IsLinux -or $IsMacOS) { throw 'install.ps1 is for Windows - use ./install.sh on Linux and macOS' }
 $repo = Split-Path -Parent $PSScriptRoot
-$binaries = @('tj.exe', 'tj_hook.exe')
 $begin = '# >>> tj-agents/cli >>>'
 $end = '# <<< tj-agents/cli <<<'
 $script:status = 0
@@ -39,48 +38,25 @@ function Set-Block([string]$File, [string]$Body) {
 }
 
 function Install-Binaries {
-    if ($Uninstall) {
-        foreach ($binary in $binaries) {
-            $target = Join-Path $BinDir $binary
-            if (Test-Path -LiteralPath $target) { Remove-Item -LiteralPath $target -Force; Say removed $target }
-            else { Say ok "$target (not installed)" }
+    $python = Get-Command python -ErrorAction SilentlyContinue
+    if (-not $python) { throw 'install needs Python 3.12 or newer' }
+    $sourcePath = Join-Path $repo 'packages\tj-cli\src'
+    $previousPythonPath = $env:PYTHONPATH
+    $env:PYTHONPATH = if ($previousPythonPath) { "$sourcePath;$previousPythonPath" } else { $sourcePath }
+    try {
+        $arguments = @('-m', 'tj_cli.native_install', '--bin-dir', $BinDir, '--source', $repo)
+        if ($Check) { $arguments += '--check' }
+        if ($Uninstall) { $arguments += '--uninstall' }
+        & $python.Source @arguments
+        if ($LASTEXITCODE -ne 0) { $script:status = 1 }
+        if (-not $Uninstall) {
+            $handyArguments = @('-m', 'tj_cli.handy_install')
+            if ($Check) { $handyArguments += '--check' }
+            & $python.Source @handyArguments
+            if ($LASTEXITCODE -ne 0) { $script:status = 1 }
         }
-        return
     }
-    if ($Check) {
-        foreach ($binary in $binaries) {
-            $target = Join-Path $BinDir $binary
-            if (Test-Path -LiteralPath $target) { Say ok "$target ($((& $target --version | Out-String).Trim()))" }
-            else { Say missing $target; $script:status = 1 }
-        }
-        return
-    }
-
-    if (Get-Command cargo -ErrorAction SilentlyContinue) {
-        & cargo build --release --locked --quiet --manifest-path (Join-Path $repo 'Cargo.toml')
-        if ($LASTEXITCODE -ne 0) { throw 'cargo build failed' }
-        $builtDirectory = Join-Path $repo 'target\release'
-    }
-    elseif (Get-Command gh -ErrorAction SilentlyContinue) {
-        $tmp = Join-Path ([IO.Path]::GetTempPath()) ('tj-' + [guid]::NewGuid().ToString('N'))
-        [void](New-Item -ItemType Directory -Path $tmp)
-        & gh release download --repo tj-agents/cli --pattern 'tj-x86_64-pc-windows-msvc.zip' --dir $tmp --clobber
-        if ($LASTEXITCODE -ne 0) { throw 'gh release download failed' }
-        Expand-Archive -LiteralPath (Join-Path $tmp 'tj-x86_64-pc-windows-msvc.zip') -DestinationPath $tmp -Force
-        $builtDirectory = $tmp
-    }
-    else { throw 'install needs either cargo (to build) or gh (to download a release)' }
-
-    if (-not (Test-Path -LiteralPath $BinDir)) { [void](New-Item -ItemType Directory -Path $BinDir -Force) }
-    foreach ($binary in $binaries) {
-        $target = Join-Path $BinDir $binary
-        $built = Join-Path $builtDirectory $binary
-        $same = (Test-Path -LiteralPath $target) -and
-            ((Get-FileHash -LiteralPath $built).Hash -eq (Get-FileHash -LiteralPath $target).Hash)
-        if ($same) { Say ok $target; continue }
-        Copy-Item -LiteralPath $built -Destination $target -Force
-        Say installed "$target ($((& $target --version | Out-String).Trim()))"
-    }
+    finally { $env:PYTHONPATH = $previousPythonPath }
 }
 
 # The user PATH lives in the registry; this process's PATH is updated too so the rest of the script
