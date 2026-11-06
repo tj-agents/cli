@@ -64,37 +64,24 @@ moment — not that it survived since.
 can set only one clipboard flavour per copy, so the default (rich) copy holds `text/html` and nothing
 else; a terminal paste or a plain text field gets nothing useful from it, not a plain fallback. Default
 mode is for rich targets — Teams, email. For anything pasted into a terminal or a plain field, use
-`--plain-only`.
+`--plain-only`, same as for a command (below).
 
 ## A command Tommy has to run himself
 
-**Every command he runs himself — a PR approval, a token or credential step, any `!` line — is built
-by `scripts/user_command.py`. Never compose one by hand or write your own wrapper script.** Write the
-spec to a scratchpad JSON file and run (`python` on Windows):
+**Put it on the clipboard. Never print it for him to copy out of the terminal.** Terminal copy is
+where wrapping and indentation get baked in, and it silently breaks a long command on paste. This is
+the same failure that put a line break into a Teams message mid-sentence.
 
-```sh
-python3 '<skill-directory>/scripts/user_command.py' issue --spec '<absolute-path-to-spec.json>'
-```
+Use `--plain-only` for a command: no HTML flavour, and backticks stay literal because in a shell they
+are syntax, not markup.
 
-```json
-{"unset": ["GH_TOKEN"], "steps": [{"argv": ["gh", "auth", "token", "--user", "tomjseery"], "capture": "GH_TOKEN"}, {"argv": ["gh", "pr", "review", "--approve", "https://github.com/tj-agents/cli/pull/21"]}]}
-```
+Do not invent a wrapper script to dodge the problem — the clipboard already solves it, and a
+throwaway script file is machinery he then has to clean up. Write a script only when the thing is
+genuinely worth keeping and re-running.
 
-`unset` clears variables first; steps run in order and stop at the first failure; `capture` exports a
-step's output as that variable. Optional `"shell": "bash"` or `"powershell"` overrides the host's `!`
-shell.
-
-The script renders one `!` line, copies it `--plain-only`, verifies the clipboard, records that it
-issued it, and prints the line and a receipt. Relay both: the line verbatim, never retyped or edited.
-A producer that already calls it, such as the bot gh wrapper after `gh pr create` or `gh pr ready`,
-prints the line itself; relay that output.
-
-A Stop hook blocks a reply containing any `!` command the builder did not issue. Run the builder; do
-not reword.
-
-A credential step pipes or `capture`s the value straight to its destination so it never reaches the
-transcript. Never echo the value, and never run such a command yourself — a half-finished attempt can
-leave a live credential stranded.
+A command that creates or moves a credential still goes to him to run, and pipes the value straight
+to its destination so it never reaches the transcript. Never echo the value, and never run such a
+command yourself — a half-finished attempt can leave a live credential stranded.
 
 **Teams messages only, for the HTML flavour.** GitHub review comments (`draft-comment`,
 `respond-comments`) are previewed in the reply and posted from here, not pasted, so they never go on
