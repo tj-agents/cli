@@ -1,9 +1,6 @@
 {
-  "schema_version": 1,
   "tier": "cli",
   "stack": "any project",
   "applies": "always",
-  "owner_repository": [
-    "tj-agents/cli"
-  ]
+  "session_context": "Put every command Tommy runs himself on his clipboard with `cli:clip`."
 }
