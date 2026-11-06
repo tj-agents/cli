@@ -12,7 +12,7 @@ Fast shell tools for agentic programming, on Windows and Linux. `tj` provides tw
 The shared `tj-agents` marketplace also publishes `cli@tj-agents`:
 
 - [`cli:cd`](.agents/cli/utility/cd/SKILL.md) continues an authorized task in a nested directory or linked worktree, using supported native session control when available.
-- [`cli:clip`](.agents/cli/utility/clip/SKILL.md) puts text on the OS clipboard (Windows, Linux or macOS) so it can be pasted elsewhere.
+- [`cli:clip`](.agents/cli/utility/clip/SKILL.md) puts plain text on the OS clipboard (Windows, Linux or macOS), verified, so it can be pasted elsewhere; Teams messages use `teams:message`.
 
 `tj-cli` supplies deterministic process, terminal, and linked-worktree mechanics to Agent. Agent owns
 session-aware target resolution and lifecycle decisions. Native control supports Windows Terminal, tmux and
@@ -21,8 +21,9 @@ updates so the console-to-tab association can be verified.
 
 ## Install
 
-You need [fzf](https://github.com/junegunn/fzf) 0.54 or newer and either a Rust toolchain (to build) or the
-[GitHub CLI](https://cli.github.com) (to download a prebuilt release).
+You need Python 3.12 or newer, [fzf](https://github.com/junegunn/fzf) 0.54 or newer, and either a Rust
+toolchain (to build from this checkout) or the [GitHub CLI](https://cli.github.com) (to download a verified
+prebuilt release).
 
 **Linux**
 
@@ -31,7 +32,7 @@ git clone https://github.com/tj-agents/cli ~/projects/tj-agents/cli
 ~/projects/tj-agents/cli/linux/install.sh
 ```
 
-**Windows** (PowerShell, no administrator rights needed)
+**Windows** (PowerShell)
 
 ```powershell
 git clone https://github.com/tj-agents/cli $HOME\source\repos\tj-agents\cli
@@ -43,11 +44,16 @@ Then open a new terminal.
 You can run the installer as often as you like. It updates whatever is out of date and reports `ok`
 for everything else, so re-running it after a `git pull` is how you upgrade. It:
 
-1. builds `tj` and `tj_hook` (or downloads the latest release) and puts them in `~/.local/bin` on Linux or
+1. builds `tj` and `tj_hook` (or downloads the latest verified release) and puts them in `~/.local/bin` on Linux or
    `%LOCALAPPDATA%\Programs\tj` on Windows, adding that folder to your user PATH on Windows;
 2. checks for fzf. On Windows it installs fzf with winget if it's missing; on Linux it tells you
    the package to install;
-3. adds one marked block to each shell startup file it finds (bash, zsh, fish, PowerShell):
+3. installs [Handy](https://github.com/cjpais/Handy) for voice dictation on desktop machines:
+   Windows uses winget; Linux desktops use a SHA-256-verified upstream package through APT or DNF,
+   with GitHub CLI and sudo required for a non-root installation. Other Linux distributions need Handy
+   installed with `handy` on PATH before setup. CI and Linux sessions without a display report this step
+   as not applicable; for SSH or WSL terminal use, run setup on the desktop host;
+4. adds one marked block to each shell startup file it finds (bash, zsh, fish, PowerShell):
 
    ```bash
    # >>> tj-agents/cli >>>
@@ -58,7 +64,24 @@ for everything else, so re-running it after a `git pull` is how you upgrade. It:
 | | Linux | Windows |
 | --- | --- | --- |
 | Check what's set up, change nothing | `linux/install.sh --check` | `windows\install.ps1 -Check` |
-| Remove everything it added | `linux/install.sh --uninstall` | `windows\install.ps1 -Uninstall` |
+| Remove CLI binaries and shell wiring | `linux/install.sh --uninstall` | `windows\install.ps1 -Uninstall` |
+
+### Voice dictation in Claude and Codex
+
+Handy is a desktop prerequisite provisioned by the existing installer. A clone alone does not install
+software. Setup checks for Handy on each run, installs it only when missing, and fails if installation
+fails. Check mode reports a missing application without installing or downloading anything. CLI uninstall
+preserves Handy and its models, as it preserves the shared fzf prerequisite.
+
+Open Handy once, download a speech model, select your microphone and hold-to-talk shortcut, and enable
+launch at login in Handy's settings. Use `Shift+Insert` as the paste method for Windows terminals, or the
+paste shortcut your terminal accepts. Then focus the Claude or Codex input, speak, review the transcript,
+and press Enter yourself. This uses the terminal's normal text input; no per-agent skill injection is
+needed. Setup verifies installation, not microphone access, model readiness or successful dictation.
+
+Linux desktop shortcuts and paste helpers depend on X11 or Wayland; complete
+[Handy's Linux setup](https://handy.computer/docs/linux) before using dictation. Headless setup does not
+claim voice input is ready.
 
 ## `cr`: find and resume a session
 
@@ -133,6 +156,12 @@ environment and working directory, returning its exit status. On Windows the lau
 has no console window and starts the command in a console hidden from creation. Ordinary
 descendants inherit that hidden console. A Windows Job Object keeps the command tree
 owned by the launcher: exiting or terminating the launcher also terminates its descendants.
+Windows `.cmd` and `.bat` targets run automatically through the same hidden, job-owned launcher;
+paths containing `%`, a matching `.cmd.exe`/`.bat.exe` sidecar, or arguments containing line breaks
+or batch shell characters are rejected rather than interpreted as batch source.
+Use `tj_hook --preserve-descendants -- <executable> [arguments...]` only when descendants
+must outlive a normally exiting root command; cancellation before that exit still terminates
+the owned tree. On Linux this option retains the launcher's existing `exec` behavior.
 On Linux the launcher replaces itself with the command, retaining its process identity
 and signal behavior.
 
@@ -154,6 +183,10 @@ the Python wheel alone does not install the native binaries. A missing launcher 
 explicitly. `run` owns a separate process session on Linux and kills that process group
 on timeout or interruption. `start` returns a `Popen` handle for callers managing its
 lifetime themselves. Timeout and nonzero-exit errors identify the requested command.
+
+`native_install.pending_native(directory)` checks the managed pair locally and reports missing or
+incompatible binaries. It probes the helper's version without downloading or changing files;
+the current runtime requires native version 0.2.0 or newer.
 
 Both functions accept typed options for standard streams, working directory, environment,
 text encoding, buffering and process creation. Unknown options fail before launch.
@@ -206,7 +239,7 @@ cargo fmt
 ```
 
 CI runs all three on Linux and Windows. It then runs each installer twice and fails if the second
-run changes anything. To publish prebuilt binaries, push a tag such as `v0.2.0`.
+run changes anything. A successful current `main` commit automatically publishes the paired prebuilt binaries.
 
 | Path | Owns |
 | --- | --- |
