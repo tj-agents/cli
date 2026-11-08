@@ -1,9 +1,11 @@
 mod cr;
+mod external;
 mod f;
 mod fzf;
 mod init;
 mod paths;
 
+use std::ffi::OsString;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
@@ -26,6 +28,9 @@ enum Command {
     /// Draws cr's preview pane (run by fzf, not by hand)
     #[command(hide = true)]
     CrPreview(cr::PreviewArgs),
+    /// Runs `tj-<name>` from PATH, so `tj item` runs `tj-item`
+    #[command(external_subcommand)]
+    External(Vec<OsString>),
 }
 
 fn main() -> ExitCode {
@@ -35,6 +40,7 @@ fn main() -> ExitCode {
         Command::F(args) => f::run(args),
         Command::Init(args) => init::run(args),
         Command::CrPreview(args) => cr::preview(args),
+        Command::External(arguments) => external::run(arguments),
     };
     match result {
         Ok(code) => code,

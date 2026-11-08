@@ -7,6 +7,9 @@ Fast shell tools for agentic programming, on Windows and Linux. `tj` provides tw
 | `cr` | Search your Claude Code or Codex sessions by **anything said in them**, preview how each one ended, and press Enter to resume it in the folder it was started from. |
 | `f` | Fuzzy-jump to a project folder. `f core` goes straight to the best match; plain `f` opens a picker. |
 
+Any other `tj <name> ...` runs `tj-<name> ...` from PATH, so `tj item` runs the `tj-item` tool from
+`tj-agents/work-items`.
+
 ## CLI skills
 
 The shared `tj-agents` marketplace also publishes `cli@tj-agents`:
