@@ -1,6 +1,8 @@
 use std::ffi::OsString;
 use std::io;
 
+#[allow(unsafe_code)]
+pub mod agent;
 #[cfg(windows)]
 #[allow(unsafe_code)]
 mod windows;
