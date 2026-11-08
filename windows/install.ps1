@@ -49,6 +49,11 @@ function Install-Binaries {
         if ($Uninstall) { $arguments += '--uninstall' }
         & $python.Source @arguments
         if ($LASTEXITCODE -ne 0) { $script:status = 1 }
+        $worktrunkArguments = @('-m', 'tj_cli.worktrunk_install', '--bin-dir', $BinDir)
+        if ($Check) { $worktrunkArguments += '--check' }
+        if ($Uninstall) { $worktrunkArguments += '--uninstall' }
+        & $python.Source @worktrunkArguments
+        if ($LASTEXITCODE -ne 0) { $script:status = 1 }
         if (-not $Uninstall) {
             $handyArguments = @('-m', 'tj_cli.handy_install')
             if ($Check) { $handyArguments += '--check' }
