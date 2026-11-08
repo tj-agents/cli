@@ -289,6 +289,13 @@ fn tmux_pane_closes_after_codex_is_stopped_with_a_keypress() {
     let sandbox = sandbox();
     set_reply(&sandbox, "tj-item-prs.json", r#"{"prs":[{"url":"u","state":"merged"}],"all_merged":true}"#);
     let socket = sandbox.root.join("tmux.sock");
+    struct Server(PathBuf);
+    impl Drop for Server {
+        fn drop(&mut self) {
+            let _ = Command::new("tmux").arg("-S").arg(&self.0).arg("kill-server").output();
+        }
+    }
+    let _server = Server(socket.clone());
     let quote = |text: &str| format!("'{}'", text.replace('\'', r"'\''"));
     let script = std::iter::once(env!("CARGO_BIN_EXE_tj").to_owned())
         .chain(run_arguments(&sandbox, "pane", "codex", "keys", "10"))
@@ -304,7 +311,25 @@ fn tmux_pane_closes_after_codex_is_stopped_with_a_keypress() {
     wait_for_log(&sandbox, "raw");
     let deadline = Instant::now() + Duration::from_secs(60);
     while Command::new("tmux").arg("-S").arg(&socket).args(["has-session", "-t", "run"]).status().unwrap().success() {
-        assert!(Instant::now() < deadline, "the tmux pane did not close");
+        if Instant::now() > deadline {
+            let pane = Command::new("tmux").arg("-S").arg(&socket).args(["capture-pane", "-p", "-t", "run"]).output();
+            let processes = Command::new("ps").args(["-eo", "pid,ppid,pgid,tpgid,stat,args"]).output();
+            panic!(
+                "the tmux pane did not close
+pane:
+{}
+agent: {}
+store: {}
+item: {}
+processes:
+{}",
+                pane.map(|output| String::from_utf8_lossy(&output.stdout).into_owned()).unwrap_or_default(),
+                log(&sandbox, "dummy.log"),
+                log(&sandbox, "stubs/agent-store.log"),
+                log(&sandbox, "stubs/tj-item.log"),
+                processes.map(|output| String::from_utf8_lossy(&output.stdout).into_owned()).unwrap_or_default(),
+            );
+        }
         std::thread::sleep(Duration::from_millis(200));
     }
     assert!(log(&sandbox, "dummy.log").contains("graceful"), "the keypress did not reach the agent");
