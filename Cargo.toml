@@ -3,7 +3,7 @@ name = "tj-cli"
 version = "0.2.0"
 edition = "2024"
 rust-version = "1.85"
-description = "Fast cross-platform shell tools for agentic programming: cr (resume Claude/Codex sessions) and f (fuzzy cd)."
+description = "Fast cross-platform shell tools for agentic programming: cr (resume Claude/Codex sessions), f (fuzzy cd) and run (the tab-owning agent wrapper)."
 repository = "https://github.com/tj-agents/cli"
 publish = false
 
@@ -28,7 +28,10 @@ walkdir = "2"
 which = "8"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_System_Console", "Win32_System_JobObjects", "Win32_System_Threading"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_JobObjects", "Win32_System_Threading"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"
