@@ -19,5 +19,6 @@
     "category": "Productivity",
     "capabilities": [],
     "defaultPrompt": "Use the selected CLI operation."
-  }
+  },
+  "version": "c270bb158476"
 }
