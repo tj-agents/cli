@@ -1,11 +1,13 @@
 # tj
 
-Fast shell tools for agentic programming, on Windows and Linux. `tj` provides two everyday commands:
+Fast shell tools for agentic programming, on Windows and Linux. `tj` provides two everyday commands, plus
+`tj run`, the root process of every agent tab:
 
 | Command | What it does |
 | --- | --- |
 | `cr` | Search your Claude Code or Codex sessions by **anything said in them**, preview how each one ended, and press Enter to resume it in the folder it was started from. |
 | `f` | Fuzzy-jump to a project folder. `f core` goes straight to the best match; plain `f` opens a picker. |
+| `run` | Run an agent in its tab and close its work item out once it is finished: agent stopped, worktree removed, card Done, tab closed. |
 
 Any other `tj <name> ...` runs `tj-<name> ...` from PATH, so `tj item` runs the `tj-item` tool from
 `tj-agents/work-items`.
@@ -56,7 +58,9 @@ for everything else, so re-running it after a `git pull` is how you upgrade. It:
    with GitHub CLI and sudo required for a non-root installation. Other Linux distributions need Handy
    installed with `handy` on PATH before setup. CI and Linux sessions without a display report this step
    as not applicable; for SSH or WSL terminal use, run setup on the desktop host;
-4. adds one marked block to each shell startup file it finds (bash, zsh, fish, PowerShell):
+4. installs [worktrunk](https://github.com/max-sixty/worktrunk) 0.81.0 as `git-wt` next to `tj`, from a
+   SHA-256-pinned release archive. `tj run` removes worktrees with it;
+5. adds one marked block to each shell startup file it finds (bash, zsh, fish, PowerShell):
 
    ```bash
    # >>> tj-agents/cli >>>
@@ -142,12 +146,48 @@ into it. The functions live in `linux/tj.sh`, `linux/tj.fish` and `windows/tj.ps
 The Rust source in `src/` is shared by both platforms. Only the installers and the shell functions
 differ, so only those are split into `linux/` and `windows/`.
 
+## `tj run`: the agent tab's root process
+
+```text
+tj run --host claude|codex --title T --cwd WORKTREE --launch-id U [--item REF] [--parent HOST:ID] -- <agent argv>
+tj done              last step of work with no PR: close out after about 10 idle minutes
+tj done --cancel     new input arrived; withdraw that (a no-op outside tj run)
+tj closeout [REF]    close an item's sessions; with no REF, sweep tabs closed by hand or crashed wrappers
+```
+
+The launcher opens the tab (`wt.exe new-tab … tj run …` or `tmux new-window … tj run …`); `tj run` never
+opens one. It starts the agent as its child: in a Job Object on Windows, or in its own foreground process
+group on Linux, where the agent also dies with the wrapper. It registers the launch with `agent-store
+launch` and exports `TJ_RUN_PID`, `TJ_RUN_STARTED_AT`, `TJ_RUN_LAUNCH_ID` and `AGENT_CLI_TAB_TITLE` to the agent.
+
+It closes out when any of these happens:
+
+- every PR for the item has merged, according to `tj item prs` (checked every two minutes). A PR that closed
+  without merging keeps the tab open, and the wrapper reports it;
+- `tj done` was run and no new input has cancelled it for about 10 minutes;
+- `agent-store` marks the launch or its session `closing`, which is what `tj closeout REF` does.
+
+Before stopping anything, it proves that closeout loses nothing: the worktree must be clean, it must have no
+commits off the default branch unless the PRs merged, and worktrunk's `pre-remove` hooks must pass. If any of
+these fails, the session stays open and the wrapper prints the reason. Closeout then:
+
+1. asks the agent to exit: a console break or SIGINT for Claude, a Ctrl+C keypress for Codex (through
+   `tmux send-keys` on Linux);
+2. kills what is left after 10 s and waits until no process of the tree remains;
+3. runs `git-wt remove --foreground`, but only on a linked worktree, never a primary checkout;
+4. runs `tj item progress REF --state Done` and `agent-store end`;
+5. exits 0, so Windows Terminal (`closeOnExit` default) or tmux closes the tab.
+
+Helpers run hidden through `tj_hook` on Windows, and in their own session on Linux, so they never touch the
+agent's console. If the agent exits by itself, the wrapper ends the launch, keeps the worktree and exits
+with the agent's code.
+
 ## Configuration
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `TJ_F_ROOT` | `~/projects`, then `~/source/repos` | where `f` searches |
-| `TJ_CACHE_DIR` | OS cache folder + `/tj` | where `cr` keeps its index |
+| `TJ_CACHE_DIR` | OS cache folder + `/tj` | where `cr` keeps its index and `tj done` its marks |
 | `TJ_BIN_DIR` | `~/.local/bin` / `%LOCALAPPDATA%\Programs\tj` | where the installer puts `tj` and `tj_hook` |
 | `CLAUDE_CONFIG_DIR` | `~/.claude` | Claude Code's config folder, as Claude Code itself reads it |
 | `CODEX_HOME` | `~/.codex` | Codex's config folder, as Codex itself reads it |
@@ -251,6 +291,8 @@ run changes anything. A successful current `main` commit automatically publishes
 | `src/bin/tj_hook.rs` | the windowless executable entry point |
 | `src/process.rs` and `src/process/` | native command execution and Windows process containment |
 | `packages/tj-cli/src/tj_cli/process/` | the Python API for the native launcher |
+| `src/run/` | `tj run`, `tj done` and `tj closeout` |
+| `src/process/agent.rs` and `src/process/agent/` | the agent's job or process group, per-host stop, tree kill |
 | `src/f.rs` | folder walk, match scoring, picker |
 | `src/cr/parse.rs` | reading Claude and Codex transcripts into searchable text and turns |
 | `src/cr/render.rs` | the Tab preview pane |
