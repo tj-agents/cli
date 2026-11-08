@@ -303,7 +303,18 @@ fn tmux_pane_closes_after_codex_is_stopped_with_a_keypress() {
         .collect::<Vec<_>>()
         .join(" ");
     let mut tmux = Command::new("tmux");
-    tmux.arg("-S").arg(&socket).args(["-f", "/dev/null", "new-session", "-d", "-s", "run", "-x", "120", "-y", "40"]);
+    tmux.env("PATH", search_path(&sandbox)).arg("-S").arg(&socket).args([
+        "-f",
+        "/dev/null",
+        "new-session",
+        "-d",
+        "-s",
+        "run",
+        "-x",
+        "120",
+        "-y",
+        "40",
+    ]);
     for (name, value) in environment(&sandbox) {
         tmux.arg("-e").arg(format!("{name}={}", value.to_string_lossy()));
     }
