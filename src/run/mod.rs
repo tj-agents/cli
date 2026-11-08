@@ -1,6 +1,7 @@
 pub mod closeout;
 mod store;
 
+use std::collections::HashSet;
 use std::ffi::OsString;
 use std::path::PathBuf;
 use std::process::{Command, ExitCode};
@@ -104,14 +105,14 @@ struct Watch {
     poll: Duration,
     idle: Duration,
     next_poll: Instant,
-    reported: Option<String>,
+    reported: HashSet<String>,
 }
 
 impl Watch {
     fn report(&mut self, line: String) {
-        if self.reported.as_deref() != Some(line.as_str()) {
+        if !self.reported.contains(&line) {
             eprintln!("\r\ntj run: {line}\r");
-            self.reported = Some(line);
+            self.reported.insert(line);
         }
     }
 
@@ -206,7 +207,7 @@ pub fn run(args: Args) -> Result<ExitCode> {
         poll,
         idle: Duration::from_secs(args.idle_seconds),
         next_poll: Instant::now() + poll,
-        reported: None,
+        reported: HashSet::new(),
     };
     let removal = loop {
         if let Some(code) = agent.try_wait()? {
