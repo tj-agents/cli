@@ -7,6 +7,7 @@
   },
   "repository": "https://github.com/tj-agents/cli",
   "skills": "./skills/",
+  "hooks": "./hooks/claude.json",
   "keywords": [
     "cli",
     "terminal",
