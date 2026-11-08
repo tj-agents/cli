@@ -19,5 +19,6 @@
     "category": "Productivity",
     "capabilities": [],
     "defaultPrompt": "Use the selected CLI operation."
-  }
+  },
+  "version": "12efa29b6592"
 }
