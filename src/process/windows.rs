@@ -23,10 +23,10 @@ use windows_sys::Win32::System::Threading::{
     STARTF_USESTDHANDLES, STARTUPINFOEXW, UpdateProcThreadAttribute, WaitForSingleObject,
 };
 
-struct AttributeList(Vec<usize>);
+pub(super) struct AttributeList(pub(super) Vec<usize>);
 
 impl AttributeList {
-    fn new(count: u32) -> io::Result<Self> {
+    pub(super) fn new(count: u32) -> io::Result<Self> {
         unsafe {
             let mut size = 0;
             InitializeProcThreadAttributeList(null_mut(), count, 0, &mut size);
@@ -50,7 +50,7 @@ impl Drop for AttributeList {
     }
 }
 
-fn wide(value: &OsStr) -> io::Result<Vec<u16>> {
+pub(super) fn wide(value: &OsStr) -> io::Result<Vec<u16>> {
     let mut value: Vec<_> = value.encode_wide().collect();
     if value.contains(&0) {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "process argument contains a null character"));
@@ -59,7 +59,7 @@ fn wide(value: &OsStr) -> io::Result<Vec<u16>> {
     Ok(value)
 }
 
-fn command_line(arguments: &[OsString]) -> io::Result<Vec<u16>> {
+pub(super) fn command_line(arguments: &[OsString]) -> io::Result<Vec<u16>> {
     let mut command = Vec::new();
     for (index, argument) in arguments.iter().enumerate() {
         if index > 0 {
@@ -121,7 +121,7 @@ fn shell_command_line(arguments: &[OsString]) -> io::Result<Vec<u16>> {
     Ok(command)
 }
 
-fn inherited_handle(identifier: u32) -> io::Result<Option<OwnedHandle>> {
+pub(super) fn inherited_handle(identifier: u32) -> io::Result<Option<OwnedHandle>> {
     unsafe {
         let original = GetStdHandle(identifier);
         if original.is_null() || original == INVALID_HANDLE_VALUE {
@@ -136,11 +136,11 @@ fn inherited_handle(identifier: u32) -> io::Result<Option<OwnedHandle>> {
     }
 }
 
-fn raw(handle: &Option<OwnedHandle>) -> HANDLE {
+pub(super) fn raw(handle: &Option<OwnedHandle>) -> HANDLE {
     handle.as_ref().map_or(null_mut(), AsRawHandle::as_raw_handle)
 }
 
-fn is_batch(path: &std::path::Path) -> bool {
+pub(super) fn is_batch(path: &std::path::Path) -> bool {
     path.extension()
         .is_some_and(|extension| extension.eq_ignore_ascii_case("cmd") || extension.eq_ignore_ascii_case("bat"))
 }
