@@ -10,28 +10,16 @@ use std::time::{Duration, Instant, SystemTime};
 use anyhow::{Context, Result, bail};
 use tj_cli::process::agent::{self, Agent, Stop};
 
+use crate::host::Host;
 use crate::paths;
 use closeout::Prs;
 
-#[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
-pub enum Host {
-    Claude,
-    Codex,
+trait HostExt {
+    fn stop(self) -> (Stop, u32);
 }
 
-impl Host {
-    fn name(self) -> &'static str {
-        match self {
-            Self::Claude => "claude",
-            Self::Codex => "codex",
-        }
-    }
-
-    fn from_name(name: &str) -> Option<Self> {
-        [Self::Claude, Self::Codex].into_iter().find(|host| host.name() == name)
-    }
-
-    /// Claude exits cleanly on a console break or SIGINT; Codex has no handler and only quits on the key.
+/// Claude exits cleanly on a console break or SIGINT; Codex has no handler and only quits on the key.
+impl HostExt for Host {
     fn stop(self) -> (Stop, u32) {
         match self {
             Self::Claude => (Stop::Signal, 1),

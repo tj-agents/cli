@@ -5,6 +5,7 @@ use anyhow::{Context, Result, bail};
 use serde_json::Value;
 
 use super::{Launch, hidden};
+use crate::host::Host;
 
 pub(crate) fn call(arguments: &[&str]) -> Result<Value> {
     let output =
@@ -94,7 +95,7 @@ fn row(value: &Value) -> Option<Row> {
     Some(Row {
         launch: Launch {
             id: text(&value["launch_id"])?,
-            host: super::Host::from_name(value["host"].as_str()?)?,
+            host: Host::from_name(value["host"].as_str()?)?,
             title: text(&value["title"]).unwrap_or_default(),
             cwd: PathBuf::from(text(&value["worktree"]).or_else(|| text(&value["cwd"]))?),
             item: text(&value["item"]["ref"]),
