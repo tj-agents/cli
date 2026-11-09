@@ -8,6 +8,7 @@ from collections.abc import Callable, Mapping
 from typing import IO, Any, NamedTuple, Protocol
 
 from tj_cli.clipboard._errors import ClipboardError
+from tj_cli.clipboard._guard import refuse_real_backend_in_tests
 from tj_cli.clipboard._text import strip_trailing_whitespace
 
 
@@ -288,6 +289,7 @@ def copy_posix(
     """Copy `text` through the clipboard tool this environment selects, and verify it
     round-trips.
     """
+    refuse_real_backend_in_tests(run is subprocess.run)
     environ = os.environ if environ is None else environ
     tool = posix_clipboard_tool(environ, which)
     env = {**environ, **tool.env_overrides} if tool.env_overrides else None

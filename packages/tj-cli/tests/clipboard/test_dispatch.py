@@ -26,6 +26,10 @@ def test_copy_dispatches_to_the_posix_backend_off_windows(
     posix.assert_called_once()
 
 
+def _fake_windows_api() -> tuple[object, object]:
+    return object(), object()
+
+
 def test_copy_dispatches_to_the_windows_backend_on_windows(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -33,5 +37,5 @@ def test_copy_dispatches_to_the_windows_backend_on_windows(
     with mock.patch.object(
         clipboard_package, "copy_windows", return_value="Copied 5 chars."
     ) as windows:
-        assert copy("hello") == "Copied 5 chars."
-    windows.assert_called_once_with("hello")
+        assert copy("hello", windows_api=_fake_windows_api) == "Copied 5 chars."
+    windows.assert_called_once_with("hello", windows_api=_fake_windows_api)
