@@ -56,14 +56,7 @@ for everything else, so re-running it after a `git pull` is how you upgrade. It:
    `%LOCALAPPDATA%\Programs\tj` on Windows, adding that folder to your user PATH on Windows;
 2. checks for fzf. On Windows it installs fzf with winget if it's missing; on Linux it tells you
    the package to install;
-3. installs [Handy](https://github.com/cjpais/Handy) for voice dictation on desktop machines:
-   Windows uses winget; Linux desktops use a SHA-256-verified upstream package through APT or DNF,
-   with GitHub CLI and sudo required for a non-root installation. Other Linux distributions need Handy
-   installed with `handy` on PATH before setup. CI and Linux sessions without a display report this step
-   as not applicable; for SSH or WSL terminal use, run setup on the desktop host;
-4. installs [worktrunk](https://github.com/max-sixty/worktrunk) 0.81.0 as `git-wt` next to `tj`, from a
-   SHA-256-pinned release archive. `tj run` removes worktrees with it;
-5. adds one marked block to each shell startup file it finds (bash, zsh, fish, PowerShell):
+3. adds one marked block to each shell startup file it finds (bash, zsh, fish, PowerShell):
 
    ```bash
    # >>> tj-agents/cli >>>
@@ -76,12 +69,19 @@ for everything else, so re-running it after a `git pull` is how you upgrade. It:
 | Check what's set up, change nothing | `linux/install.sh --check` | `windows\install.ps1 -Check` |
 | Remove CLI binaries and shell wiring | `linux/install.sh --uninstall` | `windows\install.ps1 -Uninstall` |
 
+[worktrunk](https://github.com/max-sixty/worktrunk), installed as `git-wt` next to `tj` for `tj run` to
+remove worktrees with, and [Handy](https://github.com/cjpais/Handy) are installed and kept current by
+[Agent](https://github.com/tj-agents/agent#install)'s install and refresh, through `tj_cli.worktrunk_install`
+and `tj_cli.handy_install` at the `tj-cli` revision Agent pins.
+
 ### Voice dictation in Claude and Codex
 
-Handy is a desktop prerequisite provisioned by the existing installer. A clone alone does not install
-software. Setup checks for Handy on each run, installs it only when missing, and fails if installation
-fails. Check mode reports a missing application without installing or downloading anything. CLI uninstall
-preserves Handy and its models, as it preserves the shared fzf prerequisite.
+Handy is a desktop prerequisite provisioned by Agent's install and refresh. They check for Handy on each
+run, install it only when missing, and fail if installation fails: Windows uses winget; Linux desktops use a
+SHA-256-verified upstream package through APT or DNF, with GitHub CLI and sudo required for a non-root
+installation. Other Linux distributions need Handy installed with `handy` on PATH. CI and Linux sessions
+without a display report the step as not applicable; for SSH or WSL terminal use, install on the desktop
+host. Install `--check` reports a missing application without installing or downloading anything.
 
 Open Handy once, download a speech model, select your microphone and hold-to-talk shortcut, and enable
 launch at login in Handy's settings. Use `Shift+Insert` as the paste method for Windows terminals, or the

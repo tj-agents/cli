@@ -75,21 +75,6 @@ install_binaries() {
     if ! PYTHONPATH="$repo/packages/tj-cli/src${PYTHONPATH:+:$PYTHONPATH}" python3 "${arguments[@]}"; then
         status=1
     fi
-    local worktrunk_arguments=(-m tj_cli.worktrunk_install --bin-dir "$bin_dir")
-    case "$mode" in
-        check) worktrunk_arguments+=(--check) ;;
-        uninstall) worktrunk_arguments+=(--uninstall) ;;
-    esac
-    if ! PYTHONPATH="$repo/packages/tj-cli/src${PYTHONPATH:+:$PYTHONPATH}" python3 "${worktrunk_arguments[@]}"; then
-        status=1
-    fi
-    if [ "$mode" != "uninstall" ]; then
-        local handy_arguments=(-m tj_cli.handy_install)
-        [ "$mode" = "check" ] && handy_arguments+=(--check)
-        if ! PYTHONPATH="$repo/packages/tj-cli/src${PYTHONPATH:+:$PYTHONPATH}" python3 "${handy_arguments[@]}"; then
-            status=1
-        fi
-    fi
 }
 
 check_deps() {
