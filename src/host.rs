@@ -1,5 +1,5 @@
-//! Shared with agent's Python `Host` through `packages/tj-cli/src/tj_cli/hosts.json`: both sides
-//! assert their enum against that one file, so it is the single source of truth for the contract.
+//! Agent's Python `Host` and this enum both assert against `packages/tj-cli/src/tj_cli/hosts.json`;
+//! change all three together.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, clap::ValueEnum)]
 pub(crate) enum Host {

@@ -14,12 +14,8 @@ use crate::host::Host;
 use crate::paths;
 use closeout::Prs;
 
-trait HostExt {
-    fn stop(self) -> (Stop, u32);
-}
-
-/// Claude exits cleanly on a console break or SIGINT; Codex has no handler and only quits on the key.
-impl HostExt for Host {
+impl Host {
+    /// Claude exits cleanly on a console break or SIGINT; Codex has no handler and only quits on the key.
     fn stop(self) -> (Stop, u32) {
         match self {
             Self::Claude => (Stop::Signal, 1),
