@@ -38,6 +38,11 @@ impl Agent {
         self.0.stop(stop)
     }
 
+    /// CPU time the agent's own process has used; a host redraws its spinner while a turn runs.
+    pub fn cpu_time(&self) -> io::Result<Duration> {
+        self.0.cpu_time()
+    }
+
     pub fn kill_tree(&mut self, timeout: Duration) -> io::Result<()> {
         let deadline = Instant::now() + timeout;
         loop {

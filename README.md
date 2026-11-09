@@ -152,9 +152,10 @@ differ, so only those are split into `linux/` and `windows/`.
 ## `tj run`: the agent tab's root process
 
 ```text
-tj run --host claude|codex --title T --cwd WORKTREE --launch-id U [--item REF] [--parent HOST:ID] -- <agent argv>
+tj run [--host claude|codex] [--title T] [--cwd WORKTREE] [--launch-id U] [--item REF] [--parent HOST:ID] -- <agent argv>
 tj done              last step of work with no PR: close out after about 10 idle minutes
 tj done --cancel     new input arrived; withdraw that (a no-op outside tj run)
+tj restart [--reason R]  restart this tab's agent in place once it is idle, resuming the same conversation
 tj closeout [REF]    close an item's sessions; with no REF, sweep tabs closed by hand or crashed wrappers
 ```
 
@@ -162,6 +163,22 @@ The launcher opens the tab (`wt.exe new-tab … tj run …` or `tmux new-window 
 opens one. It starts the agent as its child: in a Job Object on Windows, or in its own foreground process
 group on Linux, where the agent also dies with the wrapper. It registers the launch with `agent-store
 launch` and exports `TJ_RUN_PID`, `TJ_RUN_STARTED_AT`, `TJ_RUN_LAUNCH_ID` and `AGENT_CLI_TAB_TITLE` to the agent.
+
+Only the agent's command line is required, so a shell function can run a typed `claude` or `codex` under it:
+the host defaults to the executable's name, the folder to the current one, the title to the repository or
+worktree folder's name (suffixed `-2`, `-3`… while an open launch holds it) and the launch id to a random one.
+The executable must be the native `claude` or `codex`, not an npm `.cmd` shim.
+
+`tj restart`, run inside the session (Agent's stale-plugin hook does), asks the wrapper to restart the agent
+so it loads the plugins installed since it started. The wrapper waits until the agent's own process has used
+under 5% CPU across 30 s from when it noticed the request: a working host keeps redrawing its spinner, one
+waiting at its prompt does not. It then stops the agent the way closeout does, and starts it again in the
+same tab with the same environment as `claude --resume <id>` or `codex resume <id>`, keeping the original
+options and dropping the prompt and any earlier session choice. The id is the session `agent-store show
+--launch-id` binds to the launch; the launch row is kept, and the resumed session re-registers against it.
+With no bound session the agent keeps running and the wrapper says so once. A resume that fails to start, or
+exits with an error, leaves the tab open with the reason. `tj restart` fails outside `tj run`, and for a
+`--reason` this tab already restarted for, so a restart that did not help is not repeated.
 
 It closes out when any of these happens:
 
@@ -220,7 +237,7 @@ the subscription expired. A Claude child reports to a Codex parent with `tj mess
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `TJ_F_ROOT` | `~/projects`, then `~/source/repos` | where `f` searches |
-| `TJ_CACHE_DIR` | OS cache folder + `/tj` | where `cr` keeps its index, `tj done` its marks and each Claude relay its endpoint |
+| `TJ_CACHE_DIR` | OS cache folder + `/tj` | where `cr` keeps its index, `tj done` and `tj restart` their marks and each Claude relay its endpoint |
 | `TJ_BIN_DIR` | `~/.local/bin` / `%LOCALAPPDATA%\Programs\tj` | where the installer puts `tj` and `tj_hook` |
 | `CLAUDE_CONFIG_DIR` | `~/.claude` | Claude Code's config folder, as Claude Code itself reads it |
 | `CODEX_HOME` | `~/.codex` | Codex's config folder, as Codex itself reads it |
@@ -322,7 +339,7 @@ run changes anything. A successful current `main` commit automatically publishes
 | `src/bin/tj_hook.rs` | the windowless executable entry point |
 | `src/process.rs` and `src/process/` | native command execution and Windows process containment |
 | `packages/tj-cli/src/tj_cli/process/` | the Python API for the native launcher |
-| `src/run/` | `tj run`, `tj done` and `tj closeout` |
+| `src/run/` | `tj run`, `tj done`, `tj restart` and `tj closeout` |
 | `src/message.rs`, `src/bridge.rs`, `src/subscribe.rs` | `tj message`, the Claude session relay and `tj subscribe` |
 | `src/process/agent.rs` and `src/process/agent/` | the agent's job or process group, per-host stop, tree kill |
 | `src/f.rs` | folder walk, match scoring, picker |

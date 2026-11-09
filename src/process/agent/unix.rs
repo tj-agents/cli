@@ -73,6 +73,15 @@ impl Agent {
         }
     }
 
+    pub fn cpu_time(&self) -> io::Result<Duration> {
+        let fields = stat_fields(self.pid).ok_or_else(|| io::Error::other("the agent's /proc stat is unreadable"))?;
+        let ticks = |index: usize| fields.get(index).and_then(|field| field.parse::<u64>().ok());
+        let (Some(user), Some(system), Some(per_second)) = (ticks(11), ticks(12), hertz()) else {
+            return Err(io::Error::other("the agent's /proc stat has no CPU times"));
+        };
+        Ok(Duration::from_millis((user + system) * 1000 / per_second))
+    }
+
     pub fn kill_tree(&mut self) -> io::Result<bool> {
         let group_alive = unsafe { libc::killpg(self.pid, libc::SIGKILL) } == 0;
         for pid in adopted_children() {
@@ -101,7 +110,7 @@ fn adopted_children() -> Vec<libc::pid_t> {
         .collect()
 }
 
-/// `/proc/<pid>/stat` from the state field on: [state, ppid, pgrp, …, starttime at 19].
+/// `/proc/<pid>/stat` from the state field on: [state, ppid, pgrp, …, utime at 11, stime at 12, …, starttime at 19].
 fn stat_fields(pid: libc::pid_t) -> Option<Vec<String>> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     let rest = &stat[stat.rfind(')')? + 2..];
@@ -127,8 +136,11 @@ pub fn started_at(pid: u32) -> Option<SystemTime> {
         .ok()?
         .lines()
         .find_map(|line| line.strip_prefix("btime ")?.trim().parse().ok())?;
-    let hertz = u64::try_from(unsafe { libc::sysconf(libc::_SC_CLK_TCK) }).ok().filter(|hertz| *hertz > 0)?;
-    Some(UNIX_EPOCH + Duration::from_secs(boot) + Duration::from_millis(ticks * 1000 / hertz))
+    Some(UNIX_EPOCH + Duration::from_secs(boot) + Duration::from_millis(ticks * 1000 / hertz()?))
+}
+
+fn hertz() -> Option<u64> {
+    u64::try_from(unsafe { libc::sysconf(libc::_SC_CLK_TCK) }).ok().filter(|hertz| *hertz > 0)
 }
 
 pub fn hidden(program: &str, _hook: &Path) -> Command {
