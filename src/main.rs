@@ -34,6 +34,8 @@ enum Command {
     Run(run::Args),
     /// Mark this tab's work done; `tj run` closes it out after an idle grace
     Done(run::DoneArgs),
+    /// Ask `tj run` to restart this tab's agent once it is idle, resuming the same conversation
+    Restart(run::restart::Args),
     /// Close out a work item's sessions, or sweep launches whose tab is gone
     Closeout(run::closeout::Args),
     /// Send a message to another Claude or Codex session, addressed by its tab title
@@ -59,6 +61,7 @@ fn main() -> ExitCode {
         Command::Init(args) => init::run(args),
         Command::Run(args) => run::run(args),
         Command::Done(args) => run::done(args),
+        Command::Restart(args) => run::restart::run(args),
         Command::Closeout(args) => run::closeout::run(args),
         Command::Message(args) => message::run(args),
         Command::Subscribe(args) => subscribe::run(args),

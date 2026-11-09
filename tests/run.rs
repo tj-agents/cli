@@ -4,6 +4,10 @@ use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
 const ITEM: &str = "github:github.com/acme/app:1";
+const BOUND: &str =
+    r#"{"ok":true,"data":{"launch":{"state":"active"},"session":{"native_id":"sess-1","state":"active"}}}"#;
+const CLOSING: &str =
+    r#"{"ok":true,"data":{"launch":{"state":"closing"},"session":{"native_id":"sess-1","state":"active"}}}"#;
 
 struct Sandbox {
     _directory: tempfile::TempDir,
@@ -98,8 +102,12 @@ fn environment(sandbox: &Sandbox) -> Vec<(&'static str, std::ffi::OsString)> {
     ]
 }
 
+fn fixture() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests").join("fixtures").join("dummy_agent.py")
+}
+
 fn run_arguments(sandbox: &Sandbox, launch: &str, host: &str, mode: &str, grace: &str) -> Vec<String> {
-    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests").join("fixtures").join("dummy_agent.py");
+    let fixture = fixture();
     [
         "run",
         "--host",
@@ -118,6 +126,8 @@ fn run_arguments(sandbox: &Sandbox, launch: &str, host: &str, mode: &str, grace:
         "2",
         "--grace-seconds",
         grace,
+        "--quiet-seconds",
+        "2",
         "--",
         python(),
         &fixture.to_string_lossy(),
@@ -128,9 +138,16 @@ fn run_arguments(sandbox: &Sandbox, launch: &str, host: &str, mode: &str, grace:
 }
 
 fn start(sandbox: &Sandbox, launch: &str, host: &str, mode: &str, grace: &str) -> Child {
+    let child = spawn(sandbox, &run_arguments(sandbox, launch, host, mode, grace), &sandbox.root);
+    wait_for_log(sandbox, "agent ");
+    child
+}
+
+fn spawn(sandbox: &Sandbox, arguments: &[String], cwd: &Path) -> Child {
     let mut command = Command::new(env!("CARGO_BIN_EXE_tj"));
     command
-        .args(run_arguments(sandbox, launch, host, mode, grace))
+        .args(arguments)
+        .current_dir(cwd)
         .envs(environment(sandbox))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -141,9 +158,7 @@ fn start(sandbox: &Sandbox, launch: &str, host: &str, mode: &str, grace: &str) -
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         command.creation_flags(CREATE_NO_WINDOW);
     }
-    let child = command.spawn().unwrap();
-    wait_for_log(sandbox, "agent ");
-    child
+    command.spawn().unwrap()
 }
 
 fn log(sandbox: &Sandbox, name: &str) -> String {
@@ -183,6 +198,15 @@ fn done(sandbox: &Sandbox, launch: &str, cancel: bool) {
         command.arg("--cancel");
     }
     assert!(command.output().unwrap().status.success());
+}
+
+fn request_restart(sandbox: &Sandbox, launch: &str, reason: &str) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_tj"))
+        .args(["restart", "--reason", reason])
+        .env("TJ_RUN_LAUNCH_ID", launch)
+        .env("TJ_CACHE_DIR", sandbox.root.join("cache"))
+        .output()
+        .unwrap()
 }
 
 fn set_reply(sandbox: &Sandbox, file: &str, json: &str) {
@@ -388,4 +412,107 @@ fn done_outside_tj_run_fails_but_cancel_is_a_no_op() {
     let (succeeded, stderr) = run(&["done"]);
     assert!(!succeeded && stderr.contains("only works inside a tj run session"));
     assert!(run(&["done", "--cancel"]).0);
+}
+
+fn with_prompt(sandbox: &Sandbox, launch: &str, mode: &str) -> Vec<String> {
+    let mut arguments = run_arguments(sandbox, launch, "claude", mode, "10");
+    arguments.extend(["--model", "m", "the prompt"].map(str::to_owned));
+    arguments
+}
+
+#[test]
+fn a_restart_on_an_idle_agent_resumes_the_bound_session_in_the_same_launch() {
+    let sandbox = sandbox();
+    set_reply(&sandbox, "agent-store-show.json", BOUND);
+    let mut child = spawn(&sandbox, &with_prompt(&sandbox, "again", "signal"), &sandbox.root);
+    wait_for_log(&sandbox, "agent ");
+    assert!(request_restart(&sandbox, "again", "plugins b").status.success());
+    wait_for_log(&sandbox, "--resume sess-1");
+    still_running(&mut child, Duration::from_secs(1));
+    let agent = log(&sandbox, "dummy.log");
+    assert!(agent.contains("graceful"), "the agent was not stopped gracefully: {agent}");
+    assert_eq!(agent.matches("agent again Test tab").count(), 2, "{agent}");
+    assert!(agent.lines().any(|line| line == "args --model m the prompt"), "{agent}");
+    assert!(agent.lines().any(|line| line == "args --model m --resume sess-1"), "{agent}");
+    let store = log(&sandbox, "stubs/agent-store.log");
+    assert_eq!(store.matches("launch --launch-id again ").count(), 1, "{store}");
+    assert!(!store.contains("end --launch-id again"), "{store}");
+    let repeated = request_restart(&sandbox, "again", "plugins b");
+    assert!(!repeated.status.success());
+    assert!(String::from_utf8_lossy(&repeated.stderr).contains("already restarted"));
+    set_reply(&sandbox, "agent-store-show.json", CLOSING);
+    let output = finish(child, Duration::from_secs(60));
+    assert_closed_out(&sandbox, &output, "again");
+}
+
+#[test]
+fn a_restart_waits_while_the_agent_is_busy() {
+    let sandbox = sandbox();
+    set_reply(&sandbox, "agent-store-show.json", BOUND);
+    let mut child = spawn(&sandbox, &with_prompt(&sandbox, "busy", "busy"), &sandbox.root);
+    wait_for_log(&sandbox, "agent ");
+    assert!(request_restart(&sandbox, "busy", "plugins b").status.success());
+    still_running(&mut child, Duration::from_secs(6));
+    let agent = log(&sandbox, "dummy.log");
+    assert!(!agent.contains("--resume") && !agent.contains("graceful"), "restarted while busy: {agent}");
+    std::fs::write(sandbox.root.join("dummy.log.idle"), "").unwrap();
+    wait_for_log(&sandbox, "--resume sess-1");
+    set_reply(&sandbox, "agent-store-show.json", CLOSING);
+    let output = finish(child, Duration::from_secs(60));
+    assert_closed_out(&sandbox, &output, "busy");
+}
+
+#[test]
+fn a_restart_without_a_bound_session_keeps_the_agent_and_says_so_once() {
+    let sandbox = sandbox();
+    set_reply(&sandbox, "agent-store-show.json", r#"{"ok":true,"data":{"launch":{"state":"active"},"session":null}}"#);
+    let mut child = spawn(&sandbox, &with_prompt(&sandbox, "lonely", "signal"), &sandbox.root);
+    wait_for_log(&sandbox, "agent ");
+    assert!(request_restart(&sandbox, "lonely", "plugins b").status.success());
+    still_running(&mut child, Duration::from_secs(5));
+    assert!(request_restart(&sandbox, "lonely", "plugins b").status.success());
+    still_running(&mut child, Duration::from_secs(5));
+    set_reply(&sandbox, "agent-store-show.json", r#"{"ok":true,"data":{"launch":{"state":"closing"},"session":null}}"#);
+    let output = finish(child, Duration::from_secs(60));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(stderr.matches("not restarting: no claude session is bound to launch lonely").count(), 1, "{stderr}");
+    assert_eq!(log(&sandbox, "dummy.log").matches("agent lonely").count(), 1);
+    assert_closed_out(&sandbox, &output, "lonely");
+}
+
+#[test]
+fn restart_outside_tj_run_fails() {
+    let output = Command::new(env!("CARGO_BIN_EXE_tj")).arg("restart").env_remove("TJ_RUN_LAUNCH_ID").output().unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("only works inside a tj run session"));
+}
+
+#[test]
+fn a_shell_started_session_needs_only_the_agent_command() {
+    let sandbox = sandbox();
+    set_reply(
+        &sandbox,
+        "agent-store-launches.json",
+        r#"{"ok":true,"data":{"launches":[{"launch_id":"x","host":"claude","title":"Feature-1","worktree":"w","state":"active","wrapper":{"pid":1,"started_at":"2026-01-01T00:00:00Z"}}]}}"#,
+    );
+    let fixture = fixture().to_string_lossy().into_owned();
+    let arguments = ["run", "--host", "claude", "--", python(), &fixture, "exit"].map(str::to_owned);
+    let output = finish(spawn(&sandbox, &arguments, &sandbox.worktree), Duration::from_secs(60));
+    assert_eq!(output.status.code(), Some(3), "stderr: {}", String::from_utf8_lossy(&output.stderr));
+    let agent = log(&sandbox, "dummy.log");
+    let line = agent.lines().find(|line| line.starts_with("agent ")).unwrap();
+    let mut fields = line.splitn(4, ' ').skip(1);
+    let (id, title, cwd) = (fields.next().unwrap(), fields.next().unwrap(), fields.next().unwrap());
+    assert!(id.len() == 32 && id.chars().all(|c| c.is_ascii_hexdigit()), "{id}");
+    assert_eq!(title, "Feature-1-2");
+    assert_eq!(std::fs::canonicalize(cwd).unwrap(), std::fs::canonicalize(&sandbox.worktree).unwrap());
+    assert!(
+        log(&sandbox, "stubs/agent-store.log")
+            .contains(&format!("launch --launch-id {id} --host claude --title Feature-1-2"))
+    );
+
+    let unknown = ["run", "--", python(), &fixture, "exit"].map(str::to_owned);
+    let output = finish(spawn(&sandbox, &unknown, &sandbox.worktree), Duration::from_secs(60));
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("pass --host"));
 }

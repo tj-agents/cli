@@ -46,6 +46,7 @@ def main() -> None:
         while True:
             time.sleep(1)
     note(f"agent {os.environ['TJ_RUN_LAUNCH_ID']} {os.environ['AGENT_CLI_TAB_TITLE']} {os.getcwd()}")
+    note(f"args {' '.join(sys.argv[2:])}")
     subprocess.Popen([sys.executable, __file__, "grandchild"])
     if mode == "exit":
         time.sleep(1)
@@ -54,7 +55,9 @@ def main() -> None:
         read_keys()
     stops = [signal.SIGBREAK, signal.SIGINT] if WINDOWS else [signal.SIGINT, signal.SIGTERM]
     for stop in stops:
-        signal.signal(stop, graceful if mode == "signal" else signal.SIG_IGN)
+        signal.signal(stop, graceful if mode in ("signal", "busy") else signal.SIG_IGN)
+    while mode == "busy" and not os.path.exists(os.environ["DUMMY_LOG"] + ".idle"):
+        pass
     while True:
         time.sleep(0.1)
 
