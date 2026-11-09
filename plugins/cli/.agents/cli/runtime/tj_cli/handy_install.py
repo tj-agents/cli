@@ -62,29 +62,41 @@ def _run(arguments: list[str]) -> subprocess.CompletedProcess[str]:
     )
 
 
+def _vulkan_runtime_installed() -> bool:
+    system_root = os.environ.get("SYSTEMROOT", r"C:\Windows")
+    return (Path(system_root) / "System32" / "vulkan-1.dll").is_file()
+
+
+def _winget_install(winget: str, package: str, *scope: str) -> None:
+    _run(
+        [
+            winget,
+            "install",
+            "--id",
+            package,
+            "--exact",
+            "--source",
+            "winget",
+            *scope,
+            "--silent",
+            "--disable-interactivity",
+            "--accept-source-agreements",
+            "--accept-package-agreements",
+            "--skip-dependencies",
+        ]
+    )
+
+
 def _install_windows() -> None:
     winget = shutil.which("winget")
     if winget is None:
         raise HandyInstallError(
             "install Windows App Installer (winget), then rerun setup"
         )
-    _run(
-        [
-            winget,
-            "install",
-            "--id",
-            "cjpais.Handy",
-            "--exact",
-            "--source",
-            "winget",
-            "--scope",
-            "user",
-            "--silent",
-            "--disable-interactivity",
-            "--accept-source-agreements",
-            "--accept-package-agreements",
-        ]
-    )
+    # winget filters dependencies by --scope; VulkanRT has no user-scope installer.
+    if not _vulkan_runtime_installed():
+        _winget_install(winget, "KhronosGroup.VulkanRT")
+    _winget_install(winget, "cjpais.Handy", "--scope", "user")
 
 
 def _linux_package() -> tuple[str, str]:
