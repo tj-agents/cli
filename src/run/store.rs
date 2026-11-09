@@ -5,6 +5,7 @@ use anyhow::{Context, Result, bail};
 use serde_json::Value;
 
 use super::{Launch, hidden};
+use crate::host::Host;
 
 pub(crate) fn call(arguments: &[&str]) -> Result<Value> {
     let output =
@@ -48,6 +49,10 @@ pub fn launch(launch: &Launch, parent: Option<&str>, wrapper_pid: u32, wrapper_s
         arguments.extend(["--terminal-kind", kind, "--terminal-id", id]);
     }
     call(&arguments).map(drop)
+}
+
+pub fn recorded(launch_id: &str) -> bool {
+    call(&["show", "--launch-id", launch_id]).is_ok()
 }
 
 fn terminal() -> Option<(&'static str, String)> {
@@ -94,7 +99,7 @@ fn row(value: &Value) -> Option<Row> {
     Some(Row {
         launch: Launch {
             id: text(&value["launch_id"])?,
-            host: super::Host::from_name(value["host"].as_str()?)?,
+            host: Host::from_name(value["host"].as_str()?)?,
             title: text(&value["title"]).unwrap_or_default(),
             cwd: PathBuf::from(text(&value["worktree"]).or_else(|| text(&value["cwd"]))?),
             item: text(&value["item"]["ref"]),
