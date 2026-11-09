@@ -280,9 +280,7 @@ subprocess checks must enforce the shared path.
 
 The repository also owns the `tj-cli` Python distribution under `packages/tj-cli/`.
 Its regular package groups reusable mechanics by capability. `tj_cli.paths` exposes literal executable-search
-PATH operations; `tj_cli.processes` holds exact process identities; `tj_cli.close` and `tj_cli.closeout` expose
-explicit terminal and worktree operations for Agent. Agent supplies its lifecycle guards to `close` and
-`closeout`, which run them immediately before terminal and worktree mutation. Agent and Personal consume the
+PATH operations; `tj_cli.processes` holds exact process identities. Agent and Personal consume the
 public API:
 
 ```python
