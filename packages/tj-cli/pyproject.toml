@@ -10,4 +10,10 @@ requires = ["uv_build>=0.13.1,<0.14"]
 build-backend = "uv_build"
 
 [tool.uv]
-cache-keys = [{ file = "pyproject.toml" }, { file = "src/**/*.py" }, { file = "src/**/*.ps1" }, { file = "src/**/py.typed" }]
+cache-keys = [
+  { file = "pyproject.toml" },
+  { file = "src/**/*.py" },
+  { file = "src/**/*.ps1" },
+  { file = "src/**/*.json" },
+  { file = "src/**/py.typed" },
+]
