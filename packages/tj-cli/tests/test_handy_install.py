@@ -58,10 +58,10 @@ def isolated_desktop(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setenv("SYSTEMROOT", str(tmp_path / "windows"))
 
 
-def _vulkan_runtime() -> None:
-    library = Path(os.environ["SYSTEMROOT"]) / "System32" / "vulkan-1.dll"
-    library.parent.mkdir(parents=True)
-    library.write_bytes(b"vulkan")
+def _system_library(name: str) -> None:
+    library = Path(os.environ["SYSTEMROOT"]) / "System32" / name
+    library.parent.mkdir(parents=True, exist_ok=True)
+    library.write_bytes(b"runtime")
 
 
 def _windows_installation() -> Path:
@@ -109,14 +109,22 @@ def test_registered_windows_custom_location_is_recognized(
     assert handy_install.main(["--check"]) == 1
 
 
-@pytest.mark.parametrize("vulkan_installed", [True, False])
+RUNTIMES = {
+    "KhronosGroup.VulkanRT": "vulkan-1.dll",
+    "Microsoft.VCRedist.2015+.x64": "vcruntime140.dll",
+}
+
+
+@pytest.mark.parametrize(
+    "present", [(), ("vulkan-1.dll",), ("vcruntime140.dll",), tuple(RUNTIMES.values())]
+)
 def test_windows_installs_once_and_verifies_the_result(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
-    vulkan_installed: bool,
+    present: tuple[str, ...],
 ) -> None:
-    if vulkan_installed:
-        _vulkan_runtime()
+    for library in present:
+        _system_library(library)
     commands: list[list[str]] = []
     monkeypatch.setattr(
         shutil, "which", lambda name: "winget.exe" if name == "winget" else None
@@ -124,8 +132,8 @@ def test_windows_installs_once_and_verifies_the_result(
 
     def run(arguments: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
         commands.append(arguments)
-        if arguments[3] == "KhronosGroup.VulkanRT":
-            _vulkan_runtime()
+        if arguments[3] in RUNTIMES:
+            _system_library(RUNTIMES[arguments[3]])
         else:
             _windows_installation()
         return subprocess.CompletedProcess(arguments, 0, "", "")
@@ -133,12 +141,11 @@ def test_windows_installs_once_and_verifies_the_result(
     monkeypatch.setattr(subprocess, "run", run)
     assert handy_install.main([]) == 0
     assert handy_install.main([]) == 0
-    packages = [arguments[3] for arguments in commands]
-    if vulkan_installed:
-        assert packages == ["cjpais.Handy"]
-    else:
-        assert packages == ["KhronosGroup.VulkanRT", "cjpais.Handy"]
-        assert "--scope" not in commands[0]
+    missing = [
+        package for package, library in RUNTIMES.items() if library not in present
+    ]
+    assert [arguments[3] for arguments in commands] == [*missing, "cjpais.Handy"]
+    assert all("--scope" not in arguments for arguments in commands[:-1])
     handy = commands[-1]
     assert handy[:5] == ["winget.exe", "install", "--id", "cjpais.Handy", "--exact"]
     assert handy[handy.index("--scope") + 1] == "user"

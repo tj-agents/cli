@@ -62,9 +62,15 @@ def _run(arguments: list[str]) -> subprocess.CompletedProcess[str]:
     )
 
 
-def _vulkan_runtime_installed() -> bool:
+WINDOWS_RUNTIMES = (
+    ("KhronosGroup.VulkanRT", "vulkan-1.dll"),
+    ("Microsoft.VCRedist.2015+.x64", "vcruntime140.dll"),
+)
+
+
+def _system_library_installed(library: str) -> bool:
     system_root = os.environ.get("SYSTEMROOT", r"C:\Windows")
-    return (Path(system_root) / "System32" / "vulkan-1.dll").is_file()
+    return (Path(system_root) / "System32" / library).is_file()
 
 
 def _winget_install(winget: str, package: str, *scope: str) -> None:
@@ -93,9 +99,10 @@ def _install_windows() -> None:
         raise HandyInstallError(
             "install Windows App Installer (winget), then rerun setup"
         )
-    # winget filters dependencies by --scope; VulkanRT has no user-scope installer.
-    if not _vulkan_runtime_installed():
-        _winget_install(winget, "KhronosGroup.VulkanRT")
+    # winget filters dependencies by --scope; these runtimes are machine-scope only.
+    for package, library in WINDOWS_RUNTIMES:
+        if not _system_library_installed(library):
+            _winget_install(winget, package)
     _winget_install(winget, "cjpais.Handy", "--scope", "user")
 
 
