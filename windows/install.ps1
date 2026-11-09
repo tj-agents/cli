@@ -83,9 +83,25 @@ function Test-Fzf {
     else { Say missing 'fzf - install it with: winget install junegunn.fzf'; $script:status = 1 }
 }
 
+function Install-Zoxide {
+    if ($Uninstall) { return }
+    if (Get-Command zoxide -CommandType Application -ErrorAction SilentlyContinue) {
+        Say ok (& zoxide --version)
+        return
+    }
+    if ($Check) { Say missing 'zoxide'; $script:status = 1; return }
+    if (Get-Command winget -ErrorAction SilentlyContinue) {
+        & winget install --id ajeetdsouza.zoxide --exact --silent --accept-source-agreements --accept-package-agreements
+        if ($LASTEXITCODE -ne 0) { Say missing 'zoxide (winget installation failed)'; $script:status = 1; return }
+        Say installed 'zoxide (via winget - open a new terminal for it to be on PATH)'
+    }
+    else { Say missing 'zoxide - install it with: winget install ajeetdsouza.zoxide'; $script:status = 1 }
+}
+
 Install-Binaries
 if ($IsWindows -or $PSVersionTable.PSEdition -eq 'Desktop') { Set-UserPath }
 Test-Fzf
+Install-Zoxide
 
 # Both Windows PowerShell 5.1 and PowerShell 7 read their own profile; wire whichever exist or are installed.
 $documents = [Environment]::GetFolderPath('MyDocuments')

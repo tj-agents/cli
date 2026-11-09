@@ -9,6 +9,7 @@ two everyday commands, plus `tj run`, the root process of every agent tab:
 | --- | --- |
 | `cr` | Search your Claude Code or Codex sessions by **anything said in them**, preview how each one ended, and press Enter to resume it in the folder it was started from. |
 | `f` | Fuzzy-jump to a project folder. `f core` goes straight to the best match; plain `f` opens a picker. |
+| `cd` / `cdi` | Use [zoxide](https://github.com/ajeetdsouza/zoxide) to jump to a previously visited directory by name, or choose one interactively with `cdi`. |
 | `run` | Run an agent in its tab and close its work item out once it is finished: agent stopped, worktree removed, card Done, tab closed. |
 | `message` | Send another Claude or Codex session a message, addressed by its tab title, with the same behaviour from either host. |
 
@@ -29,7 +30,8 @@ updates so the console-to-tab association can be verified.
 
 ## Install
 
-You need Python 3.12 or newer, [fzf](https://github.com/junegunn/fzf) 0.54 or newer, and either a Rust
+You need Python 3.12 or newer, [fzf](https://github.com/junegunn/fzf) 0.54 or newer,
+[zoxide](https://github.com/ajeetdsouza/zoxide), and either a Rust
 toolchain (to build from this checkout) or the [GitHub CLI](https://cli.github.com) (to download a verified
 prebuilt release).
 
@@ -54,8 +56,8 @@ for everything else, so re-running it after a `git pull` is how you upgrade. It:
 
 1. builds `tj` and `tj_hook` (or downloads the latest verified release) and puts them in `~/.local/bin` on Linux or
    `%LOCALAPPDATA%\Programs\tj` on Windows, adding that folder to your user PATH on Windows;
-2. checks for fzf. On Windows it installs fzf with winget if it's missing; on Linux it tells you
-   the package to install;
+2. checks for fzf and zoxide. On Windows it installs missing tools with winget; on Linux it tells you
+   the packages to install (`pkexec pacman -S --needed fzf zoxide` on Arch);
 3. adds one marked block to each shell startup file it finds (bash, zsh, fish, PowerShell):
 
    ```bash
@@ -63,6 +65,12 @@ for everything else, so re-running it after a `git pull` is how you upgrade. It:
    command -v tj >/dev/null 2>&1 && eval "$(tj init bash)"
    # <<< tj-agents/cli <<<
    ```
+
+`tj init` owns zoxide initialization for Bash, Zsh, Fish and PowerShell, using `--cmd cd`.
+Keep only the tj-agents block in your shell profile; remove separate `zoxide init` lines.
+Normal `cd path` still works; after visiting a directory, `cd name` can find it from elsewhere and
+`cdi name` opens an interactive picker. `f` searches the projects tree, including directories you have
+never visited. Uninstall removes the CLI wiring and binaries, leaving zoxide and its history installed.
 
 | | Linux | Windows |
 | --- | --- | --- |
