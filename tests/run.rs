@@ -259,6 +259,30 @@ fn an_agent_ignoring_the_stop_is_killed_with_its_tree() {
 }
 
 #[test]
+fn the_launch_is_recorded_before_the_agent_starts() {
+    let sandbox = sandbox();
+    let mut arguments = run_arguments(&sandbox, "first", "claude", "exit", "10");
+    arguments.truncate(arguments.iter().position(|argument| argument == "--").unwrap() + 1);
+    let store_log = sandbox.stubs.join("agent-store.log");
+    arguments.extend([
+        python().to_owned(),
+        "-c".to_owned(),
+        format!("import os, shutil; shutil.copyfile(r'{}', os.environ['DUMMY_LOG'])", store_log.display()),
+    ]);
+    let child = Command::new(env!("CARGO_BIN_EXE_tj"))
+        .args(arguments)
+        .envs(environment(&sandbox))
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    finish(child, Duration::from_secs(60));
+    let seen_by_agent = log(&sandbox, "dummy.log");
+    assert!(seen_by_agent.contains("launch --launch-id first --host"), "{seen_by_agent}");
+}
+
+#[test]
 fn an_agent_that_exits_ends_the_launch_and_keeps_the_worktree() {
     let sandbox = sandbox();
     let child = start(&sandbox, "exit", "claude", "exit", "10");

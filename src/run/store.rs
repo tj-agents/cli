@@ -51,6 +51,10 @@ pub fn launch(launch: &Launch, parent: Option<&str>, wrapper_pid: u32, wrapper_s
     call(&arguments).map(drop)
 }
 
+pub fn recorded(launch_id: &str) -> bool {
+    call(&["show", "--launch-id", launch_id]).is_ok()
+}
+
 fn terminal() -> Option<(&'static str, String)> {
     let present = |name| std::env::var(name).ok().filter(|value| !value.is_empty());
     present("WT_SESSION").map(|id| ("windows-terminal", id)).or_else(|| present("TMUX_PANE").map(|id| ("tmux", id)))
