@@ -4,7 +4,7 @@ use std::process::{Command, ExitCode, Stdio};
 use anyhow::{Context, Result, bail};
 use serde_json::Value;
 
-use crate::{bridge, run::store};
+use crate::{bridge, host::Host, run::store};
 
 /// Exit code when nothing was sent because the caller must use its host's native tool.
 const NATIVE: u8 = 3;
@@ -41,37 +41,12 @@ impl Session {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum Caller {
-    Claude,
-    Codex,
-    Shell,
-}
-
 fn env(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|value| !value.is_empty())
 }
 
-pub fn caller() -> Caller {
-    if env("CLAUDECODE").as_deref() == Some("1") {
-        Caller::Claude
-    } else if env("CODEX_THREAD_ID").is_some() {
-        Caller::Codex
-    } else {
-        Caller::Shell
-    }
-}
-
-fn caller_handle(caller: Caller) -> Option<String> {
-    match caller {
-        Caller::Claude => env("CLAUDE_CODE_SESSION_ID").map(|id| format!("claude:{id}")),
-        Caller::Codex => env("CODEX_THREAD_ID").map(|id| format!("codex:{id}")),
-        Caller::Shell => None,
-    }
-}
-
-fn header(caller: Caller) -> String {
-    let Some(handle) = caller_handle(caller) else {
+fn header(caller: Option<Host>) -> String {
+    let Some(handle) = caller.and_then(Host::handle) else {
         return "[tj message from a terminal]".to_owned();
     };
     let name = env("AGENT_CLI_TAB_TITLE").unwrap_or_else(|| handle.clone());
@@ -134,7 +109,7 @@ pub fn queue(thread: &str, text: &str) -> Result<()> {
 
 pub fn run(args: Args) -> Result<ExitCode> {
     let target = resolve(&args.target)?;
-    let from = caller();
+    let from = Host::current();
     let name = target.name();
     let text = format!("{} {}", header(from), args.text);
     match (target.host.as_str(), from) {
@@ -142,7 +117,7 @@ pub fn run(args: Args) -> Result<ExitCode> {
             queue(&target.id, &text)?;
             println!("queued for {name}; delivered at the target's next idle point");
         }
-        ("claude", Caller::Claude) => {
+        ("claude", Some(Host::Claude)) => {
             println!("not sent: {name} is a Claude session; send it with the native SendMessage tool, to: {name}");
             return Ok(ExitCode::from(NATIVE));
         }

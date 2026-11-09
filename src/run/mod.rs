@@ -10,27 +10,11 @@ use std::time::{Duration, Instant, SystemTime};
 use anyhow::{Context, Result, bail};
 use tj_cli::process::agent::{self, Agent, Stop};
 
+use crate::host::Host;
 use crate::paths;
 use closeout::Prs;
 
-#[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
-pub enum Host {
-    Claude,
-    Codex,
-}
-
 impl Host {
-    fn name(self) -> &'static str {
-        match self {
-            Self::Claude => "claude",
-            Self::Codex => "codex",
-        }
-    }
-
-    fn from_name(name: &str) -> Option<Self> {
-        [Self::Claude, Self::Codex].into_iter().find(|host| host.name() == name)
-    }
-
     /// Claude exits cleanly on a console break or SIGINT; Codex has no handler and only quits on the key.
     fn stop(self) -> (Stop, u32) {
         match self {
@@ -83,6 +67,22 @@ pub fn hidden(program: &str) -> Command {
     let mut command = agent::hidden(program, &hook);
     command.env("GIT_TERMINAL_PROMPT", "0").env("GH_PROMPT_DISABLED", "1");
     command
+}
+
+/// The agent's SessionStart registers against this row, so it must exist before the agent starts.
+fn record_launch(launch: &Launch, parent: Option<&str>, wrapper_pid: u32, wrapper_started_at: &str) {
+    let mut failure = None;
+    for delay in [0, 1, 2, 4].map(Duration::from_secs) {
+        std::thread::sleep(delay);
+        match store::launch(launch, parent, wrapper_pid, wrapper_started_at) {
+            Ok(()) => return,
+            Err(_) if store::recorded(&launch.id) => return,
+            Err(error) => failure = Some(error),
+        }
+    }
+    if let Some(error) = failure {
+        eprintln!("tj run: launch {} was not recorded: {error:#}", launch.id);
+    }
 }
 
 fn marker(launch_id: &str) -> Result<PathBuf> {
@@ -195,11 +195,9 @@ pub fn run(args: Args) -> Result<ExitCode> {
         ("TJ_RUN_LAUNCH_ID", launch.id.clone()),
         ("AGENT_CLI_TAB_TITLE", launch.title.clone()),
     ];
+    record_launch(&launch, args.parent.as_deref(), pid, &started_at);
     let mut agent = Agent::start(&args.agent, &launch.cwd, &environment)
         .with_context(|| format!("could not start {}", args.agent[0].to_string_lossy()))?;
-    if let Err(error) = store::launch(&launch, args.parent.as_deref(), pid, &started_at) {
-        eprintln!("tj run: {error:#}");
-    }
     let poll = Duration::from_secs(args.poll_seconds);
     let mut watch = Watch {
         launch,
