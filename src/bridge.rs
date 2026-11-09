@@ -8,11 +8,10 @@ use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 use tj_cli::process::agent;
 
-use crate::paths;
+use crate::{host::Host, paths};
 
 const SOCKET: &str = "CLAUDE_CODE_MESSAGING_SOCKET";
 const TOKEN: &str = "CLAUDE_CODE_MESSAGING_TOKEN";
-const SESSION: &str = "CLAUDE_CODE_SESSION_ID";
 
 fn env(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|value| !value.is_empty())
@@ -66,7 +65,7 @@ pub fn post(session: &str, text: &str) -> Result<()> {
 }
 
 pub fn run() -> Result<ExitCode> {
-    if [SOCKET, TOKEN, SESSION].iter().any(|name| env(name).is_none()) {
+    if [SOCKET, TOKEN].iter().any(|name| env(name).is_none()) || Host::Claude.session_id().is_none() {
         return Ok(ExitCode::SUCCESS);
     }
     serve()
@@ -99,7 +98,7 @@ fn owned_by_me(path: &PathBuf) -> bool {
 }
 
 fn serve() -> Result<ExitCode> {
-    let session = env(SESSION).with_context(|| format!("{SESSION} is not set"))?;
+    let session = Host::Claude.session_id().context("CLAUDE_CODE_SESSION_ID is not set")?;
     let path = endpoint(&session)?;
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
     let secret = secret()?;

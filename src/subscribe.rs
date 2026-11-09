@@ -7,7 +7,8 @@ use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 
 use crate::bridge;
-use crate::message::{self, Caller};
+use crate::host::Host;
+use crate::message;
 
 const LIFETIME: Duration = Duration::from_secs(12 * 60 * 60);
 
@@ -156,19 +157,17 @@ fn detach(command: &mut Command) -> Result<()> {
     Ok(())
 }
 
-fn notify(caller: Caller, text: &str) -> Result<()> {
+fn notify(caller: Host, text: &str) -> Result<()> {
     match caller {
-        Caller::Claude => bridge::post_own(text),
-        Caller::Codex => message::queue(&std::env::var("CODEX_THREAD_ID")?, text),
-        Caller::Shell => bail!("tj subscribe needs a Claude or Codex parent session to notify"),
+        Host::Claude => bridge::post_own(text),
+        Host::Codex => message::queue(&caller.session_id().context("CODEX_THREAD_ID is not set")?, text),
     }
 }
 
 pub fn run(args: Args) -> Result<ExitCode> {
-    let caller = message::caller();
-    if caller == Caller::Shell {
+    let Some(caller) = Host::current() else {
         bail!("tj subscribe needs a Claude or Codex parent session to notify");
-    }
+    };
     let child = message::resolve(&args.target)?;
     if child.host != "codex" {
         bail!(

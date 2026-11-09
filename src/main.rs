@@ -3,6 +3,7 @@ mod cr;
 mod external;
 mod f;
 mod fzf;
+mod host;
 mod init;
 mod message;
 mod paths;
