@@ -1,13 +1,17 @@
 import ctypes
 import time
+from collections.abc import Callable
 from typing import Any
 
 from tj_cli.clipboard._errors import ClipboardError
+from tj_cli.clipboard._guard import refuse_real_backend_in_tests
 from tj_cli.clipboard._text import strip_trailing_whitespace
 
 GMEM_MOVEABLE = 0x0002
 CF_UNICODETEXT = 13
 HWND_MESSAGE = -3
+
+type WindowsApiFunction = Callable[[], tuple[Any, Any]]
 
 
 def _windows_api() -> tuple[Any, Any]:
@@ -146,11 +150,16 @@ def _read_windows_clipboard(user32: Any, kernel32: Any, hwnd: Any) -> str | None
         user32.CloseClipboard()
 
 
-def copy_windows(text: str) -> str:
+def copy_windows(text: str, *, windows_api: WindowsApiFunction = _windows_api) -> str:
     """Copy `text` on Windows as CF_UNICODETEXT via ctypes, then verify it off the live
     clipboard.
+
+    `windows_api` takes the place of `run`/`which` on the POSIX backend: inject a fake
+    returning a stand-in `(user32, kernel32)` pair so a test never touches the real
+    clipboard.
     """
-    user32, kernel32 = _windows_api()
+    refuse_real_backend_in_tests(windows_api is _windows_api)
+    user32, kernel32 = windows_api()
     # Raises before the clipboard is ever opened or emptied if no owner window can be
     # created.
     hwnd = _create_message_window(user32)
