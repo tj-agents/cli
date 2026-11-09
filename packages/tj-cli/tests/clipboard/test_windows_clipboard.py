@@ -65,7 +65,7 @@ class FailingCreateWindowUser32(FakeUser32):
 
 class FakeKernel32:
     """A fake `kernel32`: `GlobalAlloc` hands out a real ctypes buffer and uses its
-    address as the handle, so the genuine `ctypes.memmove`/`ctypes.wstring_at` calls
+    address as the handle, so the genuine `ctypes.memmove`/`ctypes.string_at` calls
     in `_set_clipboard_bytes`/`_read_windows_clipboard` round-trip real bytes without
     any actual Win32 call.
     """
@@ -84,6 +84,9 @@ class FakeKernel32:
 
     def GlobalUnlock(self, _handle: int) -> bool:
         return True
+
+    def GlobalSize(self, handle: int) -> int:
+        return len(self._buffers[handle])
 
     def GlobalFree(self, handle: int) -> int:
         self._buffers.pop(handle, None)
