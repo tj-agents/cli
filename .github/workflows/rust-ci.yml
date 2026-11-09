@@ -59,6 +59,8 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
+          pwsh -NoProfile -File tests/zoxide-install.ps1
+          if ($LASTEXITCODE) { exit 1 }
           choco install fzf zoxide -y --no-progress
           $bin = Join-Path $env:RUNNER_TEMP 'tjbin'
           windows/install.ps1 -BinDir $bin

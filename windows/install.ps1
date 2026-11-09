@@ -93,7 +93,21 @@ function Install-Zoxide {
     if (Get-Command winget -ErrorAction SilentlyContinue) {
         & winget install --id ajeetdsouza.zoxide --exact --silent --accept-source-agreements --accept-package-agreements
         if ($LASTEXITCODE -ne 0) { Say missing 'zoxide (winget installation failed)'; $script:status = 1; return }
-        Say installed 'zoxide (via winget - open a new terminal for it to be on PATH)'
+        # winget updates the registered PATH, not this process. Preserve process-only entries too.
+        foreach ($scope in @('Machine', 'User')) {
+            $registered = [Environment]::GetEnvironmentVariable('Path', $scope)
+            if (-not $registered) { continue }
+            $registered = [Environment]::ExpandEnvironmentVariables($registered)
+            foreach ($entry in ($registered -split ';' | Where-Object { $_ })) {
+                if (-not (($env:Path -split ';') | Where-Object { $_.TrimEnd('\') -ieq $entry.TrimEnd('\') })) {
+                    $env:Path += ";$entry"
+                }
+            }
+        }
+        if (Get-Command zoxide -CommandType Application -ErrorAction SilentlyContinue) {
+            Say installed "zoxide (via winget): $(& zoxide --version)"
+        }
+        else { Say missing 'zoxide (winget succeeded but the executable is not on PATH)'; $script:status = 1 }
     }
     else { Say missing 'zoxide - install it with: winget install ajeetdsouza.zoxide'; $script:status = 1 }
 }
