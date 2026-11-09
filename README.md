@@ -8,6 +8,7 @@ Fast shell tools for agentic programming, on Windows and Linux. `tj` provides tw
 | `cr` | Search your Claude Code or Codex sessions by **anything said in them**, preview how each one ended, and press Enter to resume it in the folder it was started from. |
 | `f` | Fuzzy-jump to a project folder. `f core` goes straight to the best match; plain `f` opens a picker. |
 | `run` | Run an agent in its tab and close its work item out once it is finished: agent stopped, worktree removed, card Done, tab closed. |
+| `message` | Send another Claude or Codex session a message, addressed by its tab title, with the same behaviour from either host. |
 
 Any other `tj <name> ...` runs `tj-<name> ...` from PATH, so `tj item` runs the `tj-item` tool from
 `tj-agents/work-items`.
@@ -182,12 +183,42 @@ Helpers run hidden through `tj_hook` on Windows, and in their own session on Lin
 agent's console. If the agent exits by itself, the wrapper ends the launch, keeps the worktree and exits
 with the agent's code.
 
+## `tj message` and `tj subscribe`: messaging between sessions
+
+```text
+tj message <title|host:id> <text>   send a message; the recipient sees who sent it and how to reply
+tj subscribe <title|host:id>        one notice when a Codex child next goes idle or exits
+```
+
+The target is looked up with `agent-store sessions --title` (or `agent-store show` for a handle) and must be
+exactly one session that has not ended. The caller is the Claude session when `CLAUDECODE=1`, otherwise the
+Codex thread in `CODEX_THREAD_ID`. Delivery depends on the target:
+
+| Target | Caller | Delivery |
+| --- | --- | --- |
+| Codex | either | `codex queue --thread <id>`; it starts a turn at the target's next idle point |
+| Claude | Claude | nothing is sent and the exit code is 3: use the native `SendMessage` tool |
+| Claude | Codex or a shell | the target session's relay posts it to that session's inbox socket |
+
+Each Claude session gets its relay from the cli plugin's async `SessionStart` hook, `tj bridge`, which lives
+until the session exits. It listens on a loopback port and records the port and a random secret in
+`<cache>/bridge/<session-id>.json`, readable only by you. It posts each message to
+`CLAUDE_CODE_MESSAGING_SOCKET` with an auth line holding `CLAUDE_CODE_MESSAGING_TOKEN`, so the session
+verifies it as its own child's message and starts a turn even in `bypassPermissions` mode.
+
+`tj subscribe` is the Codex counterpart of `SendMessage notify_when_idle`. The child must be loaded in the
+shared Codex app-server, so an embedded Codex is refused before anything is watched. A background process
+rejoins the thread over `codex app-server proxy` and waits for `thread/status/changed` to `idle`, or for
+`thread/closed`. It sends one notice to the parent and exits: `codex queue` for a Codex parent, the
+parent's own inbox socket for a Claude parent. After 12 hours without either event, the notice reports that
+the subscription expired. A Claude child reports to a Codex parent with `tj message`.
+
 ## Configuration
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `TJ_F_ROOT` | `~/projects`, then `~/source/repos` | where `f` searches |
-| `TJ_CACHE_DIR` | OS cache folder + `/tj` | where `cr` keeps its index and `tj done` its marks |
+| `TJ_CACHE_DIR` | OS cache folder + `/tj` | where `cr` keeps its index, `tj done` its marks and each Claude relay its endpoint |
 | `TJ_BIN_DIR` | `~/.local/bin` / `%LOCALAPPDATA%\Programs\tj` | where the installer puts `tj` and `tj_hook` |
 | `CLAUDE_CONFIG_DIR` | `~/.claude` | Claude Code's config folder, as Claude Code itself reads it |
 | `CODEX_HOME` | `~/.codex` | Codex's config folder, as Codex itself reads it |
@@ -290,6 +321,7 @@ run changes anything. A successful current `main` commit automatically publishes
 | `src/process.rs` and `src/process/` | native command execution and Windows process containment |
 | `packages/tj-cli/src/tj_cli/process/` | the Python API for the native launcher |
 | `src/run/` | `tj run`, `tj done` and `tj closeout` |
+| `src/message.rs`, `src/bridge.rs`, `src/subscribe.rs` | `tj message`, the Claude session relay and `tj subscribe` |
 | `src/process/agent.rs` and `src/process/agent/` | the agent's job or process group, per-host stop, tree kill |
 | `src/f.rs` | folder walk, match scoring, picker |
 | `src/cr/parse.rs` | reading Claude and Codex transcripts into searchable text and turns |
