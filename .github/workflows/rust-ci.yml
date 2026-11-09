@@ -71,6 +71,7 @@ jobs:
           windows/install.ps1 -BinDir $bin -Check
           if ($LASTEXITCODE) { exit 1 }
           pwsh -Command "`$env:Path += ';$bin'; . `$PROFILE.CurrentUserAllHosts; Get-Command f, cr, __zoxide_z -ErrorAction Stop"
+          if ($LASTEXITCODE) { exit 1 }
           windows/install.ps1 -BinDir $bin -Uninstall
           windows/install.ps1 -BinDir $bin -Check
           if (-not $LASTEXITCODE) { throw '--check passed after uninstall' }
