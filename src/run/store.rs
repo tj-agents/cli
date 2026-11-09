@@ -6,7 +6,7 @@ use serde_json::Value;
 
 use super::{Launch, hidden};
 
-fn call(arguments: &[&str]) -> Result<Value> {
+pub(crate) fn call(arguments: &[&str]) -> Result<Value> {
     let output =
         hidden("agent-store").args(arguments).stdin(Stdio::null()).output().context("could not run agent-store")?;
     let reply: Value = serde_json::from_slice(&output.stdout)
