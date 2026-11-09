@@ -126,7 +126,7 @@ fn run_arguments(sandbox: &Sandbox, launch: &str, host: &str, mode: &str, grace:
         "2",
         "--grace-seconds",
         grace,
-        "--quiet-seconds",
+        "--restart-grace-seconds",
         "2",
         "--",
         python(),
@@ -207,6 +207,16 @@ fn request_restart(sandbox: &Sandbox, launch: &str, reason: &str) -> Output {
         .env("TJ_CACHE_DIR", sandbox.root.join("cache"))
         .output()
         .unwrap()
+}
+
+fn mark_idle(sandbox: &Sandbox, launch: &str, background: &str) {
+    let output = Command::new(env!("CARGO_BIN_EXE_tj"))
+        .args(["idle", "--background", background])
+        .env("TJ_RUN_LAUNCH_ID", launch)
+        .env("TJ_CACHE_DIR", sandbox.root.join("cache"))
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
 }
 
 fn set_reply(sandbox: &Sandbox, file: &str, json: &str) {
@@ -414,48 +424,79 @@ fn done_outside_tj_run_fails_but_cancel_is_a_no_op() {
     assert!(run(&["done", "--cancel"]).0);
 }
 
-fn with_prompt(sandbox: &Sandbox, launch: &str, mode: &str) -> Vec<String> {
-    let mut arguments = run_arguments(sandbox, launch, "claude", mode, "10");
+fn with_prompt(sandbox: &Sandbox, launch: &str, host: &str, mode: &str) -> Vec<String> {
+    let mut arguments = run_arguments(sandbox, launch, host, mode, "10");
     arguments.extend(["--model", "m", "the prompt"].map(str::to_owned));
     arguments
 }
 
-#[test]
-fn a_restart_on_an_idle_agent_resumes_the_bound_session_in_the_same_launch() {
+fn not_restarted(sandbox: &Sandbox, child: &mut Child) {
+    still_running(child, Duration::from_secs(5));
+    let agent = log(sandbox, "dummy.log");
+    assert!(!agent.contains("sess-1") && !agent.contains("graceful"), "restarted: {agent}");
+}
+
+fn restarts_in_place_once_idle(host: &str) {
     let sandbox = sandbox();
+    let launch = format!("again-{host}");
+    let keys = cfg!(windows) && host == "codex";
+    let mode = if keys { "keys" } else { "signal" };
     set_reply(&sandbox, "agent-store-show.json", BOUND);
-    let mut child = spawn(&sandbox, &with_prompt(&sandbox, "again", "signal"), &sandbox.root);
-    wait_for_log(&sandbox, "agent ");
-    assert!(request_restart(&sandbox, "again", "plugins b").status.success());
-    wait_for_log(&sandbox, "--resume sess-1");
+    let mut child = spawn(&sandbox, &with_prompt(&sandbox, &launch, host, mode), &sandbox.root);
+    wait_for_log(&sandbox, if keys { "raw" } else { "agent " });
+    assert!(request_restart(&sandbox, &launch, "plugins b").status.success());
+    mark_idle(&sandbox, &launch, "0");
+    let resumed = if host == "claude" { "args --model m --resume sess-1" } else { "args --model m resume sess-1" };
+    wait_for_log(&sandbox, resumed);
     still_running(&mut child, Duration::from_secs(1));
     let agent = log(&sandbox, "dummy.log");
-    assert!(agent.contains("graceful"), "the agent was not stopped gracefully: {agent}");
-    assert_eq!(agent.matches("agent again Test tab").count(), 2, "{agent}");
+    if host == "claude" || keys {
+        assert!(agent.contains("graceful"), "the agent was not stopped gracefully: {agent}");
+    }
+    assert_eq!(agent.matches(&format!("agent {launch} Test tab")).count(), 2, "{agent}");
     assert!(agent.lines().any(|line| line == "args --model m the prompt"), "{agent}");
-    assert!(agent.lines().any(|line| line == "args --model m --resume sess-1"), "{agent}");
+    assert!(agent.lines().any(|line| line == resumed), "{agent}");
     let store = log(&sandbox, "stubs/agent-store.log");
-    assert_eq!(store.matches("launch --launch-id again ").count(), 1, "{store}");
-    assert!(!store.contains("end --launch-id again"), "{store}");
-    let repeated = request_restart(&sandbox, "again", "plugins b");
+    assert_eq!(store.matches(&format!("launch --launch-id {launch} ")).count(), 1, "{store}");
+    assert!(!store.contains(&format!("end --launch-id {launch}")), "{store}");
+    let repeated = request_restart(&sandbox, &launch, "plugins b");
     assert!(!repeated.status.success());
     assert!(String::from_utf8_lossy(&repeated.stderr).contains("already restarted"));
+    if keys {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while log(&sandbox, "dummy.log").matches("raw").count() < 2 {
+            assert!(Instant::now() < deadline, "the resumed agent never read keys");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
     set_reply(&sandbox, "agent-store-show.json", CLOSING);
     let output = finish(child, Duration::from_secs(60));
-    assert_closed_out(&sandbox, &output, "again");
+    assert_closed_out(&sandbox, &output, &launch);
 }
 
 #[test]
-fn a_restart_waits_while_the_agent_is_busy() {
+fn a_requested_restart_resumes_an_idle_claude_in_the_same_launch() {
+    restarts_in_place_once_idle("claude");
+}
+
+#[test]
+fn a_requested_restart_resumes_an_idle_codex_in_the_same_launch() {
+    restarts_in_place_once_idle("codex");
+}
+
+#[test]
+fn a_restart_waits_for_an_idle_mark_with_no_background_work() {
     let sandbox = sandbox();
     set_reply(&sandbox, "agent-store-show.json", BOUND);
-    let mut child = spawn(&sandbox, &with_prompt(&sandbox, "busy", "busy"), &sandbox.root);
+    let mut child = spawn(&sandbox, &with_prompt(&sandbox, "busy", "claude", "signal"), &sandbox.root);
     wait_for_log(&sandbox, "agent ");
     assert!(request_restart(&sandbox, "busy", "plugins b").status.success());
-    still_running(&mut child, Duration::from_secs(6));
-    let agent = log(&sandbox, "dummy.log");
-    assert!(!agent.contains("--resume") && !agent.contains("graceful"), "restarted while busy: {agent}");
-    std::fs::write(sandbox.root.join("dummy.log.idle"), "").unwrap();
+    not_restarted(&sandbox, &mut child);
+    mark_idle(&sandbox, "busy", "unknown");
+    not_restarted(&sandbox, &mut child);
+    mark_idle(&sandbox, "busy", "2");
+    not_restarted(&sandbox, &mut child);
+    mark_idle(&sandbox, "busy", "0");
     wait_for_log(&sandbox, "--resume sess-1");
     set_reply(&sandbox, "agent-store-show.json", CLOSING);
     let output = finish(child, Duration::from_secs(60));
@@ -463,15 +504,34 @@ fn a_restart_waits_while_the_agent_is_busy() {
 }
 
 #[test]
+fn a_new_prompt_clears_the_idle_mark_and_holds_the_restart() {
+    let sandbox = sandbox();
+    set_reply(&sandbox, "agent-store-show.json", BOUND);
+    let mut child = spawn(&sandbox, &with_prompt(&sandbox, "typed", "claude", "signal"), &sandbox.root);
+    wait_for_log(&sandbox, "agent ");
+    assert!(request_restart(&sandbox, "typed", "plugins b").status.success());
+    mark_idle(&sandbox, "typed", "0");
+    done(&sandbox, "typed", true);
+    assert!(!sandbox.root.join("cache").join("run").join("typed").join("idle").exists());
+    not_restarted(&sandbox, &mut child);
+    mark_idle(&sandbox, "typed", "0");
+    wait_for_log(&sandbox, "--resume sess-1");
+    set_reply(&sandbox, "agent-store-show.json", CLOSING);
+    let output = finish(child, Duration::from_secs(60));
+    assert_closed_out(&sandbox, &output, "typed");
+}
+
+#[test]
 fn a_restart_without_a_bound_session_keeps_the_agent_and_says_so_once() {
     let sandbox = sandbox();
     set_reply(&sandbox, "agent-store-show.json", r#"{"ok":true,"data":{"launch":{"state":"active"},"session":null}}"#);
-    let mut child = spawn(&sandbox, &with_prompt(&sandbox, "lonely", "signal"), &sandbox.root);
+    let mut child = spawn(&sandbox, &with_prompt(&sandbox, "lonely", "claude", "signal"), &sandbox.root);
     wait_for_log(&sandbox, "agent ");
-    assert!(request_restart(&sandbox, "lonely", "plugins b").status.success());
-    still_running(&mut child, Duration::from_secs(5));
-    assert!(request_restart(&sandbox, "lonely", "plugins b").status.success());
-    still_running(&mut child, Duration::from_secs(5));
+    for _ in 0..2 {
+        assert!(request_restart(&sandbox, "lonely", "plugins b").status.success());
+        mark_idle(&sandbox, "lonely", "0");
+        still_running(&mut child, Duration::from_secs(5));
+    }
     set_reply(&sandbox, "agent-store-show.json", r#"{"ok":true,"data":{"launch":{"state":"closing"},"session":null}}"#);
     let output = finish(child, Duration::from_secs(60));
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -481,10 +541,15 @@ fn a_restart_without_a_bound_session_keeps_the_agent_and_says_so_once() {
 }
 
 #[test]
-fn restart_outside_tj_run_fails() {
-    let output = Command::new(env!("CARGO_BIN_EXE_tj")).arg("restart").env_remove("TJ_RUN_LAUNCH_ID").output().unwrap();
+fn restart_outside_tj_run_fails_but_idle_is_a_no_op() {
+    let tj = |arguments: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_tj")).args(arguments).env_remove("TJ_RUN_LAUNCH_ID").output().unwrap()
+    };
+    let output = tj(&["restart"]);
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("only works inside a tj run session"));
+    assert!(tj(&["idle", "--background", "0"]).status.success());
+    assert!(!tj(&["idle", "--background", "some"]).status.success());
 }
 
 #[test]

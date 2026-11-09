@@ -177,18 +177,6 @@ impl Agent {
         }
     }
 
-    pub fn cpu_time(&self) -> io::Result<Duration> {
-        let (mut created, mut exited, mut kernel, mut user): (FILETIME, FILETIME, FILETIME, FILETIME) =
-            unsafe { (zeroed(), zeroed(), zeroed(), zeroed()) };
-        if unsafe { GetProcessTimes(self.process.as_raw_handle(), &mut created, &mut exited, &mut kernel, &mut user) }
-            == 0
-        {
-            return Err(io::Error::last_os_error());
-        }
-        let ticks = |time: FILETIME| u64::from(time.dwHighDateTime) << 32 | u64::from(time.dwLowDateTime);
-        Ok(Duration::from_nanos((ticks(kernel) + ticks(user)) * 100))
-    }
-
     pub fn kill_tree(&mut self) -> io::Result<bool> {
         unsafe {
             let mut accounting: JOBOBJECT_BASIC_ACCOUNTING_INFORMATION = zeroed();

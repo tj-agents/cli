@@ -36,6 +36,8 @@ enum Command {
     Done(run::DoneArgs),
     /// Ask `tj run` to restart this tab's agent once it is idle, resuming the same conversation
     Restart(run::restart::Args),
+    /// Mark this tab's agent idle between turns (run by its Stop hook); a no-op outside `tj run`
+    Idle(run::restart::IdleArgs),
     /// Close out a work item's sessions, or sweep launches whose tab is gone
     Closeout(run::closeout::Args),
     /// Send a message to another Claude or Codex session, addressed by its tab title
@@ -62,6 +64,7 @@ fn main() -> ExitCode {
         Command::Run(args) => run::run(args),
         Command::Done(args) => run::done(args),
         Command::Restart(args) => run::restart::run(args),
+        Command::Idle(args) => run::restart::idle(args),
         Command::Closeout(args) => run::closeout::run(args),
         Command::Message(args) => message::run(args),
         Command::Subscribe(args) => subscribe::run(args),
