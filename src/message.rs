@@ -108,13 +108,15 @@ pub fn resolve(target: &str) -> Result<Session> {
 /// A host CLI run without a console window, so a detached caller never flashes one.
 pub fn host_command(program: &str) -> Result<Command> {
     let executable = which::which(program).with_context(|| format!("`{program}` is not on PATH"))?;
-    let mut command = Command::new(executable);
+    let command = Command::new(executable);
     #[cfg(windows)]
-    {
+    let command = {
         use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        let mut command = command;
         command.creation_flags(CREATE_NO_WINDOW);
-    }
+        command
+    };
     Ok(command)
 }
 
