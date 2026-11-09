@@ -1,5 +1,5 @@
 pub mod closeout;
-mod store;
+pub(crate) mod store;
 
 use std::collections::HashSet;
 use std::ffi::OsString;
