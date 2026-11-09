@@ -55,6 +55,13 @@ def isolated_desktop(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
         monkeypatch.delenv(variable, raising=False)
     monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "local data"))
     monkeypatch.setenv("ProgramFiles", str(tmp_path / "program files"))
+    monkeypatch.setenv("SYSTEMROOT", str(tmp_path / "windows"))
+
+
+def _vulkan_runtime() -> None:
+    library = Path(os.environ["SYSTEMROOT"]) / "System32" / "vulkan-1.dll"
+    library.parent.mkdir(parents=True)
+    library.write_bytes(b"vulkan")
 
 
 def _windows_installation() -> Path:
@@ -102,9 +109,14 @@ def test_registered_windows_custom_location_is_recognized(
     assert handy_install.main(["--check"]) == 1
 
 
+@pytest.mark.parametrize("vulkan_installed", [True, False])
 def test_windows_installs_once_and_verifies_the_result(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    vulkan_installed: bool,
 ) -> None:
+    if vulkan_installed:
+        _vulkan_runtime()
     commands: list[list[str]] = []
     monkeypatch.setattr(
         shutil, "which", lambda name: "winget.exe" if name == "winget" else None
@@ -112,21 +124,25 @@ def test_windows_installs_once_and_verifies_the_result(
 
     def run(arguments: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
         commands.append(arguments)
-        _windows_installation()
+        if arguments[3] == "KhronosGroup.VulkanRT":
+            _vulkan_runtime()
+        else:
+            _windows_installation()
         return subprocess.CompletedProcess(arguments, 0, "", "")
 
     monkeypatch.setattr(subprocess, "run", run)
     assert handy_install.main([]) == 0
     assert handy_install.main([]) == 0
-    assert len(commands) == 1
-    assert commands[0][:5] == [
-        "winget.exe",
-        "install",
-        "--id",
-        "cjpais.Handy",
-        "--exact",
-    ]
-    assert commands[0][commands[0].index("--scope") + 1] == "user"
+    packages = [arguments[3] for arguments in commands]
+    if vulkan_installed:
+        assert packages == ["cjpais.Handy"]
+    else:
+        assert packages == ["KhronosGroup.VulkanRT", "cjpais.Handy"]
+        assert "--scope" not in commands[0]
+    handy = commands[-1]
+    assert handy[:5] == ["winget.exe", "install", "--id", "cjpais.Handy", "--exact"]
+    assert handy[handy.index("--scope") + 1] == "user"
+    assert all("--skip-dependencies" in arguments for arguments in commands)
     output = capsys.readouterr().out
     assert "installed  Handy" in output
     assert "ok         Handy" in output
