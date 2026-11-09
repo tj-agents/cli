@@ -1,7 +1,9 @@
 # tj
 
-Fast shell tools for agentic programming, on Windows and Linux. `tj` provides two everyday commands, plus
-`tj run`, the root process of every agent tab:
+Fast shell tools for agentic programming, on Windows and Linux. `tj` is the deterministic OS and terminal
+mechanics layer of [tj-agents](https://github.com/tj-agents): judgement lives in skills, `tj` does the
+parts the hosts themselves don't cover, with the same behaviour from Claude Code and Codex. `tj` provides
+two everyday commands, plus `tj run`, the root process of every agent tab:
 
 | Command | What it does |
 | --- | --- |
