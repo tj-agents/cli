@@ -55,9 +55,7 @@ def main() -> None:
         read_keys()
     stops = [signal.SIGBREAK, signal.SIGINT] if WINDOWS else [signal.SIGINT, signal.SIGTERM]
     for stop in stops:
-        signal.signal(stop, graceful if mode in ("signal", "busy") else signal.SIG_IGN)
-    while mode == "busy" and not os.path.exists(os.environ["DUMMY_LOG"] + ".idle"):
-        pass
+        signal.signal(stop, graceful if mode == "signal" else signal.SIG_IGN)
     while True:
         time.sleep(0.1)
 

@@ -1,11 +1,9 @@
-use std::collections::VecDeque;
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::time::{Duration, Instant};
+use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result, bail};
-use tj_cli::process::agent::Agent;
 
 use crate::host::Host;
 
@@ -107,56 +105,32 @@ impl Host {
     }
 }
 
-/// CPU the agent may use across a whole window and still count as waiting at its prompt.
-struct Quiet {
-    window: Duration,
-    budget: Duration,
-    samples: VecDeque<(Instant, Duration)>,
-}
-
-impl Quiet {
-    fn new(window: Duration) -> Self {
-        Self { window, budget: window / 20, samples: VecDeque::new() }
-    }
-
-    fn observe(&mut self, now: Instant, cpu: Duration) -> bool {
-        self.samples.push_back((now, cpu));
-        while self.samples.get(1).is_some_and(|(at, _)| now.duration_since(*at) >= self.window) {
-            self.samples.pop_front();
-        }
-        let (Some((first, before)), Some((_, after))) = (self.samples.front(), self.samples.back()) else {
-            return false;
-        };
-        now.duration_since(*first) >= self.window && after.saturating_sub(*before) <= self.budget
-    }
-}
+pub(super) const IDLE: &str = "idle";
+const REQUEST: &str = "restart";
+const RESTARTED: &str = "restarted";
 
 pub(super) struct Request {
     folder: PathBuf,
-    quiet: Option<Quiet>,
-    window: Duration,
+    grace: Duration,
 }
 
 impl Request {
-    pub(super) fn new(folder: &Path, window: Duration) -> Self {
-        Self { folder: folder.to_path_buf(), quiet: None, window }
+    pub(super) fn new(folder: &Path, grace: Duration) -> Self {
+        Self { folder: folder.to_path_buf(), grace }
     }
 
-    /// The pending request's reason, once the agent has stayed quiet for a whole window after it arrived.
-    pub(super) fn due(&mut self, agent: &Agent) -> Option<String> {
-        let path = self.folder.join(REQUEST);
-        if !path.exists() {
-            self.quiet = None;
+    /// The pending request's reason, once the agent has sat idle with no background work for the grace.
+    pub(super) fn due(&self) -> Option<String> {
+        let reason = std::fs::read_to_string(self.folder.join(REQUEST)).ok()?;
+        let idle = self.folder.join(IDLE);
+        let background = std::fs::read_to_string(&idle).ok()?;
+        let since = idle.metadata().and_then(|meta| meta.modified()).ok()?;
+        let waited = SystemTime::now().duration_since(since).ok()?;
+        if background.trim().parse::<u32>() != Ok(0) || waited < self.grace {
             return None;
         }
-        let cpu = agent.cpu_time().ok()?;
-        let quiet = self.quiet.get_or_insert_with(|| Quiet::new(self.window));
-        if !quiet.observe(Instant::now(), cpu) {
-            return None;
-        }
-        self.quiet = None;
-        let reason = std::fs::read_to_string(&path).ok()?;
-        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(self.folder.join(REQUEST));
+        let _ = std::fs::remove_file(&idle);
         Some(reason)
     }
 
@@ -164,9 +138,6 @@ impl Request {
         let _ = std::fs::write(self.folder.join(RESTARTED), reason);
     }
 }
-
-const REQUEST: &str = "restart";
-const RESTARTED: &str = "restarted";
 
 #[derive(clap::Args)]
 pub struct Args {
@@ -176,7 +147,7 @@ pub struct Args {
 }
 
 pub fn run(args: Args) -> Result<ExitCode> {
-    let Some(launch_id) = std::env::var("TJ_RUN_LAUNCH_ID").ok().filter(|id| !id.is_empty()) else {
+    let Some(launch_id) = super::launch_id() else {
         bail!("tj restart only works inside a tj run session (TJ_RUN_LAUNCH_ID is not set)");
     };
     let folder = super::marks(&launch_id)?;
@@ -189,12 +160,34 @@ pub fn run(args: Args) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
+fn background(text: &str) -> Result<String, String> {
+    if text == "unknown" || text.parse::<u32>().is_ok() {
+        return Ok(text.to_owned());
+    }
+    Err(format!("{text:?} is neither a count nor `unknown`"))
+}
+
+#[derive(clap::Args)]
+pub struct IdleArgs {
+    /// Background work the host still has in flight (shells, subagents, watches, timers), or `unknown`.
+    /// Only 0 lets a requested restart happen.
+    #[arg(long, value_parser = background)]
+    background: String,
+}
+
+pub fn idle(args: IdleArgs) -> Result<ExitCode> {
+    let Some(launch_id) = super::launch_id() else { return Ok(ExitCode::SUCCESS) };
+    let folder = super::marks(&launch_id)?;
+    std::fs::create_dir_all(&folder).context("could not create the idle mark's folder")?;
+    std::fs::write(folder.join(IDLE), args.background).context("could not record the idle mark")?;
+    Ok(ExitCode::SUCCESS)
+}
+
 #[cfg(test)]
 mod tests {
     use std::ffi::OsString;
-    use std::time::{Duration, Instant};
 
-    use super::{Host, Quiet};
+    use super::Host;
 
     fn resume(host: Host, agent: &[&str]) -> Vec<String> {
         let agent: Vec<OsString> = agent.iter().map(OsString::from).collect();
@@ -249,18 +242,5 @@ mod tests {
             ["codex", "--cd", "d", "--model", "m", "resume", "id"]
         );
         assert_eq!(resume(Host::Codex, &["codex"]), ["codex", "resume", "id"]);
-    }
-
-    #[test]
-    fn quiet_needs_a_whole_window_under_budget() {
-        let start = Instant::now();
-        let second = Duration::from_secs(1);
-        let mut quiet = Quiet::new(Duration::from_secs(20));
-        assert!(!quiet.observe(start, Duration::ZERO));
-        assert!(!quiet.observe(start + 10 * second, Duration::from_millis(500)));
-        assert!(quiet.observe(start + 20 * second, Duration::from_millis(900)));
-        assert!(!quiet.observe(start + 21 * second, Duration::from_millis(2000)));
-        assert!(!quiet.observe(start + 40 * second, Duration::from_millis(2500)));
-        assert!(quiet.observe(start + 41 * second, Duration::from_millis(2500)));
     }
 }

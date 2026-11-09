@@ -64,7 +64,7 @@ pub struct Args {
     #[arg(long, hide = true, default_value_t = 10)]
     grace_seconds: u64,
     #[arg(long, hide = true, default_value_t = 30)]
-    quiet_seconds: u64,
+    restart_grace_seconds: u64,
     /// The agent's command line.
     #[arg(last = true, required = true)]
     agent: Vec<OsString>,
@@ -98,6 +98,10 @@ fn marks(launch_id: &str) -> Result<PathBuf> {
         bail!("launch id {launch_id:?} must be letters, digits, '-' or '_'");
     }
     Ok(paths::cache_dir()?.join("run").join(launch_id))
+}
+
+fn launch_id() -> Option<String> {
+    std::env::var("TJ_RUN_LAUNCH_ID").ok().filter(|id| !id.is_empty())
 }
 
 fn generated_id() -> Result<String> {
@@ -270,7 +274,7 @@ pub fn run(args: Args) -> Result<ExitCode> {
         .with_context(|| format!("could not start {}", args.agent[0].to_string_lossy()))?;
     let poll = Duration::from_secs(args.poll_seconds);
     let grace = Duration::from_secs(args.grace_seconds);
-    let mut request = restart::Request::new(&marks, Duration::from_secs(args.quiet_seconds));
+    let request = restart::Request::new(&marks, Duration::from_secs(args.restart_grace_seconds));
     let mut watch = Watch {
         launch,
         environment,
@@ -305,7 +309,7 @@ pub fn run(args: Args) -> Result<ExitCode> {
                 }
             }
         }
-        if let Some(reason) = request.due(&agent) {
+        if let Some(reason) = request.due() {
             match restart(&mut agent, &mut watch, &args.agent, grace) {
                 Ok(Restarted::Kept) => {}
                 Ok(Restarted::Resumed(next)) => {
@@ -338,24 +342,28 @@ pub fn run(args: Args) -> Result<ExitCode> {
 
 #[derive(clap::Args)]
 pub struct DoneArgs {
-    /// Withdraw the mark, because new input arrived. A no-op outside `tj run`.
+    /// Withdraw the mark and the idle mark, because new input arrived. A no-op outside `tj run`.
     #[arg(long)]
     cancel: bool,
 }
 
 pub fn done(args: DoneArgs) -> Result<ExitCode> {
-    let Some(launch_id) = std::env::var("TJ_RUN_LAUNCH_ID").ok().filter(|id| !id.is_empty()) else {
+    let Some(launch_id) = launch_id() else {
         if args.cancel {
             return Ok(ExitCode::SUCCESS);
         }
         bail!("tj done only works inside a tj run session (TJ_RUN_LAUNCH_ID is not set)");
     };
-    let marker = marks(&launch_id)?.join("done");
+    let marks = marks(&launch_id)?;
+    let marker = marks.join("done");
     if args.cancel {
-        match std::fs::remove_file(&marker) {
-            Err(error) if error.kind() != std::io::ErrorKind::NotFound => return Err(error.into()),
-            _ => return Ok(ExitCode::SUCCESS),
+        for mark in [marker, marks.join(restart::IDLE)] {
+            match std::fs::remove_file(&mark) {
+                Err(error) if error.kind() != std::io::ErrorKind::NotFound => return Err(error.into()),
+                _ => {}
+            }
         }
+        return Ok(ExitCode::SUCCESS);
     }
     std::fs::create_dir_all(marker.parent().context("marker has no folder")?)?;
     std::fs::write(&marker, rfc3339(SystemTime::now()))?;
