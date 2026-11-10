@@ -1,0 +1,32 @@
+[
+  {
+    "path": ".github/workflows/ci.yml",
+    "rule": "naming",
+    "message": "job 'verify' name 'verify' must start with an uppercase letter",
+    "reason": "Preserves the existing GitHub check context consumed by branch protection and release qualification."
+  },
+  {
+    "path": ".github/workflows/release.yml",
+    "rule": "naming",
+    "message": "job 'qualify' name 'qualify' must start with an uppercase letter",
+    "reason": "Preserves the existing GitHub check context consumed by branch protection and release qualification."
+  },
+  {
+    "path": ".github/workflows/release.yml",
+    "rule": "naming",
+    "message": "job 'build' name 'build' must start with an uppercase letter",
+    "reason": "Preserves the existing GitHub check context consumed by branch protection and release qualification."
+  },
+  {
+    "path": ".github/workflows/release.yml",
+    "rule": "naming",
+    "message": "job 'publish' name 'publish' must start with an uppercase letter",
+    "reason": "Preserves the existing GitHub check context consumed by branch protection and release qualification."
+  },
+  {
+    "path": ".github/workflows/rust-ci.yml",
+    "rule": "naming",
+    "message": "job 'test' name 'test (${{ matrix.os }})' must start with an uppercase letter",
+    "reason": "Preserves the existing GitHub check context consumed by branch protection and release qualification."
+  }
+]
