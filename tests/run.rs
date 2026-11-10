@@ -35,7 +35,8 @@ fn stub(directory: &Path, name: &str, fallback: &str) {
         directory.join(format!("{name}.cmd")),
         format!(
             "@echo off\r\necho %*>>\"%~dp0{name}.log\"\r\n\
-             if exist \"%~dp0{name}-%1.json\" (type \"%~dp0{name}-%1.json\") else (echo {fallback})\r\n"
+             if exist \"%~dp0{name}-%1.json\" (type \"%~dp0{name}-%1.json\") else (echo {fallback})\r\n\
+             if \"{name}\"==\"tj-prepare\" python \"%~dp0prepare.py\"\r\n"
         ),
     )
     .unwrap();
@@ -47,7 +48,8 @@ fn stub(directory: &Path, name: &str, fallback: &str) {
             &path,
             format!(
                 "#!/bin/sh\nhere=\"$(dirname \"$0\")\"\necho \"$*\" >> \"$here/{name}.log\"\n\
-                 if [ -f \"$here/{name}-$1.json\" ]; then cat \"$here/{name}-$1.json\"; else echo '{fallback}'; fi\n"
+                 if [ -f \"$here/{name}-$1.json\" ]; then cat \"$here/{name}-$1.json\"; else echo '{fallback}'; fi\n\
+                 if [ '{name}' = 'tj-prepare' ]; then exec python3 \"$here/prepare.py\"; fi\n"
             ),
         )
         .unwrap();
@@ -73,6 +75,8 @@ fn sandbox() -> Sandbox {
     stub(&stubs, "agent-store", r#"{"ok":true,"data":{}}"#);
     stub(&stubs, "tj-item", r#"{"prs":[],"all_merged":false}"#);
     stub(&stubs, "tj-prepare", "prepared");
+    std::fs::copy(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/prepare.py"), stubs.join("prepare.py"))
+        .unwrap();
     for folder in ["home", "cache"] {
         std::fs::create_dir(root.join(folder)).unwrap();
     }
@@ -327,6 +331,7 @@ fn repository_preparation_finishes_before_the_agent_starts() {
         python().to_owned(),
         "-c".to_owned(),
         format!("import os, shutil; shutil.copyfile(r'{}', os.environ['DUMMY_LOG'])", preparation_log.display()),
+        "multiline\nprompt & | < > ^ %".to_owned(),
     ]);
     let child = spawn(&sandbox, &arguments, &sandbox.root);
     let output = finish(child, Duration::from_secs(30));
@@ -334,6 +339,19 @@ fn repository_preparation_finishes_before_the_agent_starts() {
     let prepared = log(&sandbox, "dummy.log");
     assert!(prepared.contains("--host codex --cwd"), "{prepared}");
     assert!(prepared.contains(sandbox.worktree.to_str().unwrap()), "{prepared}");
+    let input: Vec<String> = serde_json::from_str(&log(&sandbox, "stubs/prepare-input.json")).unwrap();
+    assert_eq!(input.last().unwrap(), "multiline\nprompt & | < > ^ %");
+}
+
+#[test]
+fn repository_preparation_failure_warns_and_still_starts_the_agent() {
+    let sandbox = sandbox();
+    std::fs::write(sandbox.stubs.join("prepare-failure"), "failed").unwrap();
+    let child = start(&sandbox, "prepare-failed", "claude", "exit", "10");
+    let output = finish(child, Duration::from_secs(30));
+    assert_eq!(output.status.code(), Some(3));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("standards preparation failed"));
+    assert!(log(&sandbox, "dummy.log").contains("agent prepare-failed"));
 }
 
 #[test]
