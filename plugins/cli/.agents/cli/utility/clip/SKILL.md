@@ -37,9 +37,22 @@ emoji, and a heredoc through PowerShell is worse. The file is the interface.
 
 Only the thing to paste: no "here's the command:" preamble, no `>` quoting and no surrounding fence.
 
-One thing at a time. The clipboard holds one item, so if you prepared two things, copy the one he asked
-for and say the other is ready on request. Copying overwrites silently, so do it as the last step before
-telling him it is there.
+Own one current handoff per task. Gather the ready actions Tommy must run and combine related commands
+into one pasteable batch, in dependency order, with explicit failure checks before dependent steps. Name
+the batch's actions and targets before asking him to run it. Keep required human approvals in that batch;
+combining commands does not authorize an agent to perform them.
+
+Keep that clipboard item current until Tommy reports its result. Prepare later text in files without
+copying it or opening another run request. If changed state makes the pending batch obsolete, explicitly
+supersede every earlier request, reconcile completed actions, then copy one complete replacement as the
+last step before presenting it. Never make the user choose between several outstanding clipboard requests.
+
+```text
+Ready actions: start the reviewed test run, approve the exact PRs, queue the reviewed changes.
+Handoff: one batch that starts tests, checks success, requests approval, then queues only after success.
+While it is pending: prepare other work without replacing the clipboard or asking for another paste.
+If a PR has already merged: supersede the pending request and issue one batch containing remaining work.
+```
 
 **The clipboard is volatile and nothing tells you it changed.** Any copy anywhere on the machine replaces
 it. A "Copied ..." line means it landed at that moment, not that it survived since; re-copy when in doubt.
