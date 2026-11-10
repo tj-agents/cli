@@ -72,20 +72,8 @@ function Set-UserPath {
     Say updated "user PATH (+ $BinDir)"
 }
 
-function Test-Fzf {
-    if ($Uninstall) { return }
-    if (Get-Command fzf -ErrorAction SilentlyContinue) { Say ok "fzf $((& fzf --version) -split ' ' | Select-Object -First 1)"; return }
-    if ($Check) { Say missing 'fzf'; $script:status = 1; return }
-    if (Get-Command winget -ErrorAction SilentlyContinue) {
-        & winget install --id junegunn.fzf --exact --silent --accept-source-agreements --accept-package-agreements
-        Say installed 'fzf (via winget - open a new terminal for it to be on PATH)'
-    }
-    else { Say missing 'fzf - install it with: winget install junegunn.fzf'; $script:status = 1 }
-}
-
 Install-Binaries
 if ($IsWindows -or $PSVersionTable.PSEdition -eq 'Desktop') { Set-UserPath }
-Test-Fzf
 
 # Both Windows PowerShell 5.1 and PowerShell 7 read their own profile; wire whichever exist or are installed.
 $documents = [Environment]::GetFolderPath('MyDocuments')
