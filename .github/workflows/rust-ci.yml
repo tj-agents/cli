@@ -50,11 +50,11 @@ jobs:
           mkdir -p "$HOME" && export PATH="$TJ_BIN_DIR:$PATH"
           linux/install.sh
           linux/install.sh | tee second.log
-          ! grep -E '^(installed|updated|removed) ' second.log
+          if grep -E '^(installed|updated|removed) ' second.log; then exit 1; fi
           linux/install.sh --check
           bash -ic 'type f && type cr && type __zoxide_z'
           linux/install.sh --uninstall
-          ! linux/install.sh --check
+          if linux/install.sh --check; then exit 1; fi
       - name: install twice (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
