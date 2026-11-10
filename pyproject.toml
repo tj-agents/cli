@@ -14,27 +14,264 @@ members = ["packages/tj-cli"]
 tj-cli = { workspace = true }
 
 [dependency-groups]
-dev = ["mypy>=2.4.0", "pytest>=9.1.1", "ruff>=0.17.1"]
+dev = ["mypy>=2.4.1", "pytest>=9.1.1", "ruff>=0.17.4", "pytest-socket>=0.7.0"]
 
 [tool.ruff]
-include = ["packages/tj-cli/**/*.py"]
+extend-exclude = [".agents/sync_generated.py", ".agents/dependencies", ".codex/skills", ".claude/skills", ".codex/hooks/snapshot.py", ".codex/hooks/bootstrap.py", ".worktrees", ".template", "plugins"]
+include = ["*.py", "*.pyi"]
 src = ["packages/tj-cli/src"]
 target-version = "py312"
 
 [tool.ruff.lint]
-select = ["E", "W", "F", "I", "N", "UP", "B", "A", "BLE", "C4", "SIM", "PTH", "PIE", "RET", "RUF"]
+explicit-preview-rules = true
+preview = true
+select = ["E", "W", "F", "I", "N", "UP", "B", "A", "BLE", "C4", "SIM", "PTH", "PIE", "RET", "RUF", "PGH004", "ANN401", "G004", "PLW1514", "LOG002", "LOG015", "PLC2701", "ICN001", "TID251", "TRY300", "PT009", "PT011", "PT006", "PLR6301"]
 
 [tool.mypy]
+enable_error_code = ["ignore-without-code", "exhaustive-match"]
 strict = true
 warn_unreachable = true
 files = [
     "packages/tj-cli/src",
     "packages/tj-cli/tests",
-    ".agents/cli/utility/clip/scripts",
+    ".agents",
+    "tests",
 ]
 
 [tool.pytest]
 strict = true
 testpaths = ["packages/tj-cli/tests", ".agents/tests", "tests/test_cli_operations.py"]
-addopts = ["--import-mode=importlib", "-ra"]
+addopts = ["--import-mode=importlib", "-ra", "--disable-socket"]
 filterwarnings = ["error"]
+
+[tool.ruff.lint.flake8-tidy-imports.banned-api]
+"unittest.TestCase" = { "msg" = "Use plain pytest functions and bare assertions." }
+"importlib.util.spec_from_file_location" = { "msg" = "Import the installed public API; do not load another checkout by path." }
+"sys.path" = { "msg" = "Install the declared dependency; do not modify the import search path." }
+
+[tool.ruff.lint.flake8-pytest-style]
+raises-require-match-for = ["*"]
+
+[tool.ruff.lint.per-file-ignores]
+"packages/tj-cli/tests/test_handy_install.py" = ["ANN401"]
+"packages/tj-cli/tests/process/test_execution.py" = ["PT011"]
+"packages/tj-cli/tests/clipboard/test_windows_clipboard.py" = ["PLC2701", "PLR6301"]
+"packages/tj-cli/tests/clipboard/test_text.py" = ["PLC2701"]
+"packages/tj-cli/tests/clipboard/test_posix.py" = ["PLC2701"]
+"packages/tj-cli/tests/clipboard/test_guard.py" = ["PLC2701"]
+"packages/tj-cli/src/tj_cli/native_install.py" = ["TRY300"]
+"packages/tj-cli/src/tj_cli/clipboard/_windows.py" = ["ANN401"]
+"packages/tj-cli/src/tj_cli/__init__.py" = ["F822"]
+
+[[tool.python-standards.exceptions]]
+path = "packages/tj-cli/src/tj_cli/clipboard/__init__.py"
+rule = "PY008"
+reason = "Legacy package initializer imports private implementation names for its public API."
+
+[[tool.python-standards.exceptions]]
+path = "packages/tj-cli/src/tj_cli/clipboard/_errors.py"
+rule = "PY011"
+reason = "Legacy public exception hierarchy has not yet been consolidated under its package root."
+
+[[tool.python-standards.exceptions]]
+path = "packages/tj-cli/src/tj_cli/clipboard/_guard.py"
+rule = "PY016"
+reason = "Legacy host integration reads process state while resolving native configuration."
+
+[[tool.python-standards.exceptions]]
+path = "packages/tj-cli/src/tj_cli/clipboard/_posix.py"
+rule = "PY016"
+reason = "Legacy host integration reads process state while resolving native configuration."
+
+[[tool.python-standards.exceptions]]
+path = "packages/tj-cli/src/tj_cli/handy_install.py"
+rule = "PY011"
+reason = "Legacy public exception hierarchy has not yet been consolidated under its package root."
+
+[[tool.python-standards.exceptions]]
+path = "packages/tj-cli/src/tj_cli/handy_install.py"
+rule = "PY016"
+reason = "Legacy host integration reads process state while resolving native configuration."
+
+[[tool.python-standards.exceptions]]
+path = "packages/tj-cli/src/tj_cli/native_install.py"
+rule = "PY011"
+reason = "Legacy public exception hierarchy has not yet been consolidated under its package root."
+
+[[tool.python-standards.exceptions]]
+path = "packages/tj-cli/src/tj_cli/native_install.py"
+rule = "PY016"
+reason = "Legacy host integration reads process state while resolving native configuration."
+
+[[tool.python-standards.exceptions]]
+path = "packages/tj-cli/src/tj_cli/processes.py"
+rule = "PY011"
+reason = "Legacy public exception hierarchy has not yet been consolidated under its package root."
+
+[[tool.python-standards.exceptions]]
+path = "packages/tj-cli/src/tj_cli/worktrunk_install.py"
+rule = "PY011"
+reason = "Legacy public exception hierarchy has not yet been consolidated under its package root."
+
+[[tool.python-standards.exceptions]]
+path = "packages/tj-cli/tests/clipboard/test_dispatch.py"
+rule = "PY014"
+reason = "Integration test covers public package behavior without a matching source-module name."
+
+[[tool.python-standards.exceptions]]
+path = "packages/tj-cli/tests/clipboard/test_guard.py"
+rule = "PY014"
+reason = "Integration test covers public package behavior without a matching source-module name."
+
+[[tool.python-standards.exceptions]]
+path = "packages/tj-cli/tests/clipboard/test_posix.py"
+rule = "PY014"
+reason = "Integration test covers public package behavior without a matching source-module name."
+
+[[tool.python-standards.exceptions]]
+path = "packages/tj-cli/tests/clipboard/test_text.py"
+rule = "PY014"
+reason = "Integration test covers public package behavior without a matching source-module name."
+
+[[tool.python-standards.exceptions]]
+path = "packages/tj-cli/tests/clipboard/test_windows_clipboard.py"
+rule = "PY014"
+reason = "Integration test covers public package behavior without a matching source-module name."
+
+[[tool.python-standards.exceptions]]
+path = "packages/tj-cli/tests/process/conftest.py"
+rule = "PY016"
+reason = "Existing test reads or replaces process state at a command boundary."
+
+[[tool.python-standards.exceptions]]
+path = "packages/tj-cli/tests/process/fixtures/background_child.py"
+rule = "PY016"
+reason = "Executable fixture reads process state to emulate an external command."
+
+[[tool.python-standards.exceptions]]
+path = "packages/tj-cli/tests/process/fixtures/background_root.py"
+rule = "PY009"
+reason = "Executable fixture performs import-time process reads to emulate an external command."
+
+[[tool.python-standards.exceptions]]
+path = "packages/tj-cli/tests/process/fixtures/background_root.py"
+rule = "PY016"
+reason = "Executable fixture reads process state to emulate an external command."
+
+[[tool.python-standards.exceptions]]
+path = "packages/tj-cli/tests/process/fixtures/batch_argv.py"
+rule = "PY009"
+reason = "Executable fixture performs import-time process reads to emulate an external command."
+
+[[tool.python-standards.exceptions]]
+path = "packages/tj-cli/tests/process/fixtures/batch_argv.py"
+rule = "PY016"
+reason = "Executable fixture reads process state to emulate an external command."
+
+[[tool.python-standards.exceptions]]
+path = "packages/tj-cli/tests/process/test_execution.py"
+rule = "PY014"
+reason = "Integration test covers public package behavior without a matching source-module name."
+
+[[tool.python-standards.exceptions]]
+path = "packages/tj-cli/tests/process/test_execution.py"
+rule = "PY016"
+reason = "Existing test reads or replaces process state at a command boundary."
+
+[[tool.python-standards.exceptions]]
+path = "packages/tj-cli/tests/process/test_execution.py"
+rule = "PY017"
+reason = "Existing test observes the clock while exercising timeout behavior."
+
+[[tool.python-standards.exceptions]]
+path = "packages/tj-cli/tests/process/test_windows.py"
+rule = "PY014"
+reason = "Integration test covers public package behavior without a matching source-module name."
+
+[[tool.python-standards.exceptions]]
+path = "packages/tj-cli/tests/process/test_windows.py"
+rule = "PY017"
+reason = "Existing test observes the clock while exercising timeout behavior."
+
+[[tool.python-standards.exceptions]]
+path = "packages/tj-cli/tests/test_distribution_updates.py"
+rule = "PY014"
+reason = "Integration test covers public package behavior without a matching source-module name."
+
+[[tool.python-standards.exceptions]]
+path = "packages/tj-cli/tests/test_handy_install.py"
+rule = "PY016"
+reason = "Existing test reads or replaces process state at a command boundary."
+
+[[tool.python-standards.exceptions]]
+path = "packages/tj-cli/tests/test_native_install.py"
+rule = "PY016"
+reason = "Existing test reads or replaces process state at a command boundary."
+
+[[tool.python-standards.exceptions]]
+path = "tests/fixtures/dummy_agent.py"
+rule = "PY016"
+reason = "Executable fixture reads process state to emulate an external command."
+
+[[tool.python-standards.exceptions]]
+path = "tests/fixtures/fake_codex.py"
+rule = "PY009"
+reason = "Executable fixture performs import-time process reads to emulate an external command."
+
+[[tool.python-standards.exceptions]]
+path = "tests/fixtures/fake_codex.py"
+rule = "PY016"
+reason = "Executable fixture reads process state to emulate an external command."
+
+[[tool.python-standards.exceptions]]
+path = "tests/fixtures/fake_inbox.py"
+rule = "PY016"
+reason = "Executable fixture reads process state to emulate an external command."
+
+[[tool.python-standards.exceptions]]
+path = "tests/test_cli_operations.py"
+rule = "PY014"
+reason = "Integration test covers public package behavior without a matching source-module name."
+
+[[tool.python-standards.exceptions]]
+path = "tests/test_cli_operations.py"
+rule = "PY017"
+reason = "Existing test observes the clock while exercising timeout behavior."
+
+[tool.ruff.lint.extend-per-file-ignores]
+".agents/cli/utility/clip/scripts/copy_draft.py" = ["E501", "TID251", "TRY300"]
+".agents/tests/test_cli_runtime.py" = ["E501", "I001", "TID251"]
+".agents/tests/test_copy_draft.py" = ["E501", "TID251"]
+"tests/fixtures/dummy_agent.py" = ["E501", "PTH109", "PTH123"]
+"tests/fixtures/fake_codex.py" = ["B905", "E501", "PTH123"]
+"tests/fixtures/fake_inbox.py" = ["E501", "PLC2701", "PLW1514", "PTH123"]
+"tests/test_cli_operations.py" = ["E402", "I001", "PT009", "TID251"]
+
+[tool.ruff.format]
+exclude = [
+  ".agents/cli/utility/clip/scripts/copy_draft.py",
+  ".agents/tests/test_cli_runtime.py",
+  ".agents/tests/test_copy_draft.py",
+  "tests/fixtures/dummy_agent.py",
+  "tests/fixtures/fake_codex.py",
+]
+
+[[tool.mypy.overrides]]
+module = "dummy_agent"
+disable_error_code = ["attr-defined"]
+
+[[tool.mypy.overrides]]
+module = "fake_codex"
+disable_error_code = ["type-arg"]
+
+[[tool.mypy.overrides]]
+module = "fake_inbox"
+disable_error_code = ["attr-defined"]
+
+[[tool.mypy.overrides]]
+module = "test_cli_operations"
+disable_error_code = ["attr-defined", "dict-item", "index", "no-untyped-call", "no-untyped-def", "union-attr"]
+
+[[tool.mypy.overrides]]
+module = "test_cli_runtime"
+disable_error_code = ["arg-type", "no-untyped-def", "union-attr"]
