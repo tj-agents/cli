@@ -30,8 +30,7 @@ updates so the console-to-tab association can be verified.
 
 ## Install
 
-You need Python 3.12 or newer, [fzf](https://github.com/junegunn/fzf) 0.54 or newer,
-[zoxide](https://github.com/ajeetdsouza/zoxide), and either a Rust
+You need Python 3.12 or newer, [zoxide](https://github.com/ajeetdsouza/zoxide), and either a Rust
 toolchain (to build from this checkout) or the [GitHub CLI](https://cli.github.com) (to download a verified
 prebuilt release).
 
@@ -56,8 +55,8 @@ for everything else, so re-running it after a `git pull` is how you upgrade. It:
 
 1. builds `tj` and `tj_hook` (or downloads the latest verified release) and puts them in `~/.local/bin` on Linux or
    `%LOCALAPPDATA%\Programs\tj` on Windows, adding that folder to your user PATH on Windows;
-2. checks for fzf and zoxide. On Windows it installs missing tools with winget; on Linux it tells you
-   the packages to install (`pkexec pacman -S --needed fzf zoxide` on Arch);
+2. checks for zoxide. On Windows it installs it with winget when missing; on Linux it tells you
+   the package to install (`pkexec pacman -S --needed zoxide` on Arch);
 3. adds one marked block to each shell startup file it finds (bash, zsh, fish, PowerShell):
 
    ```bash
@@ -77,19 +76,46 @@ never visited. Uninstall removes the CLI wiring and binaries, leaving zoxide and
 | Check what's set up, change nothing | `linux/install.sh --check` | `windows\install.ps1 -Check` |
 | Remove CLI binaries and shell wiring | `linux/install.sh --uninstall` | `windows\install.ps1 -Uninstall` |
 
-[worktrunk](https://github.com/max-sixty/worktrunk), installed as `git-wt` next to `tj` for `tj run` to
+[fzf](https://github.com/junegunn/fzf) 0.75.0,
+[worktrunk](https://github.com/max-sixty/worktrunk) 0.81.0, installed as `git-wt` next to `tj` for `tj run` to
 remove worktrees with, and [Handy](https://github.com/cjpais/Handy) are installed and kept current by
-[Agent](https://github.com/tj-agents/agent#install)'s install and refresh, through `tj_cli.worktrunk_install`
-and `tj_cli.handy_install` at the `tj-cli` revision Agent pins.
+[Agent](https://github.com/tj-agents/agent#install)'s install and refresh, through `tj_cli.fzf_install`,
+`tj_cli.worktrunk_install` and `tj_cli.handy_install` at the `tj-cli` revision Agent pins.
+The CLI shell installers own native binaries, shell wiring and zoxide. Agent owns the additional tools listed above.
+
+The managed installers below each write a JSON receipt in the tj bin directory. The shared format records `schema: 1`,
+`version`, `hashes` (installed file path to SHA-256), `identity` and `archive_digest`. Native receipts also
+record the immutable source revision; Handy records its absolute desktop application path.
+Unreceipted or changed installations need installation again. The `pending` functions return a reason
+string for drift, or `None` when current, using files only:
+
+| API | Receipt under the tj bin directory |
+| --- | --- |
+| `tj_cli.fzf_install.pending(bin_dir: Path) -> str \| None` | `.tj-fzf.json` |
+| `tj_cli.worktrunk_install.pending(bin_dir: Path) -> str \| None` | `.tj-worktrunk.json` |
+| `tj_cli.handy_install.pending(bin_dir: Path) -> str \| None` | `.tj-handy.json` |
+| `tj_cli.native_install.pending(bin_dir: Path, *, revision: str \| None = None) -> str \| None` | `.tj-native.json` |
+
+The installers' `--bin-dir` defaults to `TJ_BIN_DIR`, otherwise
+`~/.local/bin` on Linux or `%LOCALAPPDATA%\Programs\tj` on Windows. Pass Agent's pinned CLI revision
+to native `pending` to check revision drift too.
+The existing native `pending_native` checks runtime compatibility by invoking `tj_hook`; refresh stale
+checks should use `pending`. Agent's receipt watch registration is a separate integration change.
 
 ### Voice dictation in Claude and Codex
 
 Handy is a desktop prerequisite provisioned by Agent's install and refresh. They check for Handy on each
-run, install it only when missing, and fail if installation fails: Windows uses winget; Linux desktops use a
+run, install or upgrade it to the pinned 0.10.0 when its receipt is missing or stale, and fail if installation
+fails: Windows uses winget; Linux desktops use a
 SHA-256-verified upstream package through APT or DNF, with GitHub CLI and sudo required for a non-root
-installation. Other Linux distributions need Handy installed with `handy` on PATH. CI and Linux sessions
+installation. Automatic Linux setup requires one of those package managers. CI and Linux sessions
 without a display report the step as not applicable; for SSH or WSL terminal use, install on the desktop
-host. Install `--check` reports a missing application without installing or downloading anything.
+host. Install `--check` reports a missing or stale installation without installing or downloading anything.
+`python -m tj_cli.handy_install --no-escalate` never calls sudo or starts a Windows installation that
+could prompt for elevation. A required privileged Linux installation or Windows desktop setup fails
+with one line; an intact current installation remains a no-op. The installer entry point decides whether
+Handy applies to its environment. Handy's `pending(bin_dir)` always checks the supplied directory;
+callers decide whether to skip the desktop prerequisite in CI or headless sessions.
 
 Open Handy once, download a speech model, select your microphone and hold-to-talk shortcut, and enable
 launch at login in Handy's settings. Use `Shift+Insert` as the paste method for Windows terminals, or the
