@@ -79,6 +79,12 @@ install_binaries() {
 
 check_deps() {
     [ "$mode" = "uninstall" ] && return
+    if command -v zoxide >/dev/null 2>&1; then
+        say ok "$(zoxide --version)"
+    else
+        say missing "zoxide - install it with your package manager (Arch: pacman -S zoxide, Debian/Ubuntu: see https://github.com/ajeetdsouza/zoxide#installation)"
+        status=1
+    fi
     case ":$PATH:" in
         *":$bin_dir:"*) ;;
         *) say warning "$bin_dir is not on PATH - add it in your shell's startup file" ;;

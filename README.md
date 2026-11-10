@@ -9,6 +9,7 @@ two everyday commands, plus `tj run`, the root process of every agent tab:
 | --- | --- |
 | `cr` | Search your Claude Code or Codex sessions by **anything said in them**, preview how each one ended, and press Enter to resume it in the folder it was started from. |
 | `f` | Fuzzy-jump to a project folder. `f core` goes straight to the best match; plain `f` opens a picker. |
+| `cd` / `cdi` | Use [zoxide](https://github.com/ajeetdsouza/zoxide) to jump to a previously visited directory by name, or choose one interactively with `cdi`. |
 | `run` | Run an agent in its tab and close its work item out once it is finished: agent stopped, worktree removed, card Done, tab closed. |
 | `message` | Send another Claude or Codex session a message, addressed by its tab title, with the same behaviour from either host. |
 
@@ -29,7 +30,7 @@ updates so the console-to-tab association can be verified.
 
 ## Install
 
-You need Python 3.12 or newer and either a Rust
+You need Python 3.12 or newer, [zoxide](https://github.com/ajeetdsouza/zoxide), and either a Rust
 toolchain (to build from this checkout) or the [GitHub CLI](https://cli.github.com) (to download a verified
 prebuilt release).
 
@@ -54,13 +55,21 @@ for everything else, so re-running it after a `git pull` is how you upgrade. It:
 
 1. builds `tj` and `tj_hook` (or downloads the latest verified release) and puts them in `~/.local/bin` on Linux or
    `%LOCALAPPDATA%\Programs\tj` on Windows, adding that folder to your user PATH on Windows;
-2. adds one marked block to each shell startup file it finds (bash, zsh, fish, PowerShell):
+2. checks for zoxide. On Windows it installs it with winget when missing; on Linux it tells you
+   the package to install (`pkexec pacman -S --needed zoxide` on Arch);
+3. adds one marked block to each shell startup file it finds (bash, zsh, fish, PowerShell):
 
    ```bash
    # >>> tj-agents/cli >>>
    command -v tj >/dev/null 2>&1 && eval "$(tj init bash)"
    # <<< tj-agents/cli <<<
    ```
+
+`tj init` owns zoxide initialization for Bash, Zsh, Fish and PowerShell, using `--cmd cd`.
+Keep only the tj-agents block in your shell profile; remove separate `zoxide init` lines.
+Normal `cd path` still works; after visiting a directory, `cd name` can find it from elsewhere and
+`cdi name` opens an interactive picker. `f` searches the projects tree, including directories you have
+never visited. Uninstall removes the CLI wiring and binaries, leaving zoxide and its history installed.
 
 | | Linux | Windows |
 | --- | --- | --- |
@@ -72,9 +81,9 @@ for everything else, so re-running it after a `git pull` is how you upgrade. It:
 remove worktrees with, and [Handy](https://github.com/cjpais/Handy) are installed and kept current by
 [Agent](https://github.com/tj-agents/agent#install)'s install and refresh, through `tj_cli.fzf_install`,
 `tj_cli.worktrunk_install` and `tj_cli.handy_install` at the `tj-cli` revision Agent pins.
-The CLI shell installers own native binaries and shell wiring. Agent owns these additional tools.
+The CLI shell installers own native binaries, shell wiring and zoxide. Agent owns the additional tools listed above.
 
-Each tool installer writes a JSON receipt in the tj bin directory. The shared format records `schema: 1`,
+The managed installers below each write a JSON receipt in the tj bin directory. The shared format records `schema: 1`,
 `version`, `hashes` (installed file path to SHA-256), `identity` and `archive_digest`. Native receipts also
 record the immutable source revision; Handy records its absolute desktop application path.
 Unreceipted or changed installations need installation again. The `pending` functions return a reason
