@@ -42,6 +42,9 @@ into one pasteable batch, in dependency order, with explicit failure checks befo
 the batch's actions and targets before asking him to run it. Keep required human approvals in that batch;
 combining commands does not authorize an agent to perform them.
 
+For parallel work in one conversation, the parent owns the combined handoff. Workers report required
+human actions to that owner without copying commands or opening competing run requests.
+
 Keep that clipboard item current until Tommy reports its result. Prepare later text in files without
 copying it or opening another run request. If changed state makes the pending batch obsolete, explicitly
 supersede every earlier request, reconcile completed actions, then copy one complete replacement as the
