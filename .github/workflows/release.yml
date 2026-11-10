@@ -2,7 +2,7 @@ name: Release native CLI
 
 on:
   workflow_run:
-    workflows: [ci, Rust CI]
+    workflows: [CI, Rust CI]
     types: [completed]
 
 concurrency:
@@ -14,6 +14,7 @@ permissions:
 
 jobs:
   qualify:
+    name: qualify
     # A completed own-repository push run is the only trusted release signal. The
     # other workflow can complete later, so its completion gets a fresh qualifier.
     if: >-
@@ -37,6 +38,7 @@ jobs:
         run: python -m tj_cli.native_release
 
   build:
+    name: build
     needs: qualify
     if: needs.qualify.outputs.sha != ''
     runs-on: ${{ matrix.os }}
@@ -53,17 +55,22 @@ jobs:
         with:
           ref: ${{ needs.qualify.outputs.sha }}
           persist-credentials: false
-      - name: install Rust
+      - name: Install Rust
         shell: bash
         run: rustup toolchain install stable --profile minimal && rustup default stable
       - run: cargo build --release --locked
-      - name: package (Linux)
+      - name: Package (Linux)
         if: runner.os == 'Linux'
-        run: tar -czf tj-${{ matrix.target }}.tar.gz -C target/release tj tj_hook
-      - name: package (Windows)
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: tar -czf "tj-$TARGET.tar.gz" -C target/release tj tj_hook
+      - name: Package (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
-        run: Compress-Archive -Path target/release/tj.exe,target/release/tj_hook.exe -DestinationPath tj-${{ matrix.target }}.zip
+        env:
+          TARGET: ${{ matrix.target }}
+        run: Compress-Archive -Path target/release/tj.exe,target/release/tj_hook.exe -DestinationPath "tj-$env:TARGET.zip"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: tj-${{ matrix.target }}
@@ -72,6 +79,7 @@ jobs:
           retention-days: 7
 
   publish:
+    name: publish
     needs: [qualify, build]
     if: needs.qualify.outputs.sha != ''
     runs-on: ubuntu-latest
@@ -81,7 +89,7 @@ jobs:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           merge-multiple: true
-      - name: publish exact current main revision
+      - name: Publish exact current main revision
         env:
           GH_TOKEN: ${{ github.token }}
           REPOSITORY: ${{ github.repository }}
