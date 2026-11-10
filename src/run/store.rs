@@ -69,6 +69,11 @@ pub fn closing(launch_id: &str) -> Result<bool> {
     Ok(state(&data["launch"]) == Some("closing") || state(&data["session"]) == Some("closing"))
 }
 
+pub fn bound_session(launch_id: &str) -> Result<Option<String>> {
+    let data = call(&["show", "--launch-id", launch_id])?;
+    Ok(data["session"]["native_id"].as_str().filter(|id| !id.is_empty()).map(str::to_owned))
+}
+
 pub fn end(launch_id: &str, reason: &str) -> Result<()> {
     call(&["end", "--launch-id", launch_id, "--reason", reason]).map(drop)
 }
