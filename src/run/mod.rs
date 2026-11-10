@@ -1,9 +1,10 @@
 pub mod closeout;
+pub mod restart;
 pub(crate) mod store;
 
 use std::collections::HashSet;
-use std::ffi::OsString;
-use std::path::PathBuf;
+use std::ffi::{OsStr, OsString};
+use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -22,6 +23,10 @@ impl Host {
             Self::Codex => (Stop::Keys, 3),
         }
     }
+
+    fn from_program(program: &OsStr) -> Option<Self> {
+        Self::from_name(&Path::new(program).file_stem()?.to_string_lossy().to_lowercase())
+    }
 }
 
 pub struct Launch {
@@ -34,20 +39,21 @@ pub struct Launch {
 
 #[derive(clap::Args)]
 pub struct Args {
+    /// Defaults to the agent executable's name.
     #[arg(long, value_enum)]
-    host: Host,
-    /// Tab title, exported to the agent as AGENT_CLI_TAB_TITLE.
+    host: Option<Host>,
+    /// Tab title, exported to the agent as AGENT_CLI_TAB_TITLE. Defaults to the repository or worktree folder's name.
     #[arg(long)]
-    title: String,
-    /// The worktree the agent works in. Only a linked worktree is removed at closeout.
+    title: Option<String>,
+    /// The worktree the agent works in, by default the current folder. Only a linked worktree is removed at closeout.
     #[arg(long)]
-    cwd: PathBuf,
+    cwd: Option<PathBuf>,
     /// Work item reference, for example `github:github.com/acme/app:461`.
     #[arg(long)]
     item: Option<String>,
-    /// Identifies this launch in agent-store; the launcher waits for the row it names.
+    /// Identifies this launch in agent-store; the launcher waits for the row it names. Generated when omitted.
     #[arg(long)]
-    launch_id: String,
+    launch_id: Option<String>,
     /// The session that handed this work off, as `host:id`.
     #[arg(long)]
     parent: Option<String>,
@@ -57,6 +63,8 @@ pub struct Args {
     idle_seconds: u64,
     #[arg(long, hide = true, default_value_t = 10)]
     grace_seconds: u64,
+    #[arg(long, hide = true, default_value_t = 30)]
+    restart_grace_seconds: u64,
     /// The agent's command line.
     #[arg(last = true, required = true)]
     agent: Vec<OsString>,
@@ -85,11 +93,52 @@ fn record_launch(launch: &Launch, parent: Option<&str>, wrapper_pid: u32, wrappe
     }
 }
 
-fn marker(launch_id: &str) -> Result<PathBuf> {
+fn marks(launch_id: &str) -> Result<PathBuf> {
     if launch_id.is_empty() || !launch_id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
         bail!("launch id {launch_id:?} must be letters, digits, '-' or '_'");
     }
-    Ok(paths::cache_dir()?.join("run").join(launch_id).join("done"))
+    Ok(paths::cache_dir()?.join("run").join(launch_id))
+}
+
+fn launch_id() -> Option<String> {
+    std::env::var("TJ_RUN_LAUNCH_ID").ok().filter(|id| !id.is_empty())
+}
+
+fn generated_id() -> Result<String> {
+    let mut bytes = [0u8; 16];
+    getrandom::fill(&mut bytes).map_err(|error| anyhow::anyhow!("no OS randomness: {error}"))?;
+    Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
+fn default_title(cwd: &Path) -> String {
+    let toplevel = hidden("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .current_dir(cwd)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| PathBuf::from(String::from_utf8_lossy(&output.stdout).trim()));
+    let folder = toplevel.as_deref().unwrap_or(cwd);
+    let base = folder.file_name().map_or_else(|| "agent".to_owned(), |name| name.to_string_lossy().into_owned());
+    let taken: HashSet<String> = store::open_launches(None)
+        .map(|rows| rows.into_iter().map(|row| row.launch.title).collect())
+        .unwrap_or_default();
+    std::iter::once(base.clone())
+        .chain((2..).map(|number| format!("{base}-{number}")))
+        .find(|title| !taken.contains(title))
+        .unwrap_or(base)
+}
+
+fn launch(args: &Args) -> Result<Launch> {
+    let cwd = std::path::absolute(args.cwd.clone().map_or_else(std::env::current_dir, Ok)?)?;
+    let program = &args.agent[0];
+    let Some(host) = args.host.or_else(|| Host::from_program(program)) else {
+        bail!("pass --host: {} is neither claude nor codex", program.to_string_lossy());
+    };
+    let title = args.title.clone().unwrap_or_else(|| default_title(&cwd));
+    let id = args.launch_id.clone().map_or_else(generated_id, Ok)?;
+    Ok(Launch { id, host, title, cwd, item: args.item.clone() })
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -101,7 +150,8 @@ enum Trigger {
 
 struct Watch {
     launch: Launch,
-    marker: PathBuf,
+    environment: [(&'static str, String); 4],
+    marks: PathBuf,
     poll: Duration,
     idle: Duration,
     next_poll: Instant,
@@ -118,7 +168,8 @@ impl Watch {
 
     fn trigger(&mut self) -> Option<Trigger> {
         let idle = self
-            .marker
+            .marks
+            .join("done")
             .metadata()
             .and_then(|meta| meta.modified())
             .ok()
@@ -167,6 +218,35 @@ fn stop(agent: &mut Agent, host: Host, grace: Duration) -> Result<()> {
     agent.kill_tree(Duration::from_secs(30)).context("could not end the agent's processes")
 }
 
+enum Restarted {
+    Kept,
+    Resumed(Agent),
+}
+
+fn restart(agent: &mut Agent, watch: &mut Watch, command: &[OsString], grace: Duration) -> Result<Restarted> {
+    let host = watch.launch.host;
+    let session = match store::bound_session(&watch.launch.id) {
+        Ok(Some(session)) => session,
+        Ok(None) => {
+            watch.report(format!(
+                "not restarting: no {} session is bound to launch {} yet",
+                host.name(),
+                watch.launch.id
+            ));
+            return Ok(Restarted::Kept);
+        }
+        Err(error) => {
+            watch.report(format!("not restarting: {error:#}"));
+            return Ok(Restarted::Kept);
+        }
+    };
+    eprintln!("\r\ntj run: restarting to resume {}:{session}\r", host.name());
+    stop(agent, host, grace)?;
+    let resumed = Agent::start(&host.resume(command, &session), &watch.launch.cwd, &watch.environment)
+        .with_context(|| format!("could not resume {}:{session}", host.name()))?;
+    Ok(Restarted::Resumed(resumed))
+}
+
 fn wait_for_enter() {
     eprintln!("tj run: press Enter to close this tab");
     let _ = std::io::stdin().read_line(&mut String::new());
@@ -178,15 +258,9 @@ fn rfc3339(time: SystemTime) -> String {
 
 pub fn run(args: Args) -> Result<ExitCode> {
     agent::prepare_wrapper().context("could not prepare the console")?;
-    let launch = Launch {
-        id: args.launch_id,
-        host: args.host,
-        title: args.title,
-        cwd: std::path::absolute(&args.cwd)?,
-        item: args.item,
-    };
-    let marker = marker(&launch.id)?;
-    let _ = std::fs::remove_file(&marker);
+    let launch = launch(&args)?;
+    let marks = marks(&launch.id)?;
+    let _ = std::fs::remove_dir_all(&marks);
     let pid = std::process::id();
     let started_at = rfc3339(agent::started_at(pid).unwrap_or_else(SystemTime::now));
     let environment = [
@@ -199,18 +273,26 @@ pub fn run(args: Args) -> Result<ExitCode> {
     let mut agent = Agent::start(&args.agent, &launch.cwd, &environment)
         .with_context(|| format!("could not start {}", args.agent[0].to_string_lossy()))?;
     let poll = Duration::from_secs(args.poll_seconds);
+    let grace = Duration::from_secs(args.grace_seconds);
+    let request = restart::Request::new(&marks, Duration::from_secs(args.restart_grace_seconds));
     let mut watch = Watch {
         launch,
-        marker,
+        environment,
+        marks,
         poll,
         idle: Duration::from_secs(args.idle_seconds),
         next_poll: Instant::now() + poll,
         reported: HashSet::new(),
     };
+    let mut resumed = false;
     let removal = loop {
         if let Some(code) = agent.try_wait()? {
             agent.kill_tree(Duration::from_secs(30))?;
-            let _ = std::fs::remove_dir_all(watch.marker.parent().unwrap_or(&watch.marker));
+            if resumed && code != 0 {
+                eprintln!("\r\ntj run: the resumed agent exited with code {code}\r");
+                wait_for_enter();
+            }
+            let _ = std::fs::remove_dir_all(&watch.marks);
             if let Err(error) = store::end(&watch.launch.id, "exited") {
                 eprintln!("tj run: {error:#}");
             }
@@ -222,16 +304,34 @@ pub fn run(args: Args) -> Result<ExitCode> {
                 Err(reason) => {
                     watch.report(reason);
                     if trigger == Trigger::Done {
-                        let _ = std::fs::remove_file(&watch.marker);
+                        let _ = std::fs::remove_file(watch.marks.join("done"));
                     }
+                }
+            }
+        }
+        if let Some(reason) = request.due() {
+            match restart(&mut agent, &mut watch, &args.agent, grace) {
+                Ok(Restarted::Kept) => {}
+                Ok(Restarted::Resumed(next)) => {
+                    agent = next;
+                    resumed = true;
+                    request.restarted(&reason);
+                }
+                Err(error) => {
+                    eprintln!("tj run: restart stopped: {error:#}");
+                    let _ = std::fs::remove_dir_all(&watch.marks);
+                    if let Err(error) = store::end(&watch.launch.id, "exited") {
+                        eprintln!("tj run: {error:#}");
+                    }
+                    wait_for_enter();
+                    return Ok(ExitCode::FAILURE);
                 }
             }
         }
         std::thread::sleep(Duration::from_millis(500));
     };
-    let result = stop(&mut agent, watch.launch.host, Duration::from_secs(args.grace_seconds))
-        .and_then(|()| closeout::finish(&watch.launch, removal));
-    let _ = std::fs::remove_dir_all(watch.marker.parent().unwrap_or(&watch.marker));
+    let result = stop(&mut agent, watch.launch.host, grace).and_then(|()| closeout::finish(&watch.launch, removal));
+    let _ = std::fs::remove_dir_all(&watch.marks);
     if let Err(error) = result {
         eprintln!("tj run: closeout stopped: {error:#}");
         wait_for_enter();
@@ -242,27 +342,46 @@ pub fn run(args: Args) -> Result<ExitCode> {
 
 #[derive(clap::Args)]
 pub struct DoneArgs {
-    /// Withdraw the mark, because new input arrived. A no-op outside `tj run`.
+    /// Withdraw the mark and the idle mark, because new input arrived. A no-op outside `tj run`.
     #[arg(long)]
     cancel: bool,
 }
 
 pub fn done(args: DoneArgs) -> Result<ExitCode> {
-    let Some(launch_id) = std::env::var("TJ_RUN_LAUNCH_ID").ok().filter(|id| !id.is_empty()) else {
+    let Some(launch_id) = launch_id() else {
         if args.cancel {
             return Ok(ExitCode::SUCCESS);
         }
         bail!("tj done only works inside a tj run session (TJ_RUN_LAUNCH_ID is not set)");
     };
-    let marker = marker(&launch_id)?;
+    let marks = marks(&launch_id)?;
+    let marker = marks.join("done");
     if args.cancel {
-        match std::fs::remove_file(&marker) {
-            Err(error) if error.kind() != std::io::ErrorKind::NotFound => return Err(error.into()),
-            _ => return Ok(ExitCode::SUCCESS),
+        for mark in [marker, marks.join(restart::IDLE)] {
+            match std::fs::remove_file(&mark) {
+                Err(error) if error.kind() != std::io::ErrorKind::NotFound => return Err(error.into()),
+                _ => {}
+            }
         }
+        return Ok(ExitCode::SUCCESS);
     }
     std::fs::create_dir_all(marker.parent().context("marker has no folder")?)?;
     std::fs::write(&marker, rfc3339(SystemTime::now()))?;
     println!("Marked done: this session closes out once it has been idle for about 10 minutes. New input cancels.");
     Ok(ExitCode::SUCCESS)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::ffi::OsStr;
+    use std::path::Path;
+
+    use crate::host::Host;
+
+    #[test]
+    fn the_host_is_read_from_the_agent_executable_name() {
+        assert_eq!(Host::from_program(OsStr::new("claude")), Some(Host::Claude));
+        assert_eq!(Host::from_program(Path::new("bin").join("Codex.EXE").as_os_str()), Some(Host::Codex));
+        assert_eq!(Host::from_program(OsStr::new("python")), None);
+    }
 }
