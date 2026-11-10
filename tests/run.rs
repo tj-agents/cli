@@ -72,6 +72,7 @@ fn sandbox() -> Sandbox {
     std::fs::create_dir(&stubs).unwrap();
     stub(&stubs, "agent-store", r#"{"ok":true,"data":{}}"#);
     stub(&stubs, "tj-item", r#"{"prs":[],"all_merged":false}"#);
+    stub(&stubs, "tj-prepare", "prepared");
     for folder in ["home", "cache"] {
         std::fs::create_dir(root.join(folder)).unwrap();
     }
@@ -314,6 +315,25 @@ fn the_launch_is_recorded_before_the_agent_starts() {
     finish(child, Duration::from_secs(60));
     let seen_by_agent = log(&sandbox, "dummy.log");
     assert!(seen_by_agent.contains("launch --launch-id first --host"), "{seen_by_agent}");
+}
+
+#[test]
+fn repository_preparation_finishes_before_the_agent_starts() {
+    let sandbox = sandbox();
+    let mut arguments = run_arguments(&sandbox, "prepared", "codex", "exit", "10");
+    arguments.truncate(arguments.iter().position(|argument| argument == "--").unwrap() + 1);
+    let preparation_log = sandbox.stubs.join("tj-prepare.log");
+    arguments.extend([
+        python().to_owned(),
+        "-c".to_owned(),
+        format!("import os, shutil; shutil.copyfile(r'{}', os.environ['DUMMY_LOG'])", preparation_log.display()),
+    ]);
+    let child = spawn(&sandbox, &arguments, &sandbox.root);
+    let output = finish(child, Duration::from_secs(30));
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let prepared = log(&sandbox, "dummy.log");
+    assert!(prepared.contains("--host codex --cwd"), "{prepared}");
+    assert!(prepared.contains(sandbox.worktree.to_str().unwrap()), "{prepared}");
 }
 
 #[test]

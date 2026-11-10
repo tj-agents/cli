@@ -77,6 +77,25 @@ pub fn hidden(program: &str) -> Command {
     command
 }
 
+fn prepare(launch: &Launch, arguments: &[OsString]) {
+    let result = hidden("tj-prepare")
+        .args(["--host", launch.host.name(), "--cwd"])
+        .arg(&launch.cwd)
+        .arg("--")
+        .args(&arguments[1..])
+        .current_dir(&launch.cwd)
+        .stdin(std::process::Stdio::null())
+        .output();
+    match result {
+        Ok(output) if output.status.success() => {}
+        Ok(output) => eprintln!(
+            "tj run: repository standards preparation failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ),
+        Err(error) => eprintln!("tj run: repository standards preparation unavailable: {error}"),
+    }
+}
+
 /// The agent's SessionStart registers against this row, so it must exist before the agent starts.
 fn record_launch(launch: &Launch, parent: Option<&str>, wrapper_pid: u32, wrapper_started_at: &str) {
     let mut failure = None;
@@ -242,6 +261,7 @@ fn restart(agent: &mut Agent, watch: &mut Watch, command: &[OsString], grace: Du
     };
     eprintln!("\r\ntj run: restarting to resume {}:{session}\r", host.name());
     stop(agent, host, grace)?;
+    prepare(&watch.launch, command);
     let resumed = Agent::start(&host.resume(command, &session), &watch.launch.cwd, &watch.environment)
         .with_context(|| format!("could not resume {}:{session}", host.name()))?;
     Ok(Restarted::Resumed(resumed))
@@ -270,6 +290,7 @@ pub fn run(args: Args) -> Result<ExitCode> {
         ("AGENT_CLI_TAB_TITLE", launch.title.clone()),
     ];
     record_launch(&launch, args.parent.as_deref(), pid, &started_at);
+    prepare(&launch, &args.agent);
     let mut agent = Agent::start(&args.agent, &launch.cwd, &environment)
         .with_context(|| format!("could not start {}", args.agent[0].to_string_lossy()))?;
     let poll = Duration::from_secs(args.poll_seconds);
