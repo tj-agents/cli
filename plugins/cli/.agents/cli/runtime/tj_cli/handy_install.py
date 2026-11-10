@@ -51,7 +51,7 @@ def pending(bin_dir: Path | None = None) -> str | None:
     return tool_receipts.pending(path, VERSION)
 
 
-def _registered_windows_handy() -> Path | None:
+def _registered_windows_handy(*, version: str | None = None) -> Path | None:
     registry = importlib.import_module("winreg")
     key_name = r"Software\Microsoft\Windows\CurrentVersion\Uninstall\Handy"
     for hive in (registry.HKEY_CURRENT_USER, registry.HKEY_LOCAL_MACHINE):
@@ -61,6 +61,12 @@ def _registered_windows_handy() -> Path | None:
                     hive, key_name, 0, registry.KEY_READ | view
                 ) as key:
                     location, _ = registry.QueryValueEx(key, "InstallLocation")
+                    if version is not None:
+                        installed_version, _ = registry.QueryValueEx(
+                            key, "DisplayVersion"
+                        )
+                        if installed_version != version:
+                            continue
             except FileNotFoundError:
                 continue
             if isinstance(location, str) and location:
@@ -84,7 +90,9 @@ def find_handy() -> Path | None:
     return None
 
 
-def _run(arguments: list[str]) -> subprocess.CompletedProcess[str]:
+def _run(
+    arguments: list[str], *, env: dict[str, str] | None = None
+) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         arguments,
         check=True,
@@ -93,10 +101,11 @@ def _run(arguments: list[str]) -> subprocess.CompletedProcess[str]:
         encoding="utf-8",
         errors="replace",
         timeout=600,
+        env=env,
     )
 
 
-def _install_windows() -> None:
+def _install_windows() -> Path:
     winget = shutil.which("winget")
     if winget is None:
         raise HandyInstallError(
@@ -122,6 +131,12 @@ def _install_windows() -> None:
             "--accept-package-agreements",
         ]
     )
+    installed = _registered_windows_handy(version=VERSION)
+    if installed is None:
+        raise HandyInstallError(
+            f"installer finished but Handy {VERSION} could not be found in the registry"
+        )
+    return installed
 
 
 def _linux_package() -> tuple[str, str]:
@@ -203,7 +218,42 @@ def _download_linux_package(gh: str, suffix: str, directory: Path) -> Path:
     return destination
 
 
-def _install_linux(*, no_escalate: bool) -> None:
+def _linux_version(manager: str, name: str) -> tuple[int, ...] | None:
+    command = (
+        ["dpkg-query", "--show", "--showformat=${Version}", name]
+        if manager == "apt-get"
+        else ["rpm", "--query", "--queryformat", "%{VERSION}", name]
+    )
+    try:
+        result = _run(command)
+    except subprocess.CalledProcessError as error:
+        if error.returncode != 1:
+            raise
+        return None
+    parts = result.stdout.strip().split("-", 1)[0].split(".")
+    if len(parts) != 3 or any(not part.isdecimal() for part in parts):
+        raise HandyInstallError("package manager returned an invalid Handy version")
+    return tuple(map(int, parts))
+
+
+def _linux_executable(manager: str, name: str) -> Path:
+    command = (
+        ["dpkg-query", "--listfiles", name]
+        if manager == "apt-get"
+        else ["rpm", "--query", "--list", name]
+    )
+    paths = [Path(line) for line in _run(command).stdout.splitlines()]
+    binaries = [
+        path
+        for path in paths
+        if path.is_absolute() and path.name == "handy" and path.is_file()
+    ]
+    if len(binaries) != 1:
+        raise HandyInstallError("package manager did not identify one Handy executable")
+    return binaries[0]
+
+
+def _install_linux(*, no_escalate: bool) -> Path:
     manager, suffix = _linux_package()
     gh = shutil.which("gh")
     if gh is None:
@@ -220,15 +270,57 @@ def _install_linux(*, no_escalate: bool) -> None:
         prefix = [sudo]
     with tempfile.TemporaryDirectory(prefix="tj-handy-") as temporary:
         package = _download_linux_package(gh, suffix, Path(temporary))
-        _run([*prefix, manager, "install", "-y", str(package)])
+        command = (
+            ["dpkg-deb", "--field", str(package), "Package"]
+            if manager == "apt-get"
+            else [
+                "rpm",
+                "--query",
+                "--package",
+                "--queryformat",
+                "%{NAME}",
+                str(package),
+            ]
+        )
+        name = _run(command).stdout.strip()
+        if not name or name.startswith("-") or any(c.isspace() for c in name):
+            raise HandyInstallError("downloaded package has an invalid package name")
+        expected_version = tuple(map(int, VERSION.split(".")))
+        current_version = _linux_version(manager, name)
+        operation = "install"
+        if manager == "dnf":
+            if current_version == expected_version:
+                operation = "reinstall"
+            elif current_version is not None and current_version > expected_version:
+                operation = "downgrade"
+        options = (
+            [
+                "--allow-downgrades",
+                "--reinstall",
+                "-o",
+                "Dpkg::Options::=--force-confdef",
+                "-o",
+                "Dpkg::Options::=--force-confold",
+            ]
+            if manager == "apt-get"
+            else []
+        )
+        _run(
+            [*prefix, manager, operation, "-y", *options, str(package)],
+            env=os.environ | {"DEBIAN_FRONTEND": "noninteractive"},
+        )
+        if _linux_version(manager, name) != expected_version:
+            raise HandyInstallError(f"package manager did not install Handy {VERSION}")
+        return _linux_executable(manager, name)
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Ensure desktop Handy is installed")
     parser.add_argument("--check", action="store_true")
-    parser.add_argument("--bin-dir", type=Path, default=default_bin_dir())
+    parser.add_argument("--bin-dir", type=Path)
     parser.add_argument("--no-escalate", action="store_true")
     arguments = parser.parse_args(argv)
+    arguments.bin_dir = arguments.bin_dir or default_bin_dir()
     system = platform.system()
     if reason := _not_applicable():
         print(f"n/a        Handy ({reason})")
@@ -249,12 +341,9 @@ def main(argv: list[str] | None = None) -> int:
                     f"Handy {VERSION} requires interactive setup; "
                     "rerun without --no-escalate"
                 )
-            _install_windows()
+            installed = _install_windows()
         else:
-            _install_linux(no_escalate=arguments.no_escalate)
-        installed = find_handy()
-        if installed is None:
-            raise HandyInstallError("installer finished but Handy could not be found")
+            installed = _install_linux(no_escalate=arguments.no_escalate)
         tool_receipts.write(
             arguments.bin_dir / RECEIPT,
             tool_receipts.Receipt(

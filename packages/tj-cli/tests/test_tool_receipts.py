@@ -1,10 +1,12 @@
 import json
+import platform
 import subprocess
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
 
-from tj_cli import tool_receipts
+from tj_cli import fzf_install, handy_install, tool_receipts, worktrunk_install
 
 
 @pytest.mark.parametrize(
@@ -66,3 +68,19 @@ def test_receipt_checks_absolute_application_path(tmp_path: Path) -> None:
     assert tool_receipts.pending(receipt, "1") is None
     application.unlink()
     assert tool_receipts.pending(receipt, "1") is not None
+
+
+@pytest.mark.parametrize(
+    "installer",
+    [fzf_install.main, worktrunk_install.main, handy_install.main],
+    ids=["fzf", "worktrunk", "handy"],
+)
+def test_explicit_directory_does_not_need_windows_default_environment(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    installer: Callable[[list[str]], int],
+) -> None:
+    monkeypatch.setattr(platform, "system", lambda: "Windows")
+    for variable in ("LOCALAPPDATA", "TJ_BIN_DIR", "CI"):
+        monkeypatch.delenv(variable, raising=False)
+    assert installer(["--bin-dir", str(tmp_path), "--check"]) == 1

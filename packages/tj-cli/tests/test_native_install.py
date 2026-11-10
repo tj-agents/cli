@@ -493,3 +493,16 @@ def test_native_install_receipt_records_package_version_and_revision(
     assert receipt.identity == "a" * 40
     assert receipt.archive_digest == digest
     assert native_install.pending(directory) is None
+
+
+def test_explicit_native_directory_needs_no_windows_default_environment(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(platform_module, "system", lambda: "Windows")
+    monkeypatch.delenv("LOCALAPPDATA", raising=False)
+    monkeypatch.delenv("TJ_BIN_DIR", raising=False)
+    monkeypatch.setattr(
+        sys, "argv", ["native-install", "--bin-dir", str(tmp_path), "--check"]
+    )
+    assert native_install._main() == 1

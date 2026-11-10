@@ -66,11 +66,12 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description=f"Install worktrunk {VERSION} as git-wt"
     )
-    parser.add_argument("--bin-dir", type=Path, default=default_bin_dir())
+    parser.add_argument("--bin-dir", type=Path)
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--check", action="store_true")
     mode.add_argument("--uninstall", action="store_true")
     arguments = parser.parse_args(argv)
+    arguments.bin_dir = arguments.bin_dir or default_bin_dir()
     target = executable(arguments.bin_dir)
     if arguments.uninstall:
         (arguments.bin_dir / RECEIPT).unlink(missing_ok=True)

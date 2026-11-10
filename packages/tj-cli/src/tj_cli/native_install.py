@@ -530,13 +530,14 @@ def _command_error(
 
 def _main() -> int:
     parser = argparse.ArgumentParser(description="install verified tj native binaries")
-    parser.add_argument("--bin-dir", type=Path, default=default_bin_dir())
+    parser.add_argument("--bin-dir", type=Path)
     parser.add_argument("--source", type=Path)
     parser.add_argument("--revision")
     operation = parser.add_mutually_exclusive_group()
     operation.add_argument("--check", action="store_true")
     operation.add_argument("--uninstall", action="store_true")
     arguments = parser.parse_args()
+    arguments.bin_dir = arguments.bin_dir or default_bin_dir()
     try:
         if arguments.check:
             pending = pending_native(arguments.bin_dir)

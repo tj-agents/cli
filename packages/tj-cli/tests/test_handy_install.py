@@ -29,6 +29,8 @@ def windows_registry(monkeypatch: pytest.MonkeyPatch) -> dict[tuple[int, int], s
         return contextlib.nullcontext(key)
 
     def query_value(key: tuple[int, int], name: str) -> tuple[str, int]:
+        if name == "DisplayVersion":
+            return handy_install.VERSION, 1
         assert name == "InstallLocation"
         return entries[key], 1
 
@@ -58,10 +60,12 @@ def isolated_desktop(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setenv("ProgramFiles", str(tmp_path / "program files"))
 
 
-def _windows_installation() -> Path:
+def _windows_installation(entries: dict[tuple[int, int], str] | None = None) -> Path:
     executable = Path(os.environ["LOCALAPPDATA"]) / "Handy" / "handy.exe"
     executable.parent.mkdir(parents=True)
     executable.write_bytes(b"installed")
+    if entries is not None:
+        entries[(1, 257)] = str(executable.parent)
     return executable
 
 
@@ -107,7 +111,9 @@ def test_registered_windows_custom_location_is_recognized(
 
 
 def test_windows_installs_once_and_verifies_the_result(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    windows_registry: dict[tuple[int, int], str],
 ) -> None:
     commands: list[list[str]] = []
     monkeypatch.setattr(
@@ -116,7 +122,7 @@ def test_windows_installs_once_and_verifies_the_result(
 
     def run(arguments: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
         commands.append(arguments)
-        _windows_installation()
+        _windows_installation(windows_registry)
         return subprocess.CompletedProcess(arguments, 0, "", "")
 
     monkeypatch.setattr(subprocess, "run", run)
@@ -234,6 +240,7 @@ def test_ci_does_not_install_desktop_software(
     ],
 )
 @pytest.mark.parametrize("root", [False, True])
+@pytest.mark.parametrize("current", [None, "0.9.0", "0.10.0", "0.11.0"])
 def test_linux_installs_verified_package_once(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -241,6 +248,7 @@ def test_linux_installs_verified_package_once(
     machine: str,
     suffix: str,
     root: bool,
+    current: str | None,
 ) -> None:
     monkeypatch.setattr(platform, "system", lambda: "Linux")
     monkeypatch.setattr(platform, "machine", lambda: machine)
@@ -248,6 +256,12 @@ def test_linux_installs_verified_package_once(
     installed = tmp_path / "handy"
     package = b"upstream package"
     commands: list[list[str]] = []
+    installed_version = current
+    if current == handy_install.VERSION:
+        installed.write_bytes(b"previous installation")
+        installed.chmod(0o755)
+        _receipt(installed)
+        installed.write_bytes(b"damaged installation")
 
     def which(command: str) -> str | None:
         if command == "handy":
@@ -255,7 +269,18 @@ def test_linux_installs_verified_package_once(
         return f"/tools/{command}" if command in {manager, "gh", "sudo"} else None
 
     def run(arguments: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        nonlocal installed_version
         commands.append(arguments)
+        if arguments[0] == "dpkg-deb" or (
+            arguments[0] == "rpm" and "--package" in arguments
+        ):
+            return subprocess.CompletedProcess(arguments, 0, "handy", "")
+        if arguments[0] in {"dpkg-query", "rpm"}:
+            if "--listfiles" in arguments or "--list" in arguments:
+                return subprocess.CompletedProcess(arguments, 0, f"{installed}\n", "")
+            if installed_version is None:
+                raise subprocess.CalledProcessError(1, arguments)
+            return subprocess.CompletedProcess(arguments, 0, installed_version, "")
         if arguments == ["id", "-u"]:
             return subprocess.CompletedProcess(
                 arguments, 0, "0\n" if root else "1000\n", ""
@@ -280,20 +305,43 @@ def test_linux_installs_verified_package_once(
             kwargs["stdout"].write(package)
         else:
             prefix = [] if root else ["/tools/sudo"]
-            assert arguments[:-1] == [*prefix, manager, "install", "-y"]
+            operation = (
+                "reinstall"
+                if manager == "dnf" and current == handy_install.VERSION
+                else "downgrade"
+                if manager == "dnf" and current == "0.11.0"
+                else "install"
+            )
+            options = (
+                [
+                    "--allow-downgrades",
+                    "--reinstall",
+                    "-o",
+                    "Dpkg::Options::=--force-confdef",
+                    "-o",
+                    "Dpkg::Options::=--force-confold",
+                ]
+                if manager == "apt-get"
+                else []
+            )
+            assert arguments[:-1] == [*prefix, manager, operation, "-y", *options]
+            assert kwargs["env"]["DEBIAN_FRONTEND"] == "noninteractive"
             assert Path(arguments[-1]).read_bytes() == package
             installed.write_bytes(b"executable")
             installed.chmod(0o755)
+            installed_version = handy_install.VERSION
         return subprocess.CompletedProcess(arguments, 0, "", "")
 
     monkeypatch.setattr(shutil, "which", which)
     monkeypatch.setattr(subprocess, "run", run)
     assert handy_install.main(["--no-escalate"] if root else []) == 0
+    assert installed.read_bytes() == b"executable"
+    before = len(commands)
     assert handy_install.main(["--no-escalate"]) == 0
-    assert len(commands) == 4
-    assert commands[1][2:4] == ["--hostname", "github.com"]
-    assert commands[2][2:4] == ["--hostname", "github.com"]
-    assert not Path(commands[-1][-1]).exists()
+    assert len(commands) == before
+    gh_commands = [args for args in commands if args[0] == "/tools/gh"]
+    assert len(gh_commands) == 2
+    assert all(args[2:4] == ["--hostname", "github.com"] for args in gh_commands)
 
 
 @pytest.mark.parametrize("digest", [None, "sha256:" + "0" * 64])
@@ -356,8 +404,9 @@ def test_unreceipted_application_requires_installation_without_probing(
 def test_windows_reinstalls_the_pin_for_version_drift(
     monkeypatch: pytest.MonkeyPatch,
     version: str,
+    windows_registry: dict[tuple[int, int], str],
 ) -> None:
-    executable = _windows_installation()
+    executable = _windows_installation(windows_registry)
     _receipt(executable, version)
     commands: list[list[str]] = []
     monkeypatch.setattr(
@@ -415,3 +464,76 @@ def test_linux_no_escalate_never_calls_sudo_or_downloads(
     assert handy_install.main(["--no-escalate"]) == 1
     assert len(capsys.readouterr().err.splitlines()) == 1
     assert commands == [["id", "-u"]]
+
+
+def test_windows_receipts_registered_pin_instead_of_older_path_copy(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    windows_registry: dict[tuple[int, int], str],
+) -> None:
+    shadow = tmp_path / "portable" / "handy.exe"
+    shadow.parent.mkdir()
+    shadow.write_bytes(b"old portable version")
+    managed = tmp_path / "managed" / "handy.exe"
+    managed.parent.mkdir()
+    monkeypatch.setattr(
+        shutil, "which", lambda name: str(shadow) if name == "handy" else "winget.exe"
+    )
+
+    def run(arguments: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        managed.write_bytes(b"pinned installation")
+        windows_registry[(1, 257)] = str(managed.parent)
+        return subprocess.CompletedProcess(arguments, 0, "", "")
+
+    monkeypatch.setattr(subprocess, "run", run)
+    assert handy_install.main([]) == 0
+    receipt = tool_receipts.read(Path(os.environ["TJ_BIN_DIR"]) / handy_install.RECEIPT)
+    assert receipt is not None
+    assert receipt.hashes == {str(managed.resolve()): tool_receipts.sha256(managed)}
+    assert handy_install.pending() is None
+
+
+def test_windows_installer_success_without_pinned_registration_is_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    executable = _windows_installation()
+    monkeypatch.setattr(
+        shutil,
+        "which",
+        lambda name: str(executable) if name == "handy" else "winget.exe",
+    )
+    monkeypatch.setattr(
+        subprocess, "run", lambda *a, **kw: subprocess.CompletedProcess([], 0, "", "")
+    )
+    assert handy_install.main([]) == 1
+    assert not (Path(os.environ["TJ_BIN_DIR"]) / handy_install.RECEIPT).exists()
+
+
+@pytest.mark.parametrize("manager", ["apt-get", "dnf"])
+def test_linux_wrong_package_version_never_gets_a_receipt(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    manager: str,
+) -> None:
+    monkeypatch.setattr(platform, "system", lambda: "Linux")
+    monkeypatch.setenv("DISPLAY", ":0")
+    package = tmp_path / "package"
+    package.write_bytes(b"verified package")
+    monkeypatch.setattr(handy_install, "_linux_package", lambda: (manager, "suffix"))
+    monkeypatch.setattr(handy_install, "_download_linux_package", lambda *a: package)
+    monkeypatch.setattr(
+        shutil, "which", lambda name: "/tools/gh" if name == "gh" else None
+    )
+
+    def run(arguments: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        if arguments == ["id", "-u"]:
+            return subprocess.CompletedProcess(arguments, 0, "0", "")
+        if arguments[0] == "dpkg-deb" or "--package" in arguments:
+            return subprocess.CompletedProcess(arguments, 0, "handy", "")
+        if arguments[0] in {"dpkg-query", "rpm"}:
+            return subprocess.CompletedProcess(arguments, 0, "0.11.0", "")
+        return subprocess.CompletedProcess(arguments, 0, "", "")
+
+    monkeypatch.setattr(subprocess, "run", run)
+    assert handy_install.main(["--no-escalate"]) == 1
+    assert not (Path(os.environ["TJ_BIN_DIR"]) / handy_install.RECEIPT).exists()
