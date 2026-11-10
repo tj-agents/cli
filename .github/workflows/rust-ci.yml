@@ -43,6 +43,7 @@ jobs:
         run: |
           # Ubuntu's packaged fzf is too old for cr; take the upstream release.
           curl -fsSL https://github.com/junegunn/fzf/releases/download/v0.73.1/fzf-0.73.1-linux_amd64.tar.gz | sudo tar -xz -C /usr/local/bin fzf
+          cargo install zoxide --locked
           # The sandbox HOME below would hide rustup's toolchains, so pin them first.
           export RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}" CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
           export HOME="$RUNNER_TEMP/home" TJ_BIN_DIR="$RUNNER_TEMP/home/bin"
@@ -51,14 +52,16 @@ jobs:
           linux/install.sh | tee second.log
           ! grep -E '^(installed|updated|removed) ' second.log
           linux/install.sh --check
-          bash -ic 'type f && type cr'
+          bash -ic 'type f && type cr && type __zoxide_z'
           linux/install.sh --uninstall
           ! linux/install.sh --check
       - name: install twice (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          choco install fzf -y --no-progress
+          pwsh -NoProfile -File tests/zoxide-install.ps1
+          if ($LASTEXITCODE) { exit 1 }
+          choco install fzf zoxide -y --no-progress
           $bin = Join-Path $env:RUNNER_TEMP 'tjbin'
           windows/install.ps1 -BinDir $bin
           if ($LASTEXITCODE) { exit 1 }
@@ -67,7 +70,8 @@ jobs:
           if ($second -match '^(installed|updated|removed) ') { throw 'second install changed something' }
           windows/install.ps1 -BinDir $bin -Check
           if ($LASTEXITCODE) { exit 1 }
-          pwsh -Command "`$env:Path += ';$bin'; . `$PROFILE.CurrentUserAllHosts; Get-Command f, cr -ErrorAction Stop"
+          pwsh -Command "`$env:Path += ';$bin'; . `$PROFILE.CurrentUserAllHosts; Get-Command f, cr, __zoxide_z -ErrorAction Stop"
+          if ($LASTEXITCODE) { exit 1 }
           windows/install.ps1 -BinDir $bin -Uninstall
           windows/install.ps1 -BinDir $bin -Check
           if (-not $LASTEXITCODE) { throw '--check passed after uninstall' }
