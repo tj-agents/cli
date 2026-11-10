@@ -82,3 +82,12 @@ def test_install_writes_receipt_and_repairs_changed_binary_without_executing_it(
     assert worktrunk_install.pending(tmp_path) is None
     assert worktrunk_install.main([*args, "--uninstall"]) == 0
     assert not list(tmp_path.iterdir())
+
+
+def test_explicit_directory_does_not_need_windows_default_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(platform, "system", lambda: "Windows")
+    for variable in ("LOCALAPPDATA", "TJ_BIN_DIR", "CI"):
+        monkeypatch.delenv(variable, raising=False)
+    assert worktrunk_install.main(["--bin-dir", str(tmp_path), "--check"]) == 1

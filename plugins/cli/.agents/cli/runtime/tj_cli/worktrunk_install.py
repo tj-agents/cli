@@ -1,16 +1,14 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
-import io
 import platform
 import sys
 import tarfile
-import urllib.request
 import zipfile
 from pathlib import Path
 
-from tj_cli import tool_receipts
+from tj_cli import archive_install, tool_receipts
+from tj_cli.errors import TjCliError
 from tj_cli.native_install import default_bin_dir
 
 VERSION = "0.81.0"
@@ -27,7 +25,7 @@ ARCHIVES = {
 }
 
 
-class WorktrunkInstallError(RuntimeError):
+class WorktrunkInstallError(TjCliError):
     pass
 
 
@@ -39,27 +37,6 @@ def pending(bin_dir: Path) -> str | None:
     return tool_receipts.pending(
         bin_dir / RECEIPT, VERSION, names=(executable(bin_dir).name,)
     )
-
-
-def binary(archive_name: str, contents: bytes) -> bytes:
-    if archive_name.endswith(".zip"):
-        with zipfile.ZipFile(io.BytesIO(contents)) as archive:
-            return archive.read("git-wt.exe")
-    with tarfile.open(fileobj=io.BytesIO(contents), mode="r:xz") as archive:
-        member = archive.getmember(f"{archive_name.removesuffix('.tar.xz')}/git-wt")
-        extracted = archive.extractfile(member)
-        if extracted is None:
-            raise WorktrunkInstallError("the worktrunk archive has no git-wt")
-        return extracted.read()
-
-
-def download(archive_name: str, digest: str) -> bytes:
-    url = f"https://github.com/max-sixty/worktrunk/releases/download/v{VERSION}/{archive_name}"
-    with urllib.request.urlopen(url, timeout=600) as response:
-        contents: bytes = response.read()
-    if hashlib.sha256(contents).hexdigest() != digest:
-        raise WorktrunkInstallError(f"{archive_name} failed SHA-256 verification")
-    return contents
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -96,15 +73,18 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     try:
         archive_name, digest = ARCHIVES[system]
-        contents = binary(archive_name, download(archive_name, digest))
-        arguments.bin_dir.mkdir(parents=True, exist_ok=True)
-        staged = target.with_name(target.name + ".new")
-        staged.write_bytes(contents)
-        staged.chmod(0o755)
-        staged.replace(target)
-        tool_receipts.write(
-            arguments.bin_dir / RECEIPT,
-            tool_receipts.Receipt(VERSION, {target.name: tool_receipts.sha256(target)}),
+        archive_install.install(
+            url=f"https://github.com/max-sixty/worktrunk/releases/download/v{VERSION}/{archive_name}",
+            digest=digest,
+            member=(
+                target.name
+                if system == "Windows"
+                else f"{archive_name.removesuffix('.tar.xz')}/{target.name}"
+            ),
+            target=target,
+            receipt_path=arguments.bin_dir / RECEIPT,
+            version=VERSION,
+            error_type=WorktrunkInstallError,
         )
     except (
         WorktrunkInstallError,

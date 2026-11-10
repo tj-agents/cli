@@ -1,12 +1,11 @@
 import json
-import platform
 import subprocess
-from collections.abc import Callable
 from pathlib import Path
+from types import MappingProxyType
 
 import pytest
 
-from tj_cli import fzf_install, handy_install, tool_receipts, worktrunk_install
+from tj_cli import tool_receipts
 
 
 @pytest.mark.parametrize(
@@ -40,12 +39,12 @@ def test_receipt_detects_version_missing_and_changed_files(tmp_path: Path) -> No
     executable.chmod(0o755)
     path = tmp_path / "receipt.json"
     receipt = tool_receipts.Receipt(
-        "1", {executable.name: tool_receipts.sha256(executable)}
+        "1", MappingProxyType({executable.name: tool_receipts.sha256(executable)})
     )
     tool_receipts.write(path, receipt)
     assert tool_receipts.read(path) == receipt
     assert json.loads(path.read_text(encoding="utf-8"))["schema"] == 1
-    assert tool_receipts.pending(path, "1", names=("app",)) is None
+    assert tool_receipts.pending(path, "1", names=iter(["app"])) is None
     assert tool_receipts.pending(path, "2") is not None
     assert tool_receipts.pending(path, "1", names=("other",)) is not None
     executable.write_bytes(b"second")
@@ -68,19 +67,3 @@ def test_receipt_checks_absolute_application_path(tmp_path: Path) -> None:
     assert tool_receipts.pending(receipt, "1") is None
     application.unlink()
     assert tool_receipts.pending(receipt, "1") is not None
-
-
-@pytest.mark.parametrize(
-    "installer",
-    [fzf_install.main, worktrunk_install.main, handy_install.main],
-    ids=["fzf", "worktrunk", "handy"],
-)
-def test_explicit_directory_does_not_need_windows_default_environment(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    installer: Callable[[list[str]], int],
-) -> None:
-    monkeypatch.setattr(platform, "system", lambda: "Windows")
-    for variable in ("LOCALAPPDATA", "TJ_BIN_DIR", "CI"):
-        monkeypatch.delenv(variable, raising=False)
-    assert installer(["--bin-dir", str(tmp_path), "--check"]) == 1

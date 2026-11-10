@@ -99,3 +99,12 @@ def test_unsupported_platform_does_not_download(
         urllib.request, "urlopen", lambda *a, **kw: pytest.fail("unsupported")
     )
     assert fzf_install.main(["--bin-dir", str(tmp_path)]) == 1
+
+
+def test_explicit_directory_does_not_need_windows_default_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(platform, "system", lambda: "Windows")
+    for variable in ("LOCALAPPDATA", "TJ_BIN_DIR", "CI"):
+        monkeypatch.delenv(variable, raising=False)
+    assert fzf_install.main(["--bin-dir", str(tmp_path), "--check"]) == 1

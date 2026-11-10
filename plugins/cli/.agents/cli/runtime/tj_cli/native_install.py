@@ -19,17 +19,17 @@ from pathlib import Path
 from typing import BinaryIO, Final
 
 from tj_cli import tool_receipts
+from tj_cli.errors import TjCliError
 
 VERSION = "0.2.0"
 RECEIPT = ".tj-native.json"
 _REPOSITORY: Final = "tj-agents/cli"
-_SHA256_LENGTH: Final = 64
 _MINIMUM_NATIVE_VERSION: Final = (0, 2, 0)
 _VERSION_TIMEOUT: Final = 5.0
 _NATIVE_VERSION = re.compile(r"\Atj_hook (0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)\n?\Z")
 
 
-class NativeInstallError(RuntimeError):
+class NativeInstallError(TjCliError):
     """A native CLI pair could not be safely inspected or installed."""
 
 
@@ -120,7 +120,8 @@ def ensure_native(
         and receipt.identity == identity
         and receipt.hashes == expected_hashes
         and all(
-            _is_executable(directory / name) and _sha256(directory / name) == digest
+            _is_executable(directory / name)
+            and tool_receipts.sha256(directory / name) == digest
             for name, digest in expected_hashes.items()
         )
     ):
@@ -148,7 +149,11 @@ def uninstall_native(directory: Path) -> tuple[str, ...]:
     for name in _binary_names():
         digest = hashes.get(name)
         target = directory / name
-        if isinstance(digest, str) and target.is_file() and _sha256(target) == digest:
+        if (
+            digest is not None
+            and target.is_file()
+            and tool_receipts.sha256(target) == digest
+        ):
             target.unlink()
             removed.append(name)
     receipt_path = directory / RECEIPT
@@ -262,23 +267,24 @@ def _download_release(
             f"release asset {asset_name} has no GitHub SHA-256 digest"
         )
     prefix, separator, expected_digest = digest.partition(":")
-    if prefix != "sha256" or not separator or not _is_sha256(expected_digest):
+    if (
+        prefix != "sha256"
+        or not separator
+        or not tool_receipts.is_sha256(expected_digest)
+    ):
         raise NativeInstallError(
             f"release asset {asset_name} has an invalid GitHub digest"
         )
     receipt = tool_receipts.read(directory / RECEIPT)
-    hashes = receipt.hashes if receipt else None
     if (
         receipt is not None
         and receipt.version == VERSION
         and receipt.identity == identity
         and receipt.archive_digest == expected_digest
-        and isinstance(hashes, dict)
-        and set(hashes) == set(_binary_names())
+        and set(receipt.hashes) == set(_binary_names())
         and all(
-            isinstance(hashes[name], str)
-            and _is_executable(directory / name)
-            and _sha256(directory / name) == hashes[name]
+            _is_executable(directory / name)
+            and tool_receipts.sha256(directory / name) == receipt.hashes[name]
             for name in _binary_names()
         )
     ):
@@ -287,7 +293,7 @@ def _download_release(
         root = Path(temporary)
         archive = root / asset_name
         _download_asset(asset_id, archive)
-        if _sha256(archive) != expected_digest:
+        if tool_receipts.sha256(archive) != expected_digest:
             raise NativeInstallError(
                 f"release asset {asset_name} failed SHA-256 verification"
             )
@@ -451,22 +457,8 @@ def _replace_pair(
             ) from error
 
 
-def _sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        for block in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(block)
-    return digest.hexdigest()
-
-
 def _sha256_bytes(contents: bytes) -> str:
     return hashlib.sha256(contents).hexdigest()
-
-
-def _is_sha256(value: str) -> bool:
-    return len(value) == _SHA256_LENGTH and all(
-        character in "0123456789abcdef" for character in value
-    )
 
 
 def _run(

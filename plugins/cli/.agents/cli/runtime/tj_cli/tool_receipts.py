@@ -4,15 +4,15 @@ import hashlib
 import json
 import os
 import platform
-from collections.abc import Sequence
-from dataclasses import asdict, dataclass
+from collections.abc import Iterable, Mapping
+from dataclasses import dataclass
 from pathlib import Path
 
 
 @dataclass(frozen=True, slots=True)
 class Receipt:
     version: str
-    hashes: dict[str, str]
+    hashes: Mapping[str, str]
     identity: str | None = None
     archive_digest: str | None = None
 
@@ -72,7 +72,17 @@ def write(path: Path, receipt: Receipt) -> None:
     staged = path.with_name(path.name + ".new")
     try:
         staged.write_text(
-            json.dumps({"schema": 1, **asdict(receipt)}, sort_keys=True) + "\n",
+            json.dumps(
+                {
+                    "schema": 1,
+                    "version": receipt.version,
+                    "hashes": dict(receipt.hashes),
+                    "identity": receipt.identity,
+                    "archive_digest": receipt.archive_digest,
+                },
+                sort_keys=True,
+            )
+            + "\n",
             encoding="utf-8",
         )
         staged.replace(path)
@@ -81,7 +91,7 @@ def write(path: Path, receipt: Receipt) -> None:
 
 
 def pending(
-    path: Path, version: str, *, names: Sequence[str] | None = None
+    path: Path, version: str, *, names: Iterable[str] | None = None
 ) -> str | None:
     receipt = read(path)
     if receipt is None:
@@ -92,13 +102,15 @@ def pending(
         return f"receipt has unexpected files: {path}"
     for name, digest in receipt.hashes.items():
         target = path.parent / name
+        if not target.is_file():
+            return f"missing installed file: {target}"
+        if platform.system() != "Windows" and not os.access(target, os.X_OK):
+            return f"installed file is not executable: {target}"
         try:
-            if not target.is_file():
-                return f"missing installed file: {target}"
-            if platform.system() != "Windows" and not os.access(target, os.X_OK):
-                return f"installed file is not executable: {target}"
-            if sha256(target) != digest:
-                return f"installed file changed: {target}"
+            actual_digest = sha256(target)
         except OSError:
             return f"cannot read installed file: {target}"
+        else:
+            if actual_digest != digest:
+                return f"installed file changed: {target}"
     return None

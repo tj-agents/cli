@@ -95,15 +95,24 @@ def test_existing_windows_installation_is_unchanged(
 @pytest.mark.parametrize("hive", [1, 2])
 @pytest.mark.parametrize("view", [256, 512])
 def test_registered_windows_custom_location_is_recognized(
-    tmp_path: Path, windows_registry: dict[tuple[int, int], str], hive: int, view: int
+    tmp_path: Path,
+    windows_registry: dict[tuple[int, int], str],
+    monkeypatch: pytest.MonkeyPatch,
+    hive: int,
+    view: int,
 ) -> None:
     directory = tmp_path / "custom apps é" / "voice"
     directory.mkdir(parents=True)
     executable = directory / "handy.exe"
     executable.write_bytes(b"installed")
     windows_registry[(hive, 1 | view)] = f'"{directory}"'
-    assert handy_install.find_handy() == executable
-    _receipt(executable)
+    monkeypatch.setattr(
+        shutil, "which", lambda command: "winget.exe" if command == "winget" else None
+    )
+    monkeypatch.setattr(
+        subprocess, "run", lambda *a, **kw: subprocess.CompletedProcess([], 0, "", "")
+    )
+    assert handy_install.main([]) == 0
     assert handy_install.main(["--check"]) == 0
     assert handy_install.main([]) == 0
     executable.unlink()
@@ -377,7 +386,7 @@ def test_linux_unsupported_package_manager_gives_manual_resolution(
     monkeypatch.setattr(platform, "machine", lambda: "x86_64")
     monkeypatch.setenv("DISPLAY", ":0")
     assert handy_install.main([]) == 1
-    assert "handy on PATH" in capsys.readouterr().err
+    assert "requires apt-get or dnf" in capsys.readouterr().err
 
 
 def _receipt(executable: Path, version: str = handy_install.VERSION) -> None:
@@ -396,7 +405,7 @@ def test_unreceipted_application_requires_installation_without_probing(
     monkeypatch.setattr(
         subprocess, "run", lambda *a, **kw: pytest.fail("file-only probe")
     )
-    assert handy_install.pending() is not None
+    assert handy_install.pending(Path(os.environ["TJ_BIN_DIR"])) is not None
     assert handy_install.main(["--check"]) == 1
 
 
@@ -422,7 +431,7 @@ def test_windows_reinstalls_the_pin_for_version_drift(
     assert handy_install.main([]) == 0
     assert commands[0][commands[0].index("--version") + 1] == handy_install.VERSION
     assert "--force" in commands[0]
-    assert handy_install.pending() is None
+    assert handy_install.pending(Path(os.environ["TJ_BIN_DIR"])) is None
     assert handy_install.main([]) == 0
     assert len(commands) == 1
 
@@ -490,7 +499,7 @@ def test_windows_receipts_registered_pin_instead_of_older_path_copy(
     receipt = tool_receipts.read(Path(os.environ["TJ_BIN_DIR"]) / handy_install.RECEIPT)
     assert receipt is not None
     assert receipt.hashes == {str(managed.resolve()): tool_receipts.sha256(managed)}
-    assert handy_install.pending() is None
+    assert handy_install.pending(Path(os.environ["TJ_BIN_DIR"])) is None
 
 
 def test_windows_installer_success_without_pinned_registration_is_failure(
@@ -512,22 +521,39 @@ def test_windows_installer_success_without_pinned_registration_is_failure(
 @pytest.mark.parametrize("manager", ["apt-get", "dnf"])
 def test_linux_wrong_package_version_never_gets_a_receipt(
     monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
     manager: str,
 ) -> None:
     monkeypatch.setattr(platform, "system", lambda: "Linux")
+    monkeypatch.setattr(platform, "machine", lambda: "x86_64")
     monkeypatch.setenv("DISPLAY", ":0")
-    package = tmp_path / "package"
-    package.write_bytes(b"verified package")
-    monkeypatch.setattr(handy_install, "_linux_package", lambda: (manager, "suffix"))
-    monkeypatch.setattr(handy_install, "_download_linux_package", lambda *a: package)
+    package = b"verified package"
+    suffix = "_amd64.deb" if manager == "apt-get" else ".x86_64.rpm"
     monkeypatch.setattr(
-        shutil, "which", lambda name: "/tools/gh" if name == "gh" else None
+        shutil,
+        "which",
+        lambda name: f"/tools/{name}" if name in {manager, "gh"} else None,
     )
 
-    def run(arguments: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+    def run(arguments: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
         if arguments == ["id", "-u"]:
             return subprocess.CompletedProcess(arguments, 0, "0", "")
+        if arguments[0] == "/tools/gh":
+            if "stdout" in kwargs:
+                kwargs["stdout"].write(package)
+                return subprocess.CompletedProcess(arguments, 0, "", "")
+            release = {
+                "tag_name": f"v{handy_install.VERSION}",
+                "draft": False,
+                "assets": [
+                    {
+                        "id": 123,
+                        "name": f"Handy_{handy_install.VERSION}{suffix}",
+                        "digest": f"sha256:{hashlib.sha256(package).hexdigest()}",
+                    }
+                ],
+            }
+            return subprocess.CompletedProcess(arguments, 0, json.dumps(release), "")
         if arguments[0] == "dpkg-deb" or "--package" in arguments:
             return subprocess.CompletedProcess(arguments, 0, "handy", "")
         if arguments[0] in {"dpkg-query", "rpm"}:
@@ -536,4 +562,42 @@ def test_linux_wrong_package_version_never_gets_a_receipt(
 
     monkeypatch.setattr(subprocess, "run", run)
     assert handy_install.main(["--no-escalate"]) == 1
+    assert "package manager did not install Handy" in capsys.readouterr().err
     assert not (Path(os.environ["TJ_BIN_DIR"]) / handy_install.RECEIPT).exists()
+
+
+@pytest.mark.parametrize("system", ["Windows", "Linux"])
+def test_pending_uses_only_the_explicit_receipt_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, system: str
+) -> None:
+    monkeypatch.setattr(platform, "system", lambda: system)
+    bin_dir = tmp_path / "explicit"
+    application = tmp_path / ("handy.exe" if system == "Windows" else "handy")
+    application.write_bytes(b"pinned application")
+    application.chmod(0o755)
+    tool_receipts.write(
+        bin_dir / handy_install.RECEIPT,
+        tool_receipts.Receipt(
+            handy_install.VERSION,
+            {str(application.resolve()): tool_receipts.sha256(application)},
+        ),
+    )
+    monkeypatch.setenv("CI", "true")
+    monkeypatch.setenv("TJ_BIN_DIR", str(tmp_path / "elsewhere"))
+    monkeypatch.delenv("DISPLAY", raising=False)
+    monkeypatch.delenv("WAYLAND_DISPLAY", raising=False)
+    monkeypatch.setattr(
+        subprocess, "run", lambda *a, **kw: pytest.fail("file-only check")
+    )
+    assert handy_install.pending(bin_dir) is None
+    application.write_bytes(b"changed")
+    assert handy_install.pending(bin_dir) is not None
+
+
+def test_explicit_directory_does_not_need_windows_default_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(platform, "system", lambda: "Windows")
+    for variable in ("LOCALAPPDATA", "TJ_BIN_DIR", "CI"):
+        monkeypatch.delenv(variable, raising=False)
+    assert handy_install.main(["--bin-dir", str(tmp_path), "--check"]) == 1

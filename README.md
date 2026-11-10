@@ -84,10 +84,10 @@ string for drift, or `None` when current, using files only:
 | --- | --- |
 | `tj_cli.fzf_install.pending(bin_dir: Path) -> str \| None` | `.tj-fzf.json` |
 | `tj_cli.worktrunk_install.pending(bin_dir: Path) -> str \| None` | `.tj-worktrunk.json` |
-| `tj_cli.handy_install.pending(bin_dir: Path \| None = None) -> str \| None` | `.tj-handy.json` |
+| `tj_cli.handy_install.pending(bin_dir: Path) -> str \| None` | `.tj-handy.json` |
 | `tj_cli.native_install.pending(bin_dir: Path, *, revision: str \| None = None) -> str \| None` | `.tj-native.json` |
 
-The installers' `--bin-dir` and Handy's optional `bin_dir` default to `TJ_BIN_DIR`, otherwise
+The installers' `--bin-dir` defaults to `TJ_BIN_DIR`, otherwise
 `~/.local/bin` on Linux or `%LOCALAPPDATA%\Programs\tj` on Windows. Pass Agent's pinned CLI revision
 to native `pending` to check revision drift too.
 The existing native `pending_native` checks runtime compatibility by invoking `tj_hook`; refresh stale
@@ -99,13 +99,14 @@ Handy is a desktop prerequisite provisioned by Agent's install and refresh. They
 run, install or upgrade it to the pinned 0.10.0 when its receipt is missing or stale, and fail if installation
 fails: Windows uses winget; Linux desktops use a
 SHA-256-verified upstream package through APT or DNF, with GitHub CLI and sudo required for a non-root
-installation. Other Linux distributions need Handy installed with `handy` on PATH. CI and Linux sessions
+installation. Automatic Linux setup requires one of those package managers. CI and Linux sessions
 without a display report the step as not applicable; for SSH or WSL terminal use, install on the desktop
 host. Install `--check` reports a missing or stale installation without installing or downloading anything.
 `python -m tj_cli.handy_install --no-escalate` never calls sudo or starts a Windows installation that
 could prompt for elevation. A required privileged Linux installation or Windows desktop setup fails
-with one line; an intact current installation remains a no-op. CI and headless Linux return `None`
-from Handy's `pending` because the desktop tool is not applicable there.
+with one line; an intact current installation remains a no-op. The installer entry point decides whether
+Handy applies to its environment. Handy's `pending(bin_dir)` always checks the supplied directory;
+callers decide whether to skip the desktop prerequisite in CI or headless sessions.
 
 Open Handy once, download a speech model, select your microphone and hold-to-talk shortcut, and enable
 launch at login in Handy's settings. Use `Shift+Insert` as the paste method for Windows terminals, or the
