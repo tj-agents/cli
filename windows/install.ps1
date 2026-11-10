@@ -72,8 +72,38 @@ function Set-UserPath {
     Say updated "user PATH (+ $BinDir)"
 }
 
+function Install-Zoxide {
+    if ($Uninstall) { return }
+    if (Get-Command zoxide -CommandType Application -ErrorAction SilentlyContinue) {
+        Say ok (& zoxide --version)
+        return
+    }
+    if ($Check) { Say missing 'zoxide'; $script:status = 1; return }
+    if (Get-Command winget -ErrorAction SilentlyContinue) {
+        & winget install --id ajeetdsouza.zoxide --exact --silent --accept-source-agreements --accept-package-agreements
+        if ($LASTEXITCODE -ne 0) { Say missing 'zoxide (winget installation failed)'; $script:status = 1; return }
+        # winget updates the registered PATH, not this process. Preserve process-only entries too.
+        foreach ($scope in @('Machine', 'User')) {
+            $registered = [Environment]::GetEnvironmentVariable('Path', $scope)
+            if (-not $registered) { continue }
+            $registered = [Environment]::ExpandEnvironmentVariables($registered)
+            foreach ($entry in ($registered -split ';' | Where-Object { $_ })) {
+                if (-not (($env:Path -split ';') | Where-Object { $_.TrimEnd('\') -ieq $entry.TrimEnd('\') })) {
+                    $env:Path += ";$entry"
+                }
+            }
+        }
+        if (Get-Command zoxide -CommandType Application -ErrorAction SilentlyContinue) {
+            Say installed "zoxide (via winget): $(& zoxide --version)"
+        }
+        else { Say missing 'zoxide (winget succeeded but the executable is not on PATH)'; $script:status = 1 }
+    }
+    else { Say missing 'zoxide - install it with: winget install ajeetdsouza.zoxide'; $script:status = 1 }
+}
+
 Install-Binaries
 if ($IsWindows -or $PSVersionTable.PSEdition -eq 'Desktop') { Set-UserPath }
+Install-Zoxide
 
 # Both Windows PowerShell 5.1 and PowerShell 7 read their own profile; wire whichever exist or are installed.
 $documents = [Environment]::GetFolderPath('MyDocuments')

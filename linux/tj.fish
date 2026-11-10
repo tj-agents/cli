@@ -1,5 +1,9 @@
 # Printed by `tj init fish`. `f` is a function because a program cannot change its parent shell's
 # directory: `tj f` prints the path and the function does the cd.
+if command -q zoxide
+    zoxide init fish --cmd cd | source
+end
+
 function f
     set -l dir (command tj f $argv); or return
     test -n "$dir"; and cd -- $dir
