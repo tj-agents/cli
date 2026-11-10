@@ -26,15 +26,9 @@ Reason: preserve exact pre-existing custom-checker findings during the standards
 | File | Rule | Existing count | Required repair |
 | --- | --- | ---: | --- |
 | packages/tj-cli/src/tj_cli/clipboard/__init__.py | PY008 | 1 | Move private initialization behind a public module boundary. |
-| packages/tj-cli/src/tj_cli/clipboard/_errors.py | PY011 | 1 | Introduce and use the package's shared exception root. |
 | packages/tj-cli/src/tj_cli/clipboard/_guard.py | PY016 | 1 | Inject process state or confine the read to an entry-point main. |
 | packages/tj-cli/src/tj_cli/clipboard/_posix.py | PY016 | 1 | Inject process state or confine the read to an entry-point main. |
-| packages/tj-cli/src/tj_cli/handy_install.py | PY011 | 1 | Introduce and use the package's shared exception root. |
-| packages/tj-cli/src/tj_cli/handy_install.py | PY016 | 1 | Inject process state or confine the read to an entry-point main. |
-| packages/tj-cli/src/tj_cli/native_install.py | PY011 | 1 | Introduce and use the package's shared exception root. |
 | packages/tj-cli/src/tj_cli/native_install.py | PY016 | 3 | Inject process state or confine the read to an entry-point main. |
-| packages/tj-cli/src/tj_cli/processes.py | PY011 | 1 | Introduce and use the package's shared exception root. |
-| packages/tj-cli/src/tj_cli/worktrunk_install.py | PY011 | 1 | Introduce and use the package's shared exception root. |
 | packages/tj-cli/tests/clipboard/test_dispatch.py | PY014 | 1 | Add matching source coverage or relocate the integration test. |
 | packages/tj-cli/tests/clipboard/test_guard.py | PY014 | 1 | Add matching source coverage or relocate the integration test. |
 | packages/tj-cli/tests/clipboard/test_posix.py | PY014 | 1 | Add matching source coverage or relocate the integration test. |
