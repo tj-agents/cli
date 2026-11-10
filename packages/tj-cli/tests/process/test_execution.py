@@ -789,7 +789,7 @@ def test_run_timeout_kills_linux_descendant(tmp_path: Path) -> None:
     assert caught.value.stdout == b"ready"
     assert caught.value.stderr == b"diagnostic"
     pid = int(record.read_text(encoding="utf-8"))
-    assert not _alive(pid)
+    _wait_for_exit(pid)
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="Linux timeout partial bytes")
