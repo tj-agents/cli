@@ -4,6 +4,7 @@ pub(crate) mod store;
 
 use std::collections::HashSet;
 use std::ffi::{OsStr, OsString};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 use std::time::{Duration, Instant, SystemTime};
@@ -77,22 +78,38 @@ pub fn hidden(program: &str) -> Command {
     command
 }
 
-fn prepare(launch: &Launch, arguments: &[OsString]) {
-    let result = hidden("tj-prepare")
+fn preparation(launch: &Launch, arguments: &[OsString]) -> Result<()> {
+    let arguments = arguments[1..]
+        .iter()
+        .map(|argument| argument.to_str().context("host arguments must be UTF-8 for standards preparation"))
+        .collect::<Result<Vec<_>>>()?;
+    let input = serde_json::to_vec(&arguments)?;
+    let mut child = hidden("tj-prepare")
         .args(["--host", launch.host.name(), "--cwd"])
         .arg(&launch.cwd)
-        .arg("--")
-        .args(&arguments[1..])
+        .arg("--arguments-stdin")
         .current_dir(&launch.cwd)
-        .stdin(std::process::Stdio::null())
-        .output();
-    match result {
-        Ok(output) if output.status.success() => {}
-        Ok(output) => eprintln!(
-            "tj run: repository standards preparation failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ),
-        Err(error) => eprintln!("tj run: repository standards preparation unavailable: {error}"),
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .context("could not start tj-prepare")?;
+    let written = child
+        .stdin
+        .take()
+        .context("tj-prepare has no input pipe")
+        .and_then(|mut stdin| stdin.write_all(&input).context("could not send host arguments to tj-prepare"));
+    let output = child.wait_with_output().context("could not wait for tj-prepare")?;
+    written?;
+    if !output.status.success() {
+        bail!("tj-prepare {}: {}", output.status, String::from_utf8_lossy(&output.stderr).trim());
+    }
+    Ok(())
+}
+
+fn prepare(launch: &Launch, arguments: &[OsString]) {
+    if let Err(error) = preparation(launch, arguments) {
+        eprintln!("tj run: repository standards preparation failed: {error:#}");
     }
 }
 
