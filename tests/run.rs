@@ -244,13 +244,26 @@ fn closes_out_when_every_pr_has_merged() {
     assert!(git(&sandbox.primary, &["branch", "--list", "Feature/1"]).is_empty(), "the merged branch is still there");
 }
 
-#[test]
-fn closes_out_after_done_and_idle() {
+fn closes_after_done_and_idle(host: &str) {
     let sandbox = sandbox();
-    let child = start(&sandbox, "idle", "claude", "signal", "10");
+    let keys = cfg!(windows) && host == "codex";
+    let child = start(&sandbox, "idle", host, if keys { "keys" } else { "signal" }, "10");
+    if keys {
+        wait_for_log(&sandbox, "raw");
+    }
     done(&sandbox, "idle", false);
     let output = finish(child, Duration::from_secs(60));
     assert_closed_out(&sandbox, &output, "idle");
+}
+
+#[test]
+fn closes_out_after_done_and_idle() {
+    closes_after_done_and_idle("claude");
+}
+
+#[test]
+fn codex_closes_out_after_done_and_idle() {
+    closes_after_done_and_idle("codex");
 }
 
 #[test]
@@ -552,16 +565,15 @@ fn restart_outside_tj_run_fails_but_idle_is_a_no_op() {
     assert!(!tj(&["idle", "--background", "some"]).status.success());
 }
 
-#[test]
-fn a_shell_started_session_needs_only_the_agent_command() {
+fn shell_started_session_needs_only_the_agent_command(host: &str) {
     let sandbox = sandbox();
     set_reply(
         &sandbox,
         "agent-store-launches.json",
-        r#"{"ok":true,"data":{"launches":[{"launch_id":"x","host":"claude","title":"Feature-1","worktree":"w","state":"active","wrapper":{"pid":1,"started_at":"2026-01-01T00:00:00Z"}}]}}"#,
+        &serde_json::json!({"ok": true, "data": {"launches": [{"launch_id": "x", "host": host, "title": "Feature-1", "worktree": "w", "state": "active", "wrapper": {"pid": 1, "started_at": "2026-01-01T00:00:00Z"}}]}}).to_string(),
     );
     let fixture = fixture().to_string_lossy().into_owned();
-    let arguments = ["run", "--host", "claude", "--", python(), &fixture, "exit"].map(str::to_owned);
+    let arguments = ["run", "--host", host, "--", python(), &fixture, "exit"].map(str::to_owned);
     let output = finish(spawn(&sandbox, &arguments, &sandbox.worktree), Duration::from_secs(60));
     assert_eq!(output.status.code(), Some(3), "stderr: {}", String::from_utf8_lossy(&output.stderr));
     let agent = log(&sandbox, "dummy.log");
@@ -573,11 +585,21 @@ fn a_shell_started_session_needs_only_the_agent_command() {
     assert_eq!(std::fs::canonicalize(cwd).unwrap(), std::fs::canonicalize(&sandbox.worktree).unwrap());
     assert!(
         log(&sandbox, "stubs/agent-store.log")
-            .contains(&format!("launch --launch-id {id} --host claude --title Feature-1-2"))
+            .contains(&format!("launch --launch-id {id} --host {host} --title Feature-1-2"))
     );
 
     let unknown = ["run", "--", python(), &fixture, "exit"].map(str::to_owned);
     let output = finish(spawn(&sandbox, &unknown, &sandbox.worktree), Duration::from_secs(60));
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("pass --host"));
+}
+
+#[test]
+fn a_shell_started_session_needs_only_the_agent_command() {
+    shell_started_session_needs_only_the_agent_command("claude");
+}
+
+#[test]
+fn a_shell_started_codex_session_needs_only_the_agent_command() {
+    shell_started_session_needs_only_the_agent_command("codex");
 }
