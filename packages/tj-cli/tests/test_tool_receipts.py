@@ -67,3 +67,21 @@ def test_receipt_checks_absolute_application_path(tmp_path: Path) -> None:
     assert tool_receipts.pending(receipt, "1") is None
     application.unlink()
     assert tool_receipts.pending(receipt, "1") is not None
+
+
+def test_receipt_reports_inaccessible_installed_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    executable = tmp_path / "app"
+    path = tmp_path / "receipt.json"
+    tool_receipts.write(path, tool_receipts.Receipt("1", {"app": "a" * 64}))
+
+    def inaccessible_file(target: Path) -> bool:
+        assert target == executable
+        raise PermissionError("access denied")
+
+    monkeypatch.setattr(Path, "is_file", inaccessible_file)
+
+    assert tool_receipts.pending(path, "1") == (
+        f"cannot read installed file: {executable}"
+    )

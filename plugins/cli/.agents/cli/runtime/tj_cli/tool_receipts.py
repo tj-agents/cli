@@ -102,7 +102,11 @@ def pending(
         return f"receipt has unexpected files: {path}"
     for name, digest in receipt.hashes.items():
         target = path.parent / name
-        if not target.is_file():
+        try:
+            is_file = target.is_file()
+        except OSError:
+            return f"cannot read installed file: {target}"
+        if not is_file:
             return f"missing installed file: {target}"
         if platform.system() != "Windows" and not os.access(target, os.X_OK):
             return f"installed file is not executable: {target}"
