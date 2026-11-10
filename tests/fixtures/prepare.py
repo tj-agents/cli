@@ -5,7 +5,7 @@ from pathlib import Path
 
 def main() -> int:
     directory = Path(__file__).parent
-    arguments = json.load(sys.stdin)
+    arguments = json.load(sys.stdin.buffer)
     (directory / "prepare-input.json").write_text(
         json.dumps(arguments), encoding="utf-8"
     )
