@@ -8,6 +8,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   test:
     name: test (${{ matrix.os }})
@@ -18,6 +22,8 @@ jobs:
         os: [ubuntu-latest, windows-latest]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           components: clippy, rustfmt
@@ -26,9 +32,10 @@ jobs:
         with:
           python-version: '3.15'
       # tj run's tests drive real git-wt, and on Linux a real tmux pane.
-      - name: install git-wt and tmux
+      - name: Install git-wt and tmux
         shell: bash
         run: |
+          set -euo pipefail
           PYTHONPATH=packages/tj-cli/src python -m tj_cli.worktrunk_install --bin-dir "$RUNNER_TEMP/worktrunk"
           echo "$RUNNER_TEMP/worktrunk" >> "$GITHUB_PATH"
           if [ "$RUNNER_OS" = Linux ] && ! command -v tmux >/dev/null; then sudo apt-get install -y tmux; fi
@@ -37,10 +44,11 @@ jobs:
       - run: cargo test --locked
 
       # The installer must succeed, and a second run must find nothing left to change.
-      - name: install twice (Linux)
+      - name: Install twice (Linux)
         if: runner.os == 'Linux'
         shell: bash
         run: |
+          set -euo pipefail
           # Ubuntu's packaged fzf is too old for cr; take the upstream release.
           curl -fsSL https://github.com/junegunn/fzf/releases/download/v0.73.1/fzf-0.73.1-linux_amd64.tar.gz | sudo tar -xz -C /usr/local/bin fzf
           cargo install zoxide --locked
@@ -55,7 +63,7 @@ jobs:
           bash -ic 'type f && type cr && type __zoxide_z'
           linux/install.sh --uninstall
           if linux/install.sh --check; then exit 1; fi
-      - name: install twice (Windows)
+      - name: Install twice (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |

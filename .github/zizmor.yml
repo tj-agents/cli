@@ -1,0 +1,15 @@
+rules:
+  unpinned-uses:
+    config:
+      policies:
+        tj-agents/template/.github/workflows/plugin-ci.yml: ref-pin
+  dangerous-triggers:
+    ignore:
+    - release.yml:4:3
+  undocumented-permissions:
+    ignore:
+    - release.yml:27:7
+    - release.yml:87:7
+  superfluous-actions:
+    ignore:
+    - rust-ci.yml:27:15
