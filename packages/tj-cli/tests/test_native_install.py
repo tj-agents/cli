@@ -11,7 +11,7 @@ from unittest import mock
 
 import pytest
 
-from tj_cli import native_install
+from tj_cli import native_install, tool_receipts
 
 
 def test_installer_check_rejects_present_but_incompatible_pair_without_writing(
@@ -340,7 +340,7 @@ def test_directory_collision_preserves_user_files(
     _fake_release(monkeypatch, archive, digest)
     directory = tmp_path / "bin"
     collision = directory / (
-        names[0] if reserved == "binary" else native_install._RECEIPT
+        names[0] if reserved == "binary" else native_install.RECEIPT
     )
     collision.mkdir(parents=True)
     important = collision / "user-data"
@@ -387,7 +387,7 @@ def test_running_windows_binary_defers_upgrade_without_changing_the_pair(
             native_install.ensure_native(directory)
         assert executable.read_bytes() == before
         assert (directory / names[1]).read_bytes() == b"old-hook"
-        assert not (directory / native_install._RECEIPT).exists()
+        assert not (directory / native_install.RECEIPT).exists()
     finally:
         child.terminate()
         child.wait(timeout=10)
@@ -401,7 +401,7 @@ def test_failed_pair_replacement_restores_old_pair(
     names = native_install._binary_names()
     for name in names:
         (directory / name).write_bytes(f"old-{name}".encode())
-    (directory / native_install._RECEIPT).write_text(
+    (directory / native_install.RECEIPT).write_text(
         json.dumps({"identity": "b" * 40, "hashes": {}}), encoding="utf-8"
     )
     original_replace = Path.replace
@@ -419,7 +419,7 @@ def test_failed_pair_replacement_restores_old_pair(
             directory,
             {names[0]: b"new-tj", names[1]: b"new-hook"},
             "a" * 40,
-            {names[0]: "1", names[1]: "2"},
+            {names[0]: "1" * 64, names[1]: "2" * 64},
         )
     assert {(directory / name).read_bytes() for name in names} == {
         f"old-{name}".encode() for name in names
@@ -443,3 +443,53 @@ def test_supported_platform_mapping(
     monkeypatch.setattr(platform_module, "system", lambda: system)
     assert native_install._asset_name() == asset
     assert native_install._binary_names() == names
+
+
+def test_pending_receipt_checks_version_revision_and_pair_without_processes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    names = native_install._binary_names()
+    monkeypatch.setattr(
+        subprocess, "run", lambda *a, **kw: pytest.fail("file-only probe")
+    )
+    assert native_install.pending(tmp_path) is not None
+    for name in names:
+        target = tmp_path / name
+        target.write_bytes(b"native")
+        target.chmod(0o755)
+    path = tmp_path / native_install.RECEIPT
+    hashes = {name: tool_receipts.sha256(tmp_path / name) for name in names}
+    tool_receipts.write(
+        path, tool_receipts.Receipt(native_install.VERSION, hashes, "a" * 40)
+    )
+    before = {p.name: p.stat().st_mtime_ns for p in tmp_path.iterdir()}
+    assert native_install.pending(tmp_path) is None
+    assert native_install.pending(tmp_path, revision="a" * 40) is None
+    assert native_install.pending(tmp_path, revision="b" * 40) is not None
+    assert before == {p.name: p.stat().st_mtime_ns for p in tmp_path.iterdir()}
+    tool_receipts.write(path, tool_receipts.Receipt("0.1.0", hashes, "a" * 40))
+    assert native_install.pending(tmp_path) is not None
+    tool_receipts.write(
+        path, tool_receipts.Receipt(native_install.VERSION, hashes, "a" * 40)
+    )
+    (tmp_path / names[0]).write_bytes(b"changed")
+    assert native_install.pending(tmp_path) is not None
+
+
+def test_native_install_receipt_records_package_version_and_revision(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    archive = tmp_path / "native.zip"
+    names = native_install._binary_names()
+    digest = _archive(archive, {names[0]: b"tj", names[1]: b"hook"})
+    _fake_release(monkeypatch, archive, digest)
+    directory = tmp_path / "bin"
+    native_install.ensure_native(directory)
+    receipt = tool_receipts.read(directory / native_install.RECEIPT)
+    assert receipt is not None
+    assert receipt.version == native_install.VERSION
+    assert receipt.identity == "a" * 40
+    assert receipt.archive_digest == digest
+    assert native_install.pending(directory) is None

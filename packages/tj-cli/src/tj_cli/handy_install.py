@@ -12,9 +12,43 @@ import sys
 import tempfile
 from pathlib import Path
 
+from tj_cli import tool_receipts
+from tj_cli.native_install import default_bin_dir
+
+VERSION = "0.10.0"
+RECEIPT = ".tj-handy.json"
+
 
 class HandyInstallError(RuntimeError):
     pass
+
+
+def _not_applicable() -> str | None:
+    if os.environ.get("CI", "").lower() == "true":
+        return "CI"
+    if platform.system() == "Linux" and not (
+        os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")
+    ):
+        return "no desktop session; run setup on the desktop host"
+    return None
+
+
+def pending(bin_dir: Path | None = None) -> str | None:
+    if _not_applicable() is not None:
+        return None
+    path = (bin_dir or default_bin_dir()) / RECEIPT
+    receipt = tool_receipts.read(path)
+    expected_name = "handy.exe" if platform.system() == "Windows" else "handy"
+    if (
+        receipt is None
+        or len(receipt.hashes) != 1
+        or any(
+            not Path(name).is_absolute() or Path(name).name != expected_name
+            for name in receipt.hashes
+        )
+    ):
+        return f"missing or invalid Handy receipt: {path}"
+    return tool_receipts.pending(path, VERSION)
 
 
 def _registered_windows_handy() -> Path | None:
@@ -75,11 +109,14 @@ def _install_windows() -> None:
             "--id",
             "cjpais.Handy",
             "--exact",
+            "--version",
+            VERSION,
             "--source",
             "winget",
             "--scope",
             "user",
             "--silent",
+            "--force",
             "--disable-interactivity",
             "--accept-source-agreements",
             "--accept-package-agreements",
@@ -104,11 +141,21 @@ def _linux_package() -> tuple[str, str]:
 
 def _download_linux_package(gh: str, suffix: str, directory: Path) -> Path:
     result = _run(
-        [gh, "api", "--hostname", "github.com", "repos/cjpais/Handy/releases/latest"]
+        [
+            gh,
+            "api",
+            "--hostname",
+            "github.com",
+            f"repos/cjpais/Handy/releases/tags/v{VERSION}",
+        ]
     )
     release = json.loads(result.stdout)
     if not isinstance(release, dict) or not isinstance(release.get("assets"), list):
         raise HandyInstallError("Handy release metadata has no assets")
+    if release.get("tag_name") != f"v{VERSION}" or release.get("draft") is not False:
+        raise HandyInstallError(
+            f"Handy release does not match pinned version {VERSION}"
+        )
     assets = [
         asset
         for asset in release["assets"]
@@ -156,13 +203,17 @@ def _download_linux_package(gh: str, suffix: str, directory: Path) -> Path:
     return destination
 
 
-def _install_linux() -> None:
+def _install_linux(*, no_escalate: bool) -> None:
     manager, suffix = _linux_package()
     gh = shutil.which("gh")
     if gh is None:
         raise HandyInstallError("install GitHub CLI (gh), then rerun desktop setup")
     prefix: list[str] = []
     if _run(["id", "-u"]).stdout.strip() != "0":
+        if no_escalate:
+            raise HandyInstallError(
+                f"Handy {VERSION} needs administrator installation; rerun desktop setup"
+            )
         sudo = shutil.which("sudo")
         if sudo is None:
             raise HandyInstallError("install sudo or install Handy as administrator")
@@ -175,34 +226,45 @@ def _install_linux() -> None:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Ensure desktop Handy is installed")
     parser.add_argument("--check", action="store_true")
+    parser.add_argument("--bin-dir", type=Path, default=default_bin_dir())
+    parser.add_argument("--no-escalate", action="store_true")
     arguments = parser.parse_args(argv)
     system = platform.system()
-    if os.environ.get("CI", "").lower() == "true":
-        print("n/a        Handy (CI)")
-        return 0
-    if system == "Linux" and not (
-        os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")
-    ):
-        print("n/a        Handy (no desktop session; run setup on the desktop host)")
+    if reason := _not_applicable():
+        print(f"n/a        Handy ({reason})")
         return 0
     if system not in {"Windows", "Linux"}:
         print(f"error      Handy setup does not support {system}", file=sys.stderr)
         return 1
     try:
-        if installed := find_handy():
-            print(f"ok         Handy ({installed})")
+        if pending(arguments.bin_dir) is None:
+            print(f"ok         Handy {VERSION}")
             return 0
         if arguments.check:
             print("missing    Handy (rerun setup without --check to install)")
             return 1
         if system == "Windows":
+            if arguments.no_escalate:
+                raise HandyInstallError(
+                    f"Handy {VERSION} requires interactive setup; "
+                    "rerun without --no-escalate"
+                )
             _install_windows()
         else:
-            _install_linux()
+            _install_linux(no_escalate=arguments.no_escalate)
         installed = find_handy()
         if installed is None:
             raise HandyInstallError("installer finished but Handy could not be found")
+        tool_receipts.write(
+            arguments.bin_dir / RECEIPT,
+            tool_receipts.Receipt(
+                VERSION, {str(installed.resolve()): tool_receipts.sha256(installed)}
+            ),
+        )
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
+        if arguments.no_escalate:
+            print(f"error      Handy: {' '.join(str(error).split())}", file=sys.stderr)
+            return 1
         print(f"error      Handy: {error}", file=sys.stderr)
         for output in (error.stdout, error.stderr):
             if output:

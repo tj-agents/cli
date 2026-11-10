@@ -4,16 +4,17 @@ import argparse
 import hashlib
 import io
 import platform
-import subprocess
 import sys
 import tarfile
 import urllib.request
 import zipfile
 from pathlib import Path
 
+from tj_cli import tool_receipts
 from tj_cli.native_install import default_bin_dir
 
 VERSION = "0.81.0"
+RECEIPT = ".tj-worktrunk.json"
 ARCHIVES = {
     "Windows": (
         "worktrunk-x86_64-pc-windows-msvc.zip",
@@ -34,20 +35,10 @@ def executable(bin_dir: Path) -> Path:
     return bin_dir / ("git-wt.exe" if platform.system() == "Windows" else "git-wt")
 
 
-def installed_version(path: Path) -> str | None:
-    if not path.is_file():
-        return None
-    try:
-        result = subprocess.run(
-            [str(path), "--version"],
-            capture_output=True,
-            text=True,
-            timeout=60,
-            check=False,
-        )
-    except OSError:
-        return None
-    return result.stdout.strip().removeprefix("wt v") or None
+def pending(bin_dir: Path) -> str | None:
+    return tool_receipts.pending(
+        bin_dir / RECEIPT, VERSION, names=(executable(bin_dir).name,)
+    )
 
 
 def binary(archive_name: str, contents: bytes) -> bytes:
@@ -82,13 +73,14 @@ def main(argv: list[str] | None = None) -> int:
     arguments = parser.parse_args(argv)
     target = executable(arguments.bin_dir)
     if arguments.uninstall:
+        (arguments.bin_dir / RECEIPT).unlink(missing_ok=True)
         if target.exists():
             target.unlink()
             print(f"removed    {target}")
         else:
             print("ok         git-wt (not installed)")
         return 0
-    if installed_version(target) == VERSION:
+    if pending(arguments.bin_dir) is None:
         print(f"ok         git-wt {VERSION}")
         return 0
     if arguments.check:
@@ -109,6 +101,10 @@ def main(argv: list[str] | None = None) -> int:
         staged.write_bytes(contents)
         staged.chmod(0o755)
         staged.replace(target)
+        tool_receipts.write(
+            arguments.bin_dir / RECEIPT,
+            tool_receipts.Receipt(VERSION, {target.name: tool_receipts.sha256(target)}),
+        )
     except (
         WorktrunkInstallError,
         OSError,
