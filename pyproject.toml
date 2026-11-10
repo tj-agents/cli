@@ -69,11 +69,6 @@ rule = "PY008"
 reason = "Legacy package initializer imports private implementation names for its public API."
 
 [[tool.python-standards.exceptions]]
-path = "packages/tj-cli/src/tj_cli/clipboard/_errors.py"
-rule = "PY011"
-reason = "Legacy public exception hierarchy has not yet been consolidated under its package root."
-
-[[tool.python-standards.exceptions]]
 path = "packages/tj-cli/src/tj_cli/clipboard/_guard.py"
 rule = "PY016"
 reason = "Legacy host integration reads process state while resolving native configuration."
@@ -84,34 +79,9 @@ rule = "PY016"
 reason = "Legacy host integration reads process state while resolving native configuration."
 
 [[tool.python-standards.exceptions]]
-path = "packages/tj-cli/src/tj_cli/handy_install.py"
-rule = "PY011"
-reason = "Legacy public exception hierarchy has not yet been consolidated under its package root."
-
-[[tool.python-standards.exceptions]]
-path = "packages/tj-cli/src/tj_cli/handy_install.py"
-rule = "PY016"
-reason = "Legacy host integration reads process state while resolving native configuration."
-
-[[tool.python-standards.exceptions]]
-path = "packages/tj-cli/src/tj_cli/native_install.py"
-rule = "PY011"
-reason = "Legacy public exception hierarchy has not yet been consolidated under its package root."
-
-[[tool.python-standards.exceptions]]
 path = "packages/tj-cli/src/tj_cli/native_install.py"
 rule = "PY016"
 reason = "Legacy host integration reads process state while resolving native configuration."
-
-[[tool.python-standards.exceptions]]
-path = "packages/tj-cli/src/tj_cli/processes.py"
-rule = "PY011"
-reason = "Legacy public exception hierarchy has not yet been consolidated under its package root."
-
-[[tool.python-standards.exceptions]]
-path = "packages/tj-cli/src/tj_cli/worktrunk_install.py"
-rule = "PY011"
-reason = "Legacy public exception hierarchy has not yet been consolidated under its package root."
 
 [[tool.python-standards.exceptions]]
 path = "packages/tj-cli/tests/clipboard/test_dispatch.py"
