@@ -79,18 +79,10 @@ install_binaries() {
 
 check_deps() {
     [ "$mode" = "uninstall" ] && return
-    if command -v fzf >/dev/null 2>&1; then
-        local v
-        v="$(fzf --version | cut -d' ' -f1)"
-        # cr's preview pane needs --preview-wrap-sign, added in fzf 0.54.
-        if [ "$(printf '%s\n0.54\n' "$v" | sort -V | head -1)" != "0.54" ]; then
-            say warning "fzf $v is older than 0.54 - cr needs a newer one (https://github.com/junegunn/fzf/releases)"
-            status=1
-        else
-            say ok "fzf $v"
-        fi
+    if command -v zoxide >/dev/null 2>&1; then
+        say ok "$(zoxide --version)"
     else
-        say missing "fzf - install it with your package manager (Arch: pacman -S fzf, Debian/Ubuntu: apt install fzf)"
+        say missing "zoxide - install it with your package manager (Arch: pacman -S zoxide, Debian/Ubuntu: see https://github.com/ajeetdsouza/zoxide#installation)"
         status=1
     fi
     case ":$PATH:" in
