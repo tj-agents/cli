@@ -4,8 +4,6 @@ use std::process::Stdio;
 use std::thread::JoinHandle;
 use std::time::{Duration, SystemTime};
 
-use serde_json::Value;
-
 use crate::host::Host;
 use crate::paths;
 
@@ -72,27 +70,6 @@ impl Drop for Lock {
     fn drop(&mut self) {
         let _ = fs::remove_file(&self.0);
     }
-}
-
-fn selects(manifest: &str) -> bool {
-    serde_json::from_str::<Value>(manifest).ok().is_some_and(|manifest| {
-        manifest["plugins"].as_array().is_some_and(|plugins| {
-            plugins.iter().filter_map(Value::as_str).any(|plugin| plugin.ends_with("@tj-agents"))
-        })
-    })
-}
-
-/// The repository holding `cwd` selects tj-agents plugins in its `.agents/plugins.json`.
-fn selected(cwd: &Path) -> bool {
-    for folder in cwd.ancestors() {
-        if let Ok(manifest) = fs::read_to_string(folder.join(".agents").join("plugins.json")) {
-            return selects(&manifest);
-        }
-        if folder.join(".git").exists() {
-            return false;
-        }
-    }
-    false
 }
 
 /// The marketplace commit this host's plugins last converged to, as published by `tj update`.
@@ -172,9 +149,6 @@ fn check(state: &State, host: Host, cwd: &Path, url: &str) -> Result<Option<Stri
 /// Checks once, off the launch's critical path, whether tj-agents moved past what this host last installed, and
 /// starts the install in the background when it did. Joining yields the one line to show, if any.
 pub(crate) fn start(host: Host, cwd: &Path, url: String) -> Option<JoinHandle<Result<Option<String>, CheckError>>> {
-    if !selected(cwd) {
-        return None;
-    }
     let state = State::new(&paths::cache_dir().ok()?, host);
     let cwd = cwd.to_path_buf();
     Some(std::thread::spawn(move || check(&state, host, &cwd, &url)))
@@ -184,17 +158,9 @@ pub(crate) fn start(host: Host, cwd: &Path, url: String) -> Option<JoinHandle<Re
 mod tests {
     use std::time::{Duration, UNIX_EPOCH};
 
-    use super::{Answer, CheckError, TIMEOUT, converged, install, recent, request, selects};
+    use super::{Answer, CheckError, TIMEOUT, converged, install, recent, request};
 
     const SHA: &str = "3f0578aa4000485aa25477e36592978fa5fa750f";
-
-    #[test]
-    fn only_a_project_selecting_tj_agents_plugins_is_checked() {
-        assert!(selects(r#"{"plugins":["base@other","agent@tj-agents"]}"#));
-        assert!(!selects(r#"{"plugins":["agent@agents"]}"#));
-        assert!(!selects(r#"{"marketplaces":{"tj-agents":{}}}"#));
-        assert!(!selects(r#"{"plugins":["agent@tj-agents""#));
-    }
 
     #[test]
     fn the_converged_commit_is_the_published_revision_when_it_is_a_sha() {

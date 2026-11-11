@@ -1,6 +1,7 @@
 pub mod closeout;
 pub mod owner;
 pub(crate) mod store;
+mod tj_agents;
 pub mod update;
 
 use std::collections::HashSet;
@@ -333,8 +334,12 @@ pub fn run(args: Args) -> Result<ExitCode> {
     agent::prepare_wrapper().context("could not prepare the console")?;
     let exe = std::env::current_exe().context("could not locate the tj executable")?;
     let launch = launch(&args)?;
-    let upstream =
-        if args.successor { None } else { update::upstream::start(launch.host, &launch.cwd, args.update_url.clone()) };
+    let selected = tj_agents::selected(&launch.cwd);
+    let upstream = if selected && !args.successor {
+        update::upstream::start(launch.host, &launch.cwd, args.update_url.clone())
+    } else {
+        None
+    };
     let marks = marks(&launch.id)?;
     if !args.successor {
         let _ = std::fs::remove_dir_all(&marks);
@@ -350,7 +355,9 @@ pub fn run(args: Args) -> Result<ExitCode> {
     if !args.successor {
         record_launch(&launch, args.parent.as_deref(), pid, &started_at);
     }
-    prepare(&launch, &args.agent);
+    if selected {
+        prepare(&launch, &args.agent);
+    }
     match upstream.map(std::thread::JoinHandle::join) {
         Some(Ok(Ok(Some(line)))) => eprintln!("tj run: {line}"),
         Some(Ok(Err(error))) => {
