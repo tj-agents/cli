@@ -176,6 +176,10 @@ fn native_codex(sandbox: &Sandbox) -> PathBuf {
 }
 
 fn prebound_arguments(sandbox: &Sandbox, launch: &str) -> Vec<String> {
+    prebound_arguments_with_prompt(sandbox, launch, "Prompt")
+}
+
+fn prebound_arguments_with_prompt(sandbox: &Sandbox, launch: &str, prompt: &str) -> Vec<String> {
     let mut arguments = run_arguments(sandbox, launch, "codex", "exit", "10");
     let separator = arguments.iter().position(|argument| argument == "--").unwrap();
     arguments.splice(
@@ -189,7 +193,8 @@ fn prebound_arguments(sandbox: &Sandbox, launch: &str) -> Vec<String> {
             sandbox.worktree.to_string_lossy().into_owned(),
             "resume".to_owned(),
             PREBOUND.to_owned(),
-            "Prompt".to_owned(),
+            "--".to_owned(),
+            prompt.to_owned(),
         ],
     );
     arguments
@@ -632,6 +637,21 @@ fn a_prebound_native_codex_session_registers_and_verifies_before_spawning() {
     )));
     assert!(store.matches("show ").count() >= 4, "{store}");
     assert!(store.contains("end --launch-id prebound --reason exited"), "{store}");
+    assert!(!store.contains("--reason not_started"), "{store}");
+}
+
+#[test]
+fn a_delimited_option_shaped_prompt_is_registered_before_spawning() {
+    let sandbox = sandbox();
+    prebind(&sandbox, false);
+    let output = finish(
+        spawn(&sandbox, &prebound_arguments_with_prompt(&sandbox, "option-prompt", "--model=other"), &sandbox.root),
+        Duration::from_secs(30),
+    );
+    assert!(!output.status.success());
+    let store = log(&sandbox, "stubs/agent-store.log");
+    assert!(store.contains(&format!("register --session codex:{PREBOUND}")), "{store}");
+    assert!(store.contains("end --launch-id option-prompt --reason exited"), "{store}");
     assert!(!store.contains("--reason not_started"), "{store}");
 }
 
