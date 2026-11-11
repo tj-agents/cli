@@ -70,6 +70,8 @@ pub struct Args {
     plugin_grace_seconds: u64,
     #[arg(long, hide = true, default_value_t = 2)]
     input_idle_seconds: u64,
+    #[arg(long, hide = true, default_value = update::upstream::MARKETPLACE)]
+    update_url: String,
     /// Continues this launch in a replaced tj binary: the launch, its marks and its conversation already exist.
     #[arg(long, hide = true)]
     successor: bool,
@@ -331,6 +333,8 @@ pub fn run(args: Args) -> Result<ExitCode> {
     agent::prepare_wrapper().context("could not prepare the console")?;
     let exe = std::env::current_exe().context("could not locate the tj executable")?;
     let launch = launch(&args)?;
+    let upstream =
+        if args.successor { None } else { update::upstream::start(launch.host, &launch.cwd, args.update_url.clone()) };
     let marks = marks(&launch.id)?;
     if !args.successor {
         let _ = std::fs::remove_dir_all(&marks);
@@ -347,6 +351,13 @@ pub fn run(args: Args) -> Result<ExitCode> {
         record_launch(&launch, args.parent.as_deref(), pid, &started_at);
     }
     prepare(&launch, &args.agent);
+    match upstream.map(std::thread::JoinHandle::join) {
+        Some(Ok(Ok(Some(line)))) => eprintln!("tj run: {line}"),
+        Some(Ok(Err(error))) => {
+            eprintln!("tj run: could not check for tj-agents updates: {:#}", anyhow::Error::from(error));
+        }
+        _ => {}
+    }
     let mut agent = Agent::start(&args.agent, &launch.cwd, &environment)
         .with_context(|| format!("could not start {}", args.agent[0].to_string_lossy()))?;
     let poll = Duration::from_secs(args.poll_seconds);
