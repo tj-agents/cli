@@ -157,8 +157,8 @@ fn default_title(cwd: &Path) -> String {
         .map(|output| PathBuf::from(String::from_utf8_lossy(&output.stdout).trim()));
     let folder = toplevel.as_deref().unwrap_or(cwd);
     let base = folder.file_name().map_or_else(|| "agent".to_owned(), |name| name.to_string_lossy().into_owned());
-    let taken: HashSet<String> = store::open_launches(None)
-        .map(|rows| rows.into_iter().map(|row| row.launch.title).collect())
+    let taken: HashSet<String> = store::launches(None)
+        .map(|rows| rows.into_iter().filter(|row| !row.ended).map(|row| row.launch.title).collect())
         .unwrap_or_default();
     std::iter::once(base.clone())
         .chain((2..).map(|number| format!("{base}-{number}")))
@@ -299,7 +299,7 @@ pub fn run(args: Args) -> Result<ExitCode> {
     let marks = marks(&launch.id)?;
     let _ = std::fs::remove_dir_all(&marks);
     let pid = std::process::id();
-    let started_at = rfc3339(agent::started_at(pid).unwrap_or_else(SystemTime::now));
+    let started_at = rfc3339(agent::started_at(pid)?.context("could not identify this wrapper process")?);
     let environment = [
         ("TJ_RUN_PID", pid.to_string()),
         ("TJ_RUN_STARTED_AT", started_at.clone()),
@@ -330,14 +330,27 @@ pub fn run(args: Args) -> Result<ExitCode> {
                 eprintln!("\r\ntj run: the resumed agent exited with code {code}\r");
                 wait_for_enter();
             }
+            watch.next_poll = Instant::now();
+            let closing = watch.trigger().is_some();
             let _ = std::fs::remove_dir_all(&watch.marks);
+            if closing {
+                let result = closeout::owned_preflight(&watch.launch)
+                    .map_err(anyhow::Error::msg)
+                    .and_then(|plan| closeout::finish(&watch.launch, plan));
+                if let Err(error) = result {
+                    eprintln!("tj run: closeout stopped: {error:#}");
+                    wait_for_enter();
+                    return Ok(ExitCode::FAILURE);
+                }
+                return Ok(ExitCode::from(u8::try_from(code).unwrap_or(1)));
+            }
             if let Err(error) = store::end(&watch.launch.id, "exited") {
                 eprintln!("tj run: {error:#}");
             }
             return Ok(ExitCode::from(u8::try_from(code).unwrap_or(1)));
         }
         if let Some(trigger) = watch.trigger() {
-            match closeout::owned_preflight(&watch.launch, trigger == Trigger::Merged) {
+            match closeout::owned_preflight(&watch.launch) {
                 Ok(removal) => break removal,
                 Err(reason) => {
                     watch.report(reason);
