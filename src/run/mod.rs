@@ -337,7 +337,7 @@ pub fn run(args: Args) -> Result<ExitCode> {
             return Ok(ExitCode::from(u8::try_from(code).unwrap_or(1)));
         }
         if let Some(trigger) = watch.trigger() {
-            match closeout::preflight(&watch.launch.cwd, trigger == Trigger::Merged) {
+            match closeout::owned_preflight(&watch.launch, trigger == Trigger::Merged) {
                 Ok(removal) => break removal,
                 Err(reason) => {
                     watch.report(reason);

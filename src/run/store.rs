@@ -74,6 +74,26 @@ pub fn bound_session(launch_id: &str) -> Result<Option<String>> {
     Ok(data["session"]["native_id"].as_str().filter(|id| !id.is_empty()).map(str::to_owned))
 }
 
+pub fn worktree(launch: &Launch) -> Result<PathBuf> {
+    let data = call(&["show", "--launch-id", &launch.id])?;
+    let session = &data["session"];
+    let Some(worktree) = session["worktree"].as_str() else {
+        return Ok(launch.cwd.clone());
+    };
+    if data["launch"]["launch_id"].as_str() != Some(launch.id.as_str())
+        || session["launch_id"].as_str() != Some(launch.id.as_str())
+        || session["host"].as_str() != Some(launch.host.name())
+        || session["native_id"].as_str().is_none_or(str::is_empty)
+    {
+        bail!("session worktree is not bound to {} launch {}", launch.host.name(), launch.id);
+    }
+    let worktree = PathBuf::from(worktree);
+    if !worktree.is_absolute() {
+        bail!("bound session worktree is not absolute: {}", worktree.display());
+    }
+    Ok(worktree)
+}
+
 pub fn end(launch_id: &str, reason: &str) -> Result<()> {
     call(&["end", "--launch-id", launch_id, "--reason", reason]).map(drop)
 }
