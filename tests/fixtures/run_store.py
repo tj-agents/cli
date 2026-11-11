@@ -11,6 +11,8 @@ class Claim(TypedDict):
 class Data(TypedDict, total=False):
     worktrees: list[Claim]
     released: bool
+    launch: object
+    session: object
 
 
 class Reply(TypedDict):
@@ -71,7 +73,7 @@ def prebound_reply(
     )
     if configuration_data.get("foreign_native") is True and native is not None:
         native["native_id"] = "123e4567-e89b-12d3-a456-426614174001"
-    return {"ok": True, "data": {"launch": launch, "session": native}}
+    return {"ok": True, "data": Data(launch=launch, session=native)}
 
 
 def main() -> None:
