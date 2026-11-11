@@ -1,3 +1,5 @@
+use std::process::ExitCode;
+
 use tj_cli::process::agent;
 
 /// The launch this process speaks for. A tab, shell or agent started from inside a session inherits `TJ_RUN_*`,
@@ -10,6 +12,13 @@ pub(crate) fn launch() -> Option<String> {
         return None;
     }
     owns(&agent::ancestry().ok()?, wrapper).then_some(launch)
+}
+
+pub fn print() -> ExitCode {
+    if let Some(launch) = launch() {
+        println!("{launch}");
+    }
+    ExitCode::SUCCESS
 }
 
 fn owns(chain: &[(u32, String)], wrapper: u32) -> bool {
