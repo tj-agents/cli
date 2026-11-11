@@ -181,6 +181,10 @@ def _install_windows() -> Path:
     for package, library in WINDOWS_RUNTIMES:
         if not _system_library_installed(library):
             _winget_install(winget, package)
+            if not _system_library_installed(library):
+                raise HandyInstallError(
+                    f"installer finished but {package} runtime {library} is missing"
+                )
     _winget_install(
         winget, "cjpais.Handy", "--version", VERSION, "--scope", "user", "--force"
     )
