@@ -44,6 +44,11 @@ pub struct Removal {
     worktree: PathBuf,
 }
 
+pub fn owned_preflight(launch: &Launch, delivered: bool) -> Result<Option<Removal>, String> {
+    let worktree = store::worktree(launch).map_err(|error| format!("{error:#}"))?;
+    preflight(&worktree, delivered)
+}
+
 fn git(cwd: &Path, arguments: &[&str]) -> Result<String> {
     let output =
         hidden("git").args(arguments).current_dir(cwd).stdin(Stdio::null()).output().context("could not run git")?;
@@ -160,7 +165,7 @@ pub fn run(args: Args) -> Result<ExitCode> {
             continue;
         }
         let result = if launch.cwd.exists() {
-            preflight(&launch.cwd, delivered).map_err(anyhow::Error::msg).and_then(|removal| finish(launch, removal))
+            owned_preflight(launch, delivered).map_err(anyhow::Error::msg).and_then(|removal| finish(launch, removal))
         } else {
             finish(launch, None)
         };
