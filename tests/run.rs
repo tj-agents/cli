@@ -989,6 +989,15 @@ fn tracker_and_launch_finalization_failures_can_be_retried_after_all_releases() 
         let journal = sandbox.root.join("cache/run").join(format!("{launch}.closeout.json"));
         assert!(journal.is_file());
         std::fs::remove_file(sandbox.stubs.join(failed)).unwrap();
+        git(&sandbox.primary, &["branch", "Feature/1"]);
+        let ended = log(&sandbox, "stubs/agent-store.log").matches("--reason closed").count();
+        let refused = retry_closeout(&sandbox, &launch);
+        assert_eq!(refused.status.code(), Some(1));
+        assert!(String::from_utf8_lossy(&refused.stdout).contains("branch was retained"));
+        assert_eq!(log(&sandbox, "stubs/agent-store.log").matches("--reason closed").count(), ended);
+        assert!(journal.is_file());
+        assert!(!git(&sandbox.primary, &["branch", "--list", "Feature/1"]).is_empty());
+        git(&sandbox.primary, &["branch", "-d", "Feature/1"]);
         let output = retry_closeout(&sandbox, &launch);
         assert_closed_out(&sandbox, &output, &launch);
         assert!(!journal.exists());
