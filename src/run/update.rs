@@ -6,7 +6,7 @@ mod watch;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use tj_cli::process::agent;
@@ -37,8 +37,8 @@ pub(crate) fn host(host: Host) -> &'static dyn Update {
     }
 }
 
-pub(crate) fn published() -> Result<PathBuf> {
-    Ok(paths::cache_dir()?.join("published"))
+pub(crate) fn published(host: Host) -> Result<PathBuf> {
+    Ok(paths::cache_dir()?.join("published").join(host.name()))
 }
 
 /// The update to apply now, if any.
@@ -53,17 +53,30 @@ pub(crate) fn due(watcher: &mut Watcher, host: &dyn Update, agent: u32, graces: 
 
 #[derive(clap::Args)]
 pub struct Args {
-    /// The installed plugin revision, such as their pins. Every running tab applies each new revision once.
+    /// The host whose plugins were just updated; only its tabs apply the update.
+    #[arg(long, value_enum)]
+    host: Host,
+    /// What was installed, such as the plugin pins. Every publish is a new update, even of the same revision.
     #[arg(long)]
     revision: String,
 }
 
 pub fn publish(args: Args) -> Result<ExitCode> {
-    let published = published()?;
-    let folder = published.parent().context("the published revision has no folder")?;
-    std::fs::create_dir_all(folder).context("could not create the cache folder")?;
-    let staged = folder.join(format!("published.{}", std::process::id()));
-    std::fs::write(&staged, &args.revision).context("could not stage the published revision")?;
-    std::fs::rename(&staged, &published).context("could not publish the revision")?;
+    let published = published(args.host)?;
+    let folder = published.parent().context("the published update has no folder")?;
+    std::fs::create_dir_all(folder).context("could not create the published updates folder")?;
+    let stamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos();
+    let staged = folder.join(format!("{}.{}", args.host.name(), std::process::id()));
+    std::fs::write(
+        &staged,
+        format!(
+            "{}
+{stamp}.{}",
+            args.revision,
+            std::process::id()
+        ),
+    )
+    .context("could not stage the published update")?;
+    std::fs::rename(&staged, &published).context("could not publish the update")?;
     Ok(ExitCode::SUCCESS)
 }

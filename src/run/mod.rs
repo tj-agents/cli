@@ -356,7 +356,7 @@ pub fn run(args: Args) -> Result<ExitCode> {
         restart: Duration::from_secs(args.restart_grace_seconds),
         input: Duration::from_secs(args.input_idle_seconds),
     };
-    let mut watcher = update::Watcher::new(exe, update::published()?);
+    let mut watcher = update::Watcher::new(exe, update::published(launch.host)?);
     let mut watch = Watch {
         launch,
         marks,
