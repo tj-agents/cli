@@ -35,10 +35,9 @@ enum Command {
     Run(run::Args),
     /// Mark this tab's work done; `tj run` closes it out after an idle grace
     Done(run::DoneArgs),
-    /// Publish an installed plugin revision; every tab under `tj run` reloads it in place once idle
-    Reload(run::reload::Args),
-    /// Update plugins and tj, then apply the update to this tab's agent now, in place
-    Refresh,
+    /// Announce installed plugin updates; every tab under `tj run` applies them in place once idle (run by Agent)
+    #[command(hide = true)]
+    Update(run::update::Args),
     /// Prints the `tj run` launch this process belongs to, if any (run by the agent's SessionStart hook)
     #[command(hide = true)]
     Launch,
@@ -67,9 +66,8 @@ fn main() -> ExitCode {
         Command::Init(args) => init::run(args),
         Command::Run(args) => run::run(args),
         Command::Done(args) => run::done(args),
-        Command::Reload(args) => run::reload::publish(args),
-        Command::Refresh => run::reload::refresh(),
-        Command::Launch => Ok(run::reload::launch()),
+        Command::Update(args) => run::update::publish(args),
+        Command::Launch => Ok(run::owner::print()),
         Command::Closeout(args) => run::closeout::run(args),
         Command::Message(args) => message::run(args),
         Command::Subscribe(args) => subscribe::run(args),

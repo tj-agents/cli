@@ -16,7 +16,7 @@ impl Stamp {
 }
 
 /// What this tab is running against: the wrapper's own executable and the last published plugin revision.
-pub(crate) struct Updates {
+pub(crate) struct Watcher {
     exe: PathBuf,
     running: Option<Stamp>,
     candidate: Option<(Stamp, Instant)>,
@@ -24,7 +24,7 @@ pub(crate) struct Updates {
     applied: Option<String>,
 }
 
-impl Updates {
+impl Watcher {
     pub(crate) fn new(exe: PathBuf, published: PathBuf) -> Self {
         let running = Stamp::of(&exe);
         let applied = std::fs::read_to_string(&published).ok();
@@ -75,7 +75,7 @@ impl Updates {
 mod tests {
     use std::time::Duration;
 
-    use super::Updates;
+    use super::Watcher;
 
     #[test]
     fn a_revision_is_pending_only_once_published_and_until_applied() {
@@ -83,7 +83,7 @@ mod tests {
         let published = directory.path().join("published");
         let exe = directory.path().join("tj");
         std::fs::write(&exe, "old").unwrap();
-        let mut updates = Updates::new(exe, published.clone());
+        let mut updates = Watcher::new(exe, published.clone());
         assert_eq!(updates.revision(), None);
         std::fs::write(&published, "b").unwrap();
         assert_eq!(updates.revision().as_deref(), Some("b"));
@@ -96,7 +96,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let exe = directory.path().join("tj");
         std::fs::write(&exe, "old").unwrap();
-        let mut updates = Updates::new(exe.clone(), directory.path().join("published"));
+        let mut updates = Watcher::new(exe.clone(), directory.path().join("published"));
         assert!(!updates.binary(Duration::ZERO));
         std::fs::write(&exe, "a newer build").unwrap();
         assert!(!updates.binary(Duration::ZERO));
