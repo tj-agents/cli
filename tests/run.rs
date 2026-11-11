@@ -317,6 +317,52 @@ fn an_unrelated_worktree_binding_does_not_stop_or_clean_the_agent() {
 }
 
 #[test]
+fn an_orphaned_launch_cleans_its_bound_worktree_when_the_launch_directory_is_gone() {
+    for host in ["claude", "codex"] {
+        let sandbox = sandbox();
+        let launch = format!("orphan-{host}");
+        let row = serde_json::json!({
+            "launch_id": launch, "host": host, "title": "Orphan",
+            "worktree": sandbox.root.join("gone"), "state": "closing",
+            "wrapper": {"pid": 0, "started_at": "2026-01-01T00:00:00Z"}
+        });
+        set_reply(
+            &sandbox,
+            "agent-store-launches.json",
+            &serde_json::json!({
+                "ok": true, "data": {"launches": [row]}
+            })
+            .to_string(),
+        );
+        set_reply(
+            &sandbox,
+            "agent-store-show.json",
+            &serde_json::json!({
+                "ok": true,
+                "data": {
+                    "launch": {"launch_id": launch},
+                    "session": {
+                        "native_id": "sess-1", "host": host,
+                        "launch_id": launch, "worktree": sandbox.worktree
+                    }
+                }
+            })
+            .to_string(),
+        );
+        let output = Command::new(env!("CARGO_BIN_EXE_tj"))
+            .arg("closeout")
+            .envs(environment(&sandbox))
+            .current_dir(&sandbox.root)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        assert!(!sandbox.worktree.exists(), "the bound worktree is still there");
+        assert!(git(&sandbox.primary, &["branch", "--list", "Feature/1"]).is_empty());
+        assert!(log(&sandbox, "stubs/agent-store.log").contains(&format!("end --launch-id {launch} --reason closed")));
+    }
+}
+
+#[test]
 fn closes_out_after_done_and_idle() {
     let sandbox = sandbox();
     let child = start(&sandbox, "idle", "claude", "signal", "10");
