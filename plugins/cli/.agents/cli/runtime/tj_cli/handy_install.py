@@ -147,9 +147,8 @@ WINDOWS_RUNTIMES = (
 )
 
 
-def _system_library_installed(library: str) -> bool:
-    system_root = os.environ.get("SYSTEMROOT", r"C:\Windows")
-    return (Path(system_root) / "System32" / library).is_file()
+def _system_library_installed(system_directory: Path, library: str) -> bool:
+    return (system_directory / library).is_file()
 
 
 def _winget_install(winget: str, package: str, *options: str) -> None:
@@ -172,16 +171,16 @@ def _winget_install(winget: str, package: str, *options: str) -> None:
     )
 
 
-def _install_windows() -> Path:
+def _install_windows(system_directory: Path) -> Path:
     winget = shutil.which("winget")
     if winget is None:
         raise HandyInstallError(
             "install Windows App Installer (winget), then rerun setup"
         )
     for package, library in WINDOWS_RUNTIMES:
-        if not _system_library_installed(library):
+        if not _system_library_installed(system_directory, library):
             _winget_install(winget, package)
-            if not _system_library_installed(library):
+            if not _system_library_installed(system_directory, library):
                 raise HandyInstallError(
                     f"installer finished but {package} runtime {library} is missing"
                 )
@@ -369,7 +368,10 @@ def main(argv: list[str] | None = None) -> int:
                     f"Handy {VERSION} requires interactive setup; "
                     "rerun without --no-escalate"
                 )
-            installed = _install_windows()
+            system_directory = (
+                Path(os.environ.get("SYSTEMROOT", r"C:\Windows")) / "System32"
+            )
+            installed = _install_windows(system_directory)
         else:
             installed = _install_linux(
                 no_escalate=arguments.no_escalate,
