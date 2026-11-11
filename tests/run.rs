@@ -250,6 +250,73 @@ fn closes_out_when_every_pr_has_merged() {
 }
 
 #[test]
+fn closes_out_the_worktree_bound_after_launch() {
+    for (host, mode) in [("claude", "signal"), ("codex", "keys")] {
+        let sandbox = sandbox();
+        git(&sandbox.primary, &["worktree", "remove", sandbox.worktree.to_str().unwrap()]);
+        let launch = format!("later-worktree-{host}");
+        let mut arguments = run_arguments(&sandbox, &launch, host, mode, "2");
+        let cwd = arguments.iter().position(|argument| argument == "--cwd").unwrap() + 1;
+        arguments[cwd] = sandbox.primary.to_string_lossy().into_owned();
+        let child = spawn(&sandbox, &arguments, &sandbox.root);
+        wait_for_log(&sandbox, "agent ");
+        git(&sandbox.primary, &["worktree", "add", "-q", sandbox.worktree.to_str().unwrap(), "Feature/1"]);
+        let binding = serde_json::json!({
+            "ok": true,
+            "data": {
+                "launch": {"launch_id": launch, "state": "active", "cwd": sandbox.primary},
+                "session": {
+                    "native_id": "sess-1", "state": "active", "host": host,
+                    "launch_id": launch, "worktree": sandbox.worktree
+                }
+            }
+        });
+        set_reply(&sandbox, "agent-store-show.json", &binding.to_string());
+        set_reply(&sandbox, "tj-item-prs.json", r#"{"prs":[{"url":"u","state":"merged"}],"all_merged":true}"#);
+        let output = finish(child, Duration::from_secs(30));
+        assert_closed_out(&sandbox, &output, &launch);
+        let store = log(&sandbox, "stubs/agent-store.log");
+        let recorded = store.lines().find(|line| line.starts_with("launch ")).unwrap();
+        assert!(recorded.contains(sandbox.primary.to_str().unwrap()), "{recorded}");
+        assert!(!recorded.contains(sandbox.worktree.to_str().unwrap()), "{recorded}");
+        assert!(git(&sandbox.primary, &["branch", "--list", "Feature/1"]).is_empty());
+    }
+}
+
+#[test]
+fn an_unrelated_worktree_binding_does_not_stop_or_clean_the_agent() {
+    for (field, wrong) in [("launch_id", "another-launch"), ("host", "codex"), ("worktree", "relative/path")] {
+        let sandbox = sandbox();
+        let launch = "wrong-binding";
+        let mut binding = serde_json::json!({
+            "ok": true,
+            "data": {
+                "launch": {"launch_id": launch, "state": "active"},
+                "session": {
+                    "native_id": "sess-1", "state": "active", "host": "claude",
+                    "launch_id": launch, "worktree": sandbox.worktree
+                }
+            }
+        });
+        binding["data"]["session"][field] = serde_json::Value::String(wrong.to_owned());
+        set_reply(&sandbox, "agent-store-show.json", &binding.to_string());
+        set_reply(&sandbox, "tj-item-prs.json", r#"{"prs":[{"url":"u","state":"merged"}],"all_merged":true}"#);
+        let mut child = start(&sandbox, launch, "claude", "signal", "2");
+        still_running(&mut child, Duration::from_secs(2));
+        assert!(sandbox.worktree.exists());
+        assert!(!log(&sandbox, "stubs/tj-item.log").contains("--state Done"));
+        binding["data"]["session"]["launch_id"] = serde_json::json!(launch);
+        binding["data"]["session"]["host"] = serde_json::json!("claude");
+        binding["data"]["session"]["worktree"] = serde_json::json!(sandbox.worktree);
+        set_reply(&sandbox, "agent-store-show.json", &binding.to_string());
+        let output = finish(child, Duration::from_secs(30));
+        assert_closed_out(&sandbox, &output, launch);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("not bound") || stderr.contains("not absolute"), "{stderr}");
+    }
+}
+
+#[test]
 fn closes_out_after_done_and_idle() {
     let sandbox = sandbox();
     let child = start(&sandbox, "idle", "claude", "signal", "10");
