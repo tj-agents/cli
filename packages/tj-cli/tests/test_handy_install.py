@@ -108,6 +108,8 @@ def test_registered_windows_custom_location_is_recognized(
     hive: int,
     view: int,
 ) -> None:
+    for library in RUNTIMES.values():
+        _system_library(library)
     directory = tmp_path / "custom apps é" / "voice"
     directory.mkdir(parents=True)
     executable = directory / "handy.exe"
@@ -175,6 +177,36 @@ def test_windows_installs_once_and_verifies_the_result(
     assert "ok         Handy" in output
 
 
+@pytest.mark.parametrize(("package", "library"), RUNTIMES.items())
+def test_windows_ineffective_runtime_install_stops_before_handy_or_receipt(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    windows_registry: dict[tuple[int, int], str],
+    package: str,
+    library: str,
+) -> None:
+    for other in RUNTIMES.values():
+        if other != library:
+            _system_library(other)
+    _windows_installation(windows_registry)
+    commands: list[list[str]] = []
+    monkeypatch.setattr(
+        shutil, "which", lambda name: "winget.exe" if name == "winget" else None
+    )
+
+    def run(arguments: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        commands.append(arguments)
+        return subprocess.CompletedProcess(arguments, 0, "", "")
+
+    monkeypatch.setattr(subprocess, "run", run)
+    assert handy_install.main([]) == 1
+    assert [arguments[3] for arguments in commands] == [package]
+    assert not (Path(os.environ["TJ_BIN_DIR"]) / handy_install.RECEIPT).exists()
+    output = capsys.readouterr()
+    assert package in output.err and library in output.err
+    assert "installed  Handy" not in output.out
+
+
 def test_windows_missing_winget_is_actionable(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
@@ -188,6 +220,8 @@ def test_windows_failed_or_ineffective_install_is_not_success(
     capsys: pytest.CaptureFixture[str],
     failure: bool,
 ) -> None:
+    for library in RUNTIMES.values():
+        _system_library(library)
     monkeypatch.setattr(
         shutil, "which", lambda name: "winget.exe" if name == "winget" else None
     )
@@ -506,6 +540,8 @@ def test_windows_receipts_registered_pin_instead_of_older_path_copy(
     tmp_path: Path,
     windows_registry: dict[tuple[int, int], str],
 ) -> None:
+    for library in RUNTIMES.values():
+        _system_library(library)
     shadow = tmp_path / "portable" / "handy.exe"
     shadow.parent.mkdir()
     shadow.write_bytes(b"old portable version")
@@ -531,6 +567,8 @@ def test_windows_receipts_registered_pin_instead_of_older_path_copy(
 def test_windows_installer_success_without_pinned_registration_is_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    for library in RUNTIMES.values():
+        _system_library(library)
     executable = _windows_installation()
     monkeypatch.setattr(
         shutil,
