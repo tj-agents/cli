@@ -215,10 +215,13 @@ fn prebound_session(args: &Args, launch: &Launch) -> Result<Option<PreboundSessi
         OsStr::new("resume"),
         OsStr::new(native_id),
     ];
-    if !(args.agent.len() == expected.len() || args.agent.len() == expected.len() + 1)
-        || args.agent.iter().take(expected.len()).map(OsString::as_os_str).ne(expected)
-    {
-        bail!("--session requires `codex --cd <cwd> resume <UUID>` with at most one prompt");
+    let prompt_is_delimited = match args.agent.get(expected.len()..) {
+        Some([]) => true,
+        Some([delimiter, _]) => delimiter == OsStr::new("--"),
+        _ => false,
+    };
+    if !prompt_is_delimited || args.agent.iter().take(expected.len()).map(OsString::as_os_str).ne(expected) {
+        bail!("--session requires `codex --cd <cwd> resume <UUID> [-- <prompt>]`");
     }
     Ok(Some(PreboundSession { handle: handle.clone() }))
 }
@@ -544,7 +547,51 @@ mod tests {
     #[test]
     fn prebound_session_admits_only_the_native_codex_resume_shape() {
         let launch = launch();
-        let args = prebound_args(vec![
+        let without_prompt = prebound_args(vec![
+            executable(),
+            OsString::from("--cd"),
+            launch.cwd.clone().into_os_string(),
+            OsString::from("resume"),
+            OsString::from("123e4567-e89b-12d3-a456-426614174000"),
+        ]);
+        assert_eq!(
+            prebound_session(&without_prompt, &launch).unwrap().unwrap().handle,
+            without_prompt.session.unwrap()
+        );
+
+        let with_prompt = prebound_args(vec![
+            executable(),
+            OsString::from("--cd"),
+            launch.cwd.clone().into_os_string(),
+            OsString::from("resume"),
+            OsString::from("123e4567-e89b-12d3-a456-426614174000"),
+            OsString::from("--"),
+            OsString::from("Prompt"),
+        ]);
+        assert_eq!(prebound_session(&with_prompt, &launch).unwrap().unwrap().handle, with_prompt.session.unwrap());
+    }
+
+    #[test]
+    fn prebound_session_admits_only_a_delimited_literal_prompt() {
+        let launch = launch();
+        for prompt in ["--help", "--model=other", "-", " spaced 世界"] {
+            let args = prebound_args(vec![
+                executable(),
+                OsString::from("--cd"),
+                launch.cwd.clone().into_os_string(),
+                OsString::from("resume"),
+                OsString::from("123e4567-e89b-12d3-a456-426614174000"),
+                OsString::from("--"),
+                OsString::from(prompt),
+            ]);
+            assert!(prebound_session(&args, &launch).is_ok());
+        }
+    }
+
+    #[test]
+    fn prebound_session_rejects_undelimited_or_extra_arguments() {
+        let launch = launch();
+        let bare_prompt = prebound_args(vec![
             executable(),
             OsString::from("--cd"),
             launch.cwd.clone().into_os_string(),
@@ -552,22 +599,48 @@ mod tests {
             OsString::from("123e4567-e89b-12d3-a456-426614174000"),
             OsString::from("Prompt"),
         ]);
-        assert_eq!(prebound_session(&args, &launch).unwrap().unwrap().handle, args.session.unwrap());
-    }
+        assert!(prebound_session(&bare_prompt, &launch).is_err());
 
-    #[test]
-    fn prebound_session_rejects_extra_or_malformed_arguments() {
-        let launch = launch();
-        let malformed = prebound_args(vec![
+        let bare_option = prebound_args(vec![
             executable(),
             OsString::from("--cd"),
             launch.cwd.clone().into_os_string(),
             OsString::from("resume"),
-            OsString::from("123E4567-e89b-12d3-a456-426614174000"),
+            OsString::from("123e4567-e89b-12d3-a456-426614174000"),
+            OsString::from("--model=other"),
+        ]);
+        assert!(prebound_session(&bare_option, &launch).is_err());
+
+        let bare_delimiter = prebound_args(vec![
+            executable(),
+            OsString::from("--cd"),
+            launch.cwd.clone().into_os_string(),
+            OsString::from("resume"),
+            OsString::from("123e4567-e89b-12d3-a456-426614174000"),
+            OsString::from("--"),
+        ]);
+        assert!(prebound_session(&bare_delimiter, &launch).is_err());
+
+        let extra = prebound_args(vec![
+            executable(),
+            OsString::from("--cd"),
+            launch.cwd.clone().into_os_string(),
+            OsString::from("resume"),
+            OsString::from("123e4567-e89b-12d3-a456-426614174000"),
+            OsString::from("--"),
             OsString::from("Prompt"),
             OsString::from("extra"),
         ]);
-        assert!(prebound_session(&malformed, &launch).is_err());
+        assert!(prebound_session(&extra, &launch).is_err());
+
+        let reordered = prebound_args(vec![
+            executable(),
+            OsString::from("resume"),
+            launch.cwd.clone().into_os_string(),
+            OsString::from("--cd"),
+            OsString::from("123e4567-e89b-12d3-a456-426614174000"),
+        ]);
+        assert!(prebound_session(&reordered, &launch).is_err());
         assert!(!canonical_uuid("123E4567-e89b-12d3-a456-426614174000"));
 
         let mut wrong_host = prebound_args(vec![

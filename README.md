@@ -206,7 +206,8 @@ The executable must be the native `claude` or `codex`, not an npm `.cmd` shim.
 
 `--session codex:UUID` binds a pre-created Codex thread before the native process starts. It requires an
 explicit `--host codex` and an absolute native command in the exact form
-`codex --cd WORKTREE resume UUID [PROMPT]`.
+`codex --cd WORKTREE resume UUID [-- PROMPT]`. The delimiter is required when a prompt is supplied, so
+prompt text beginning with a hyphen remains literal.
 
 Before each start or restart, `tj run` invokes Agent's `tj-prepare` with the host, working directory
 and host arguments. Agent reconciles the repository's selected plugins and its standards index before
