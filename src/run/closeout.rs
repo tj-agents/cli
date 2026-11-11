@@ -164,11 +164,11 @@ pub fn run(args: Args) -> Result<ExitCode> {
         if args.item.is_none() && !row.closing && !delivered {
             continue;
         }
-        let result = if launch.cwd.exists() {
-            owned_preflight(launch, delivered).map_err(anyhow::Error::msg).and_then(|removal| finish(launch, removal))
-        } else {
-            finish(launch, None)
-        };
+        let result = store::worktree(launch).and_then(|worktree| {
+            let removal =
+                if worktree.exists() { preflight(&worktree, delivered).map_err(anyhow::Error::msg)? } else { None };
+            finish(launch, removal)
+        });
         match result {
             Ok(()) => println!("closed     {} ({})", launch.title, launch.cwd.display()),
             Err(error) => {
