@@ -4,6 +4,7 @@ pub(crate) mod store;
 
 use std::collections::HashSet;
 use std::ffi::{OsStr, OsString};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 use std::time::{Duration, Instant, SystemTime};
@@ -77,6 +78,41 @@ pub fn hidden(program: &str) -> Command {
     command
 }
 
+fn preparation(launch: &Launch, arguments: &[OsString]) -> Result<()> {
+    let arguments = arguments[1..]
+        .iter()
+        .map(|argument| argument.to_str().context("host arguments must be UTF-8 for standards preparation"))
+        .collect::<Result<Vec<_>>>()?;
+    let input = serde_json::to_vec(&arguments)?;
+    let mut child = hidden("tj-prepare")
+        .args(["--host", launch.host.name(), "--cwd"])
+        .arg(&launch.cwd)
+        .arg("--arguments-stdin")
+        .current_dir(&launch.cwd)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .context("could not start tj-prepare")?;
+    let written = child
+        .stdin
+        .take()
+        .context("tj-prepare has no input pipe")
+        .and_then(|mut stdin| stdin.write_all(&input).context("could not send host arguments to tj-prepare"));
+    let output = child.wait_with_output().context("could not wait for tj-prepare")?;
+    written?;
+    if !output.status.success() {
+        bail!("tj-prepare {}: {}", output.status, String::from_utf8_lossy(&output.stderr).trim());
+    }
+    Ok(())
+}
+
+fn prepare(launch: &Launch, arguments: &[OsString]) {
+    if let Err(error) = preparation(launch, arguments) {
+        eprintln!("tj run: repository standards preparation failed: {error:#}");
+    }
+}
+
 /// The agent's SessionStart registers against this row, so it must exist before the agent starts.
 fn record_launch(launch: &Launch, parent: Option<&str>, wrapper_pid: u32, wrapper_started_at: &str) {
     let mut failure = None;
@@ -121,8 +157,8 @@ fn default_title(cwd: &Path) -> String {
         .map(|output| PathBuf::from(String::from_utf8_lossy(&output.stdout).trim()));
     let folder = toplevel.as_deref().unwrap_or(cwd);
     let base = folder.file_name().map_or_else(|| "agent".to_owned(), |name| name.to_string_lossy().into_owned());
-    let taken: HashSet<String> = store::open_launches(None)
-        .map(|rows| rows.into_iter().map(|row| row.launch.title).collect())
+    let taken: HashSet<String> = store::launches(None)
+        .map(|rows| rows.into_iter().filter(|row| !row.ended).map(|row| row.launch.title).collect())
         .unwrap_or_default();
     std::iter::once(base.clone())
         .chain((2..).map(|number| format!("{base}-{number}")))
@@ -242,6 +278,7 @@ fn restart(agent: &mut Agent, watch: &mut Watch, command: &[OsString], grace: Du
     };
     eprintln!("\r\ntj run: restarting to resume {}:{session}\r", host.name());
     stop(agent, host, grace)?;
+    prepare(&watch.launch, command);
     let resumed = Agent::start(&host.resume(command, &session), &watch.launch.cwd, &watch.environment)
         .with_context(|| format!("could not resume {}:{session}", host.name()))?;
     Ok(Restarted::Resumed(resumed))
@@ -262,7 +299,7 @@ pub fn run(args: Args) -> Result<ExitCode> {
     let marks = marks(&launch.id)?;
     let _ = std::fs::remove_dir_all(&marks);
     let pid = std::process::id();
-    let started_at = rfc3339(agent::started_at(pid).unwrap_or_else(SystemTime::now));
+    let started_at = rfc3339(agent::started_at(pid)?.context("could not identify this wrapper process")?);
     let environment = [
         ("TJ_RUN_PID", pid.to_string()),
         ("TJ_RUN_STARTED_AT", started_at.clone()),
@@ -270,6 +307,7 @@ pub fn run(args: Args) -> Result<ExitCode> {
         ("AGENT_CLI_TAB_TITLE", launch.title.clone()),
     ];
     record_launch(&launch, args.parent.as_deref(), pid, &started_at);
+    prepare(&launch, &args.agent);
     let mut agent = Agent::start(&args.agent, &launch.cwd, &environment)
         .with_context(|| format!("could not start {}", args.agent[0].to_string_lossy()))?;
     let poll = Duration::from_secs(args.poll_seconds);
@@ -292,14 +330,27 @@ pub fn run(args: Args) -> Result<ExitCode> {
                 eprintln!("\r\ntj run: the resumed agent exited with code {code}\r");
                 wait_for_enter();
             }
+            watch.next_poll = Instant::now();
+            let closing = watch.trigger().is_some();
             let _ = std::fs::remove_dir_all(&watch.marks);
+            if closing {
+                let result = closeout::owned_preflight(&watch.launch)
+                    .map_err(anyhow::Error::msg)
+                    .and_then(|plan| closeout::finish(&watch.launch, plan));
+                if let Err(error) = result {
+                    eprintln!("tj run: closeout stopped: {error:#}");
+                    wait_for_enter();
+                    return Ok(ExitCode::FAILURE);
+                }
+                return Ok(ExitCode::from(u8::try_from(code).unwrap_or(1)));
+            }
             if let Err(error) = store::end(&watch.launch.id, "exited") {
                 eprintln!("tj run: {error:#}");
             }
             return Ok(ExitCode::from(u8::try_from(code).unwrap_or(1)));
         }
         if let Some(trigger) = watch.trigger() {
-            match closeout::preflight(&watch.launch.cwd, trigger == Trigger::Merged) {
+            match closeout::owned_preflight(&watch.launch) {
                 Ok(removal) => break removal,
                 Err(reason) => {
                     watch.report(reason);

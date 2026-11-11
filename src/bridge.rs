@@ -105,10 +105,10 @@ fn serve() -> Result<ExitCode> {
     let record = json!({"port": listener.local_addr()?.port(), "secret": secret, "pid": std::process::id()});
     write_private(&path, &record.to_string())?;
     if let Some(pid) = env("CLAUDE_PID").and_then(|pid| pid.parse::<u32>().ok()) {
-        let born = agent::started_at(pid);
+        let born = agent::started_at(pid)?.context("Claude parent process is gone")?;
         let path = path.clone();
         std::thread::spawn(move || {
-            while agent::started_at(pid) == born {
+            while agent::started_at(pid).is_ok_and(|started| started == Some(born)) {
                 std::thread::sleep(Duration::from_secs(5));
             }
             if owned_by_me(&path) {
