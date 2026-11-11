@@ -1,4 +1,4 @@
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
@@ -119,6 +119,8 @@ fn environment(sandbox: &Sandbox) -> Vec<(&'static str, std::ffi::OsString)> {
         ("PATH", search_path(sandbox)),
         ("TJ_CACHE_DIR", sandbox.root.join("cache").into_os_string()),
         ("DUMMY_LOG", sandbox.log.clone().into_os_string()),
+        ("DUMMY_TJ", std::ffi::OsString::from(env!("CARGO_BIN_EXE_tj"))),
+        ("CLAUDE_CONFIG_DIR", sandbox.root.join("claude").into_os_string()),
         ("HOME", home.clone()),
         ("APPDATA", home.clone()),
         ("XDG_CONFIG_HOME", home),
@@ -152,6 +154,8 @@ fn run_arguments(sandbox: &Sandbox, launch: &str, host: &str, mode: &str, grace:
         grace,
         "--restart-grace-seconds",
         "2",
+        "--input-idle-seconds",
+        "0",
         "--",
         python(),
         &fixture.to_string_lossy(),
@@ -215,17 +219,35 @@ fn still_running(child: &mut Child, wait: Duration) {
     assert!(child.try_wait().unwrap().is_none(), "tj run exited");
 }
 
-fn done(sandbox: &Sandbox, launch: &str, cancel: bool) {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_tj"));
-    command.arg("done").env("TJ_RUN_LAUNCH_ID", launch).env("TJ_CACHE_DIR", sandbox.root.join("cache"));
-    if cancel {
-        command.arg("--cancel");
+/// Runs `tj` inside the agent, as the hooks of the tab's own agent do, and returns its exit code and stderr.
+fn in_agent(sandbox: &Sandbox, arguments: &[&str]) -> (i32, String) {
+    let commands = sandbox.root.join("commands");
+    let number = log(sandbox, "commands").lines().count();
+    let mut line = serde_json::to_string(arguments).unwrap();
+    line.push('\n');
+    std::fs::OpenOptions::new().create(true).append(true).open(&commands).unwrap().write_all(line.as_bytes()).unwrap();
+    let prefix = format!("ran {number} ");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Some(ran) =
+            log(sandbox, "dummy.log").lines().find_map(|line| line.strip_prefix(&prefix).map(str::to_owned))
+        {
+            let (code, stderr) = ran.split_once(' ').unwrap_or((&ran, ""));
+            return (code.parse().unwrap(), stderr.to_owned());
+        }
+        assert!(Instant::now() < deadline, "the agent never ran tj {arguments:?}");
+        std::thread::sleep(Duration::from_millis(100));
     }
-    assert!(command.output().unwrap().status.success());
+}
+
+fn done(sandbox: &Sandbox, cancel: bool) {
+    let arguments: &[&str] = if cancel { &["done", "--cancel"] } else { &["done"] };
+    let (code, stderr) = in_agent(sandbox, arguments);
+    assert_eq!(code, 0, "tj done: {stderr}");
 }
 
 fn refused(sandbox: &Sandbox, child: &mut Child, launch: &str) {
-    done(sandbox, launch, false);
+    done(sandbox, false);
     let mark = sandbox.root.join("cache").join("run").join(launch).join("done");
     let deadline = Instant::now() + Duration::from_secs(30);
     while mark.exists() {
@@ -244,19 +266,19 @@ fn wait_for_polls(sandbox: &Sandbox, file: &str, prefix: &str, count: usize) {
     }
 }
 
-fn request_restart(sandbox: &Sandbox, launch: &str, reason: &str) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_tj"))
-        .args(["restart", "--reason", reason])
-        .env("TJ_RUN_LAUNCH_ID", launch)
-        .env("TJ_CACHE_DIR", sandbox.root.join("cache"))
-        .output()
-        .unwrap()
+/// Writes Claude's own status record for the running agent, as Claude Code does between turns.
+fn set_status(sandbox: &Sandbox, status: &str) {
+    let pid = log(sandbox, "dummy.log").lines().rev().find_map(|line| line.strip_prefix("pid ")).unwrap().to_owned();
+    let sessions = sandbox.root.join("claude").join("sessions");
+    std::fs::create_dir_all(&sessions).unwrap();
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis();
+    let record = serde_json::json!({"pid": pid.parse::<u32>().unwrap(), "status": status, "statusUpdatedAt": now});
+    std::fs::write(sessions.join(format!("{pid}.json")), record.to_string()).unwrap();
 }
 
-fn mark_idle(sandbox: &Sandbox, launch: &str, background: &str) {
+fn publish(sandbox: &Sandbox, host: &str, revision: &str) {
     let output = Command::new(env!("CARGO_BIN_EXE_tj"))
-        .args(["idle", "--background", background])
-        .env("TJ_RUN_LAUNCH_ID", launch)
+        .args(["update", "--host", host, "--revision", revision])
         .env("TJ_CACHE_DIR", sandbox.root.join("cache"))
         .output()
         .unwrap();
@@ -374,7 +396,7 @@ fn a_merge_mid_session_asks_the_agent_once_and_only_its_done_closes_out() {
     let asked = log(&sandbox, "stubs/codex.log");
     assert_eq!(asked.lines().count(), 1, "{asked}");
     assert!(asked.contains("tj done"), "{asked}");
-    done(&sandbox, "merged-during", false);
+    done(&sandbox, false);
     let output = finish(child, Duration::from_secs(60));
     assert_closed_out(&sandbox, &output, "merged-during");
 }
@@ -405,7 +427,7 @@ fn closes_out_the_worktree_bound_after_launch() {
             }
         });
         set_reply(&sandbox, "agent-store-show.json", &binding.to_string());
-        done(&sandbox, &launch, false);
+        done(&sandbox, false);
         let output = finish(child, Duration::from_secs(60));
         assert_closed_out(&sandbox, &output, &launch);
         let store = log(&sandbox, "stubs/agent-store.log");
@@ -441,7 +463,7 @@ fn an_unrelated_worktree_binding_does_not_stop_or_clean_the_agent() {
         binding["data"]["session"]["host"] = serde_json::json!("claude");
         binding["data"]["session"]["worktree"] = serde_json::json!(sandbox.worktree);
         set_reply(&sandbox, "agent-store-show.json", &binding.to_string());
-        done(&sandbox, launch, false);
+        done(&sandbox, false);
         let output = finish(child, Duration::from_secs(60));
         assert_closed_out(&sandbox, &output, launch);
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -502,7 +524,7 @@ fn an_orphaned_launch_cleans_its_bound_worktree_when_the_launch_directory_is_gon
 fn closes_out_after_done_and_idle() {
     let sandbox = sandbox();
     let child = start(&sandbox, "idle", "claude", "signal", "10");
-    done(&sandbox, "idle", false);
+    done(&sandbox, false);
     let output = finish(child, Duration::from_secs(60));
     assert_closed_out(&sandbox, &output, "idle");
     assert!(log(&sandbox, "dummy.log").contains("graceful"), "the agent was not stopped gracefully");
@@ -513,8 +535,8 @@ fn closes_out_after_done_and_idle() {
 fn new_input_cancels_done_and_mark_closing_still_closes() {
     let sandbox = sandbox();
     let mut child = start(&sandbox, "cancel", "claude", "signal", "10");
-    done(&sandbox, "cancel", false);
-    done(&sandbox, "cancel", true);
+    done(&sandbox, false);
+    done(&sandbox, true);
     still_running(&mut child, Duration::from_secs(5));
     set_reply(&sandbox, "agent-store-show.json", CLOSING);
     let output = finish(child, Duration::from_secs(60));
@@ -534,7 +556,7 @@ fn unmerged_commits_keep_the_session_open_until_delivered() {
     git(&sandbox.primary, &["merge", "--squash", "Feature/1"]);
     git(&sandbox.primary, &["commit", "-q", "-m", "squash work"]);
     git(&sandbox.primary, &["push", "-q", "origin", "main"]);
-    done(&sandbox, "unmerged", false);
+    done(&sandbox, false);
     let output = finish(child, Duration::from_secs(60));
     assert!(String::from_utf8_lossy(&output.stderr).contains("worktree has unmerged commits"));
     assert_eq!(output.status.code(), Some(0));
@@ -545,7 +567,7 @@ fn unmerged_commits_keep_the_session_open_until_delivered() {
 fn an_agent_ignoring_the_stop_is_killed_with_its_tree() {
     let sandbox = sandbox();
     let child = start(&sandbox, "stubborn", "claude", "stubborn", "2");
-    done(&sandbox, "stubborn", false);
+    done(&sandbox, false);
     let output = finish(child, Duration::from_secs(60));
     assert_closed_out(&sandbox, &output, "stubborn");
     assert!(!log(&sandbox, "dummy.log").contains("graceful"));
@@ -645,7 +667,7 @@ fn codex_is_stopped_with_a_ctrl_c_keypress() {
     let sandbox = sandbox();
     let child = start(&sandbox, "codex", "codex", "keys", "10");
     wait_for_log(&sandbox, "raw");
-    done(&sandbox, "codex", false);
+    done(&sandbox, false);
     let output = finish(child, Duration::from_secs(60));
     assert_closed_out(&sandbox, &output, "codex");
     assert!(log(&sandbox, "dummy.log").contains("graceful"), "the keypress did not reach the agent");
@@ -690,7 +712,7 @@ fn tmux_pane_closes_after_codex_is_stopped_with_a_keypress() {
     }
     assert!(tmux.arg(script).status().unwrap().success());
     wait_for_log(&sandbox, "raw");
-    done(&sandbox, "pane", false);
+    done(&sandbox, false);
     let deadline = Instant::now() + Duration::from_secs(60);
     while Command::new("tmux").arg("-S").arg(&socket).args(["has-session", "-t", "run"]).status().unwrap().success() {
         if Instant::now() > deadline {
@@ -743,128 +765,187 @@ fn with_prompt(sandbox: &Sandbox, launch: &str, host: &str, mode: &str) -> Vec<S
     arguments
 }
 
-fn not_restarted(sandbox: &Sandbox, child: &mut Child) {
-    still_running(child, Duration::from_secs(5));
-    let agent = log(sandbox, "dummy.log");
-    assert!(!agent.contains("sess-1") && !agent.contains("graceful"), "restarted: {agent}");
+fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !done() {
+        assert!(Instant::now() < deadline, "{what}");
+        std::thread::sleep(Duration::from_millis(100));
+    }
 }
 
-fn restarts_in_place_once_idle(host: &str) {
+fn fake_codex(sandbox: &Sandbox) -> PathBuf {
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake_codex.py");
+    #[cfg(windows)]
+    std::fs::write(sandbox.stubs.join("codex.cmd"), format!("@echo off\r\npython \"{}\" %*\r\n", script.display()))
+        .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let path = sandbox.stubs.join("codex");
+        std::fs::write(&path, format!("#!/bin/sh\nexec python3 \"{}\" \"$@\"\n", script.display())).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    sandbox.root.join("codex.log")
+}
+
+#[test]
+fn only_the_tabs_own_agent_can_mark_it_done() {
     let sandbox = sandbox();
-    let launch = format!("again-{host}");
-    let keys = cfg!(windows) && host == "codex";
-    let mode = if keys { "keys" } else { "signal" };
+    let mut child = start(&sandbox, "owned", "claude", "signal", "10");
+    wait_for_log(&sandbox, "wrapper ");
+    let wrapper =
+        log(&sandbox, "dummy.log").lines().find_map(|line| line.strip_prefix("wrapper ").map(str::to_owned)).unwrap();
+    let (pid, started_at) = wrapper.split_once(' ').unwrap();
+    let foreign = |arguments: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_tj"))
+            .args(arguments)
+            .envs([("TJ_RUN_LAUNCH_ID", "owned"), ("TJ_RUN_PID", pid), ("TJ_RUN_STARTED_AT", started_at)])
+            .env("TJ_CACHE_DIR", sandbox.root.join("cache"))
+            .output()
+            .unwrap()
+    };
+    let mark = sandbox.root.join("cache").join("run").join("owned").join("done");
+    let refused = foreign(&["done"]);
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("inherited another tab"));
+    assert!(!mark.exists(), "a process outside the tab marked it done");
+    assert!(foreign(&["launch"]).stdout.is_empty());
+    assert_eq!(in_agent(&sandbox, &["launch"]).0, 0);
+    done(&sandbox, false);
+    assert!(foreign(&["done", "--cancel"]).status.success());
+    assert!(mark.exists(), "a process outside the tab cancelled its done mark");
+    done(&sandbox, true);
+    assert!(!mark.exists());
+    still_running(&mut child, Duration::from_secs(1));
+    set_reply(&sandbox, "agent-store-show.json", CLOSING);
+    let output = finish(child, Duration::from_secs(60));
+    assert_closed_out(&sandbox, &output, "owned");
+}
+
+#[cfg(windows)]
+#[test]
+fn each_claude_update_is_applied_to_an_idle_claude_in_place_once() {
+    let sandbox = sandbox();
     set_reply(&sandbox, "agent-store-show.json", BOUND);
-    let mut child = spawn(&sandbox, &with_prompt(&sandbox, &launch, host, mode), &sandbox.root);
+    let child = spawn(&sandbox, &with_prompt(&sandbox, "plugins", "claude", "keys"), &sandbox.root);
+    wait_for_log(&sandbox, "raw");
+    set_status(&sandbox, "busy");
+    publish(&sandbox, "claude", "plugins b");
+    std::thread::sleep(Duration::from_secs(4));
+    assert!(!log(&sandbox, "dummy.log").contains("typed"), "typed into a turn that never ended");
+    set_status(&sandbox, "idle");
+    wait_for_log(&sandbox, "typed /reload-plugins");
+    publish(&sandbox, "codex", "plugins c");
+    std::thread::sleep(Duration::from_secs(4));
+    assert_eq!(log(&sandbox, "dummy.log").matches("typed /reload-plugins").count(), 1, "a Codex update reached Claude");
+    publish(&sandbox, "claude", "plugins b");
+    wait_until("a second Claude update of the same plugins was skipped", || {
+        log(&sandbox, "dummy.log").matches("typed /reload-plugins").count() == 2
+    });
+    std::thread::sleep(Duration::from_secs(4));
+    let agent = log(&sandbox, "dummy.log");
+    assert_eq!(agent.matches("typed /reload-plugins").count(), 2, "{agent}");
+    assert_eq!(agent.matches("agent plugins Test tab").count(), 1, "the agent restarted: {agent}");
+    set_reply(&sandbox, "agent-store-show.json", CLOSING);
+    let output = finish(child, Duration::from_secs(60));
+    assert_closed_out(&sandbox, &output, "plugins");
+}
+
+#[test]
+fn a_codex_update_is_applied_through_its_app_server() {
+    let sandbox = sandbox();
+    let codex = fake_codex(&sandbox);
+    set_reply(&sandbox, "agent-store-show.json", BOUND);
+    let keys = cfg!(windows);
+    let arguments = with_prompt(&sandbox, "codex-reload", "codex", if keys { "keys" } else { "signal" });
+    let mut command = Command::new(env!("CARGO_BIN_EXE_tj"));
+    command
+        .args(&arguments)
+        .current_dir(&sandbox.root)
+        .envs(environment(&sandbox))
+        .env("FAKE_CODEX_LOG", &codex)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x0800_0000);
+    }
+    let child = command.spawn().unwrap();
     wait_for_log(&sandbox, if keys { "raw" } else { "agent " });
-    assert!(request_restart(&sandbox, &launch, "plugins b").status.success());
-    mark_idle(&sandbox, &launch, "0");
-    let resumed = if host == "claude" { "args --model m --resume sess-1" } else { "args --model m resume sess-1" };
-    wait_for_log(&sandbox, resumed);
+    publish(&sandbox, "codex", "plugins b");
+    wait_until("the Codex app-server was never asked to take the update", || {
+        std::fs::read_to_string(&codex).unwrap_or_default().contains(r#""reloadUserConfig": true"#)
+    });
+    let agent = log(&sandbox, "dummy.log");
+    assert_eq!(agent.matches("agent codex-reload Test tab").count(), 1, "the agent restarted: {agent}");
+    set_reply(&sandbox, "agent-store-show.json", CLOSING);
+    let output = finish(child, Duration::from_secs(60));
+    assert_closed_out(&sandbox, &output, "codex-reload");
+}
+
+#[test]
+fn a_new_tj_binary_resumes_the_same_conversation_in_the_same_tab() {
+    let sandbox = sandbox();
+    let bin = sandbox.root.join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    let name = |stem: &str| format!("{stem}{}", std::env::consts::EXE_SUFFIX);
+    let install = |extra: &[u8]| {
+        let target = bin.join(name("tj"));
+        if target.exists() {
+            std::fs::rename(&target, bin.join(format!("{}.old", name("tj")))).unwrap();
+        }
+        let mut binary = std::fs::read(env!("CARGO_BIN_EXE_tj")).unwrap();
+        binary.extend_from_slice(extra);
+        std::fs::write(&target, binary).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    };
+    install(b"");
+    #[cfg(windows)]
+    std::fs::copy(env!("CARGO_BIN_EXE_tj_hook"), bin.join(name("tj_hook"))).unwrap();
+    set_reply(&sandbox, "agent-store-show.json", BOUND);
+    let mut command = Command::new(bin.join(name("tj")));
+    command
+        .args(with_prompt(&sandbox, "upgrade", "claude", "signal"))
+        .current_dir(&sandbox.root)
+        .envs(environment(&sandbox))
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x0800_0000);
+    }
+    let mut child = command.spawn().unwrap();
+    wait_for_log(&sandbox, "pid ");
+    set_status(&sandbox, "busy");
+    install(b"\0");
+    still_running(&mut child, Duration::from_secs(6));
+    assert!(!log(&sandbox, "dummy.log").contains("graceful"), "restarted mid-turn");
+    set_status(&sandbox, "idle");
+    wait_for_log(&sandbox, "args --model m --resume sess-1");
     still_running(&mut child, Duration::from_secs(1));
     let agent = log(&sandbox, "dummy.log");
-    if host == "claude" || keys {
-        assert!(agent.contains("graceful"), "the agent was not stopped gracefully: {agent}");
-    }
-    assert_eq!(agent.matches(&format!("agent {launch} Test tab")).count(), 2, "{agent}");
-    assert!(agent.lines().any(|line| line == "args --model m the prompt"), "{agent}");
-    assert!(agent.lines().any(|line| line == resumed), "{agent}");
+    assert!(agent.contains("graceful"), "the agent was not stopped gracefully: {agent}");
+    assert_eq!(agent.matches("agent upgrade Test tab").count(), 2, "{agent}");
     let store = log(&sandbox, "stubs/agent-store.log");
-    assert_eq!(store.matches(&format!("launch --launch-id {launch} ")).count(), 1, "{store}");
-    assert!(!store.contains(&format!("end --launch-id {launch}")), "{store}");
-    let repeated = request_restart(&sandbox, &launch, "plugins b");
-    assert!(!repeated.status.success());
-    assert!(String::from_utf8_lossy(&repeated.stderr).contains("already restarted"));
-    if keys {
-        let deadline = Instant::now() + Duration::from_secs(30);
-        while log(&sandbox, "dummy.log").matches("raw").count() < 2 {
-            assert!(Instant::now() < deadline, "the resumed agent never read keys");
-            std::thread::sleep(Duration::from_millis(100));
-        }
-    }
+    assert_eq!(store.matches("launch --launch-id upgrade ").count(), 1, "{store}");
+    assert!(!store.contains("end --launch-id upgrade"), "{store}");
     set_reply(&sandbox, "agent-store-show.json", CLOSING);
     let output = finish(child, Duration::from_secs(60));
-    assert_closed_out(&sandbox, &output, &launch);
+    assert_closed_out(&sandbox, &output, "upgrade");
 }
 
 #[test]
-fn a_requested_restart_resumes_an_idle_claude_in_the_same_launch() {
-    restarts_in_place_once_idle("claude");
-}
-
-#[test]
-fn a_requested_restart_resumes_an_idle_codex_in_the_same_launch() {
-    restarts_in_place_once_idle("codex");
-}
-
-#[test]
-fn a_restart_waits_for_an_idle_mark_with_no_background_work() {
-    let sandbox = sandbox();
-    set_reply(&sandbox, "agent-store-show.json", BOUND);
-    let mut child = spawn(&sandbox, &with_prompt(&sandbox, "busy", "claude", "signal"), &sandbox.root);
-    wait_for_log(&sandbox, "agent ");
-    assert!(request_restart(&sandbox, "busy", "plugins b").status.success());
-    not_restarted(&sandbox, &mut child);
-    mark_idle(&sandbox, "busy", "unknown");
-    not_restarted(&sandbox, &mut child);
-    mark_idle(&sandbox, "busy", "2");
-    not_restarted(&sandbox, &mut child);
-    mark_idle(&sandbox, "busy", "0");
-    wait_for_log(&sandbox, "--resume sess-1");
-    set_reply(&sandbox, "agent-store-show.json", CLOSING);
-    let output = finish(child, Duration::from_secs(60));
-    assert_closed_out(&sandbox, &output, "busy");
-}
-
-#[test]
-fn a_new_prompt_clears_the_idle_mark_and_holds_the_restart() {
-    let sandbox = sandbox();
-    set_reply(&sandbox, "agent-store-show.json", BOUND);
-    let mut child = spawn(&sandbox, &with_prompt(&sandbox, "typed", "claude", "signal"), &sandbox.root);
-    wait_for_log(&sandbox, "agent ");
-    assert!(request_restart(&sandbox, "typed", "plugins b").status.success());
-    mark_idle(&sandbox, "typed", "0");
-    done(&sandbox, "typed", true);
-    assert!(!sandbox.root.join("cache").join("run").join("typed").join("idle").exists());
-    not_restarted(&sandbox, &mut child);
-    mark_idle(&sandbox, "typed", "0");
-    wait_for_log(&sandbox, "--resume sess-1");
-    set_reply(&sandbox, "agent-store-show.json", CLOSING);
-    let output = finish(child, Duration::from_secs(60));
-    assert_closed_out(&sandbox, &output, "typed");
-}
-
-#[test]
-fn a_restart_without_a_bound_session_keeps_the_agent_and_says_so_once() {
-    let sandbox = sandbox();
-    set_reply(&sandbox, "agent-store-show.json", r#"{"ok":true,"data":{"launch":{"state":"active"},"session":null}}"#);
-    let mut child = spawn(&sandbox, &with_prompt(&sandbox, "lonely", "claude", "signal"), &sandbox.root);
-    wait_for_log(&sandbox, "agent ");
-    for _ in 0..2 {
-        assert!(request_restart(&sandbox, "lonely", "plugins b").status.success());
-        mark_idle(&sandbox, "lonely", "0");
-        still_running(&mut child, Duration::from_secs(5));
-    }
-    set_reply(&sandbox, "agent-store-show.json", CLOSING);
-    std::fs::remove_file(sandbox.stubs.join("agent-store-show.json")).unwrap();
-    bind(&sandbox, "lonely", "claude", true);
-    let output = finish(child, Duration::from_secs(60));
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert_eq!(stderr.matches("not restarting: no claude session is bound to launch lonely").count(), 1, "{stderr}");
-    assert_eq!(log(&sandbox, "dummy.log").matches("agent lonely").count(), 1);
-    assert_closed_out(&sandbox, &output, "lonely");
-}
-
-#[test]
-fn restart_outside_tj_run_fails_but_idle_is_a_no_op() {
-    let tj = |arguments: &[&str]| {
-        Command::new(env!("CARGO_BIN_EXE_tj")).args(arguments).env_remove("TJ_RUN_LAUNCH_ID").output().unwrap()
-    };
-    let output = tj(&["restart"]);
-    assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("only works inside a tj run session"));
-    assert!(tj(&["idle", "--background", "0"]).status.success());
-    assert!(!tj(&["idle", "--background", "some"]).status.success());
+fn launch_prints_nothing_outside_tj_run() {
+    let output = Command::new(env!("CARGO_BIN_EXE_tj")).arg("launch").env_remove("TJ_RUN_LAUNCH_ID").output().unwrap();
+    assert!(output.status.success() && output.stdout.is_empty());
 }
 
 #[test]
@@ -912,7 +993,7 @@ fn closes_out_all_owned_worktrees_across_repositories() {
         claim(&sandbox, &launch, host, &[sandbox.worktree.clone(), extra.clone(), other.worktree.clone()]);
         let child = spawn(&sandbox, &arguments, &sandbox.root);
         wait_for_log(&sandbox, if keys { "raw" } else { "agent " });
-        done(&sandbox, &launch, false);
+        done(&sandbox, false);
         let output = finish(child, Duration::from_secs(120));
         assert_closed_out(&sandbox, &output, &launch);
         assert!(!extra.exists());
@@ -937,7 +1018,7 @@ fn one_dirty_owned_worktree_keeps_every_worktree_and_the_agent_open() {
     assert!(!log(&sandbox, "stubs/agent-store.log").contains("release-worktree"));
     assert!(!log(&sandbox, "stubs/tj-item.log").contains("--state Done"));
     std::fs::remove_file(extra.join("unfinished.txt")).unwrap();
-    done(&sandbox, "dirty-collection", false);
+    done(&sandbox, false);
     let output = finish(child, Duration::from_secs(120));
     assert_closed_out(&sandbox, &output, "dirty-collection");
     assert!(!extra.exists());
@@ -963,7 +1044,7 @@ fn another_live_session_blocks_closeout_even_when_its_metadata_says_ended() {
     refused(&sandbox, &mut child, "live-owner");
     assert!(sandbox.worktree.exists());
     set_store_list(&sandbox.stubs, "sessions", serde_json::json!([]));
-    done(&sandbox, "live-owner", false);
+    done(&sandbox, false);
     let output = finish(child, Duration::from_secs(60));
     assert_closed_out(&sandbox, &output, "live-owner");
     assert!(String::from_utf8_lossy(&output.stderr).contains("another session may still be using"));
@@ -974,7 +1055,7 @@ fn release_failure_keeps_the_claim_and_never_marks_done() {
     let sandbox = sandbox();
     set_reply(&sandbox, "agent-store-release-worktree.json", r#"{"ok":false,"error":{"message":"storage failed"}}"#);
     let child = start(&sandbox, "failed-release", "claude", "signal", "2");
-    done(&sandbox, "failed-release", false);
+    done(&sandbox, false);
     let output = finish(child, Duration::from_secs(60));
     assert_eq!(output.status.code(), Some(1));
     assert!(!sandbox.worktree.exists());
@@ -1016,7 +1097,7 @@ fn tracker_and_launch_finalization_failures_can_be_retried_after_all_releases() 
         set_reply(&sandbox, failed, r#"{"ok":false,"error":{"message":"finalization failed"}}"#);
         let launch = format!("finalize-{stage}");
         let child = start(&sandbox, &launch, "claude", "signal", "2");
-        done(&sandbox, &launch, false);
+        done(&sandbox, false);
         let output = finish(child, Duration::from_secs(60));
         assert_eq!(output.status.code(), Some(1), "{}", String::from_utf8_lossy(&output.stderr));
         assert!(!sandbox.worktree.exists());
@@ -1049,7 +1130,7 @@ fn changes_written_during_shutdown_are_kept_and_never_marked_done() {
     )
     .unwrap();
     let child = start(&sandbox, "shutdown-change", "claude", "signal", "2");
-    done(&sandbox, "shutdown-change", false);
+    done(&sandbox, false);
     let output = finish(child, Duration::from_secs(60));
     assert_eq!(output.status.code(), Some(1));
     assert_eq!(std::fs::read_to_string(sandbox.worktree.join("unfinished.txt")).unwrap(), "unfinished");
@@ -1065,7 +1146,7 @@ fn an_unclaimed_linked_worktree_requires_recovery_before_closing() {
     refused(&sandbox, &mut child, "unclaimed");
     assert!(sandbox.worktree.exists());
     claim(&sandbox, "unclaimed", "claude", std::slice::from_ref(&sandbox.worktree));
-    done(&sandbox, "unclaimed", false);
+    done(&sandbox, false);
     let output = finish(child, Duration::from_secs(60));
     assert_closed_out(&sandbox, &output, "unclaimed");
     assert!(String::from_utf8_lossy(&output.stderr).contains("no recorded ownership; recovery required"));
