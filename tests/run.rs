@@ -251,15 +251,17 @@ fn closes_out_when_every_pr_has_merged() {
 
 #[test]
 fn closes_out_the_worktree_bound_after_launch() {
-    for (host, mode) in [("claude", "signal"), ("codex", "keys")] {
+    for host in ["claude", "codex"] {
         let sandbox = sandbox();
         git(&sandbox.primary, &["worktree", "remove", sandbox.worktree.to_str().unwrap()]);
         let launch = format!("later-worktree-{host}");
+        let keys = cfg!(windows) && host == "codex";
+        let mode = if keys { "keys" } else { "signal" };
         let mut arguments = run_arguments(&sandbox, &launch, host, mode, "2");
         let cwd = arguments.iter().position(|argument| argument == "--cwd").unwrap() + 1;
         arguments[cwd] = sandbox.primary.to_string_lossy().into_owned();
         let child = spawn(&sandbox, &arguments, &sandbox.root);
-        wait_for_log(&sandbox, "agent ");
+        wait_for_log(&sandbox, if keys { "raw" } else { "agent " });
         git(&sandbox.primary, &["worktree", "add", "-q", sandbox.worktree.to_str().unwrap(), "Feature/1"]);
         let binding = serde_json::json!({
             "ok": true,
