@@ -8,7 +8,9 @@ use std::process::Command;
 use std::ptr::{null, null_mut};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use windows_sys::Win32::Foundation::{FILETIME, GENERIC_READ, GENERIC_WRITE, INVALID_HANDLE_VALUE, WAIT_OBJECT_0};
+use windows_sys::Win32::Foundation::{
+    ERROR_INVALID_PARAMETER, FILETIME, GENERIC_READ, GENERIC_WRITE, INVALID_HANDLE_VALUE, WAIT_OBJECT_0,
+};
 use windows_sys::Win32::Storage::FileSystem::{CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING};
 use windows_sys::Win32::System::Console::{
     CTRL_BREAK_EVENT, CTRL_C_EVENT, GenerateConsoleCtrlEvent, INPUT_RECORD, KEY_EVENT, LEFT_CTRL_PRESSED,
@@ -250,25 +252,30 @@ pub fn prepare_wrapper() -> io::Result<()> {
     Ok(())
 }
 
-pub fn started_at(pid: u32) -> Option<SystemTime> {
+pub fn started_at(pid: u32) -> io::Result<Option<SystemTime>> {
     unsafe {
         let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
         if process.is_null() {
-            return None;
+            let error = io::Error::last_os_error();
+            return if error.raw_os_error() == Some(ERROR_INVALID_PARAMETER as i32) { Ok(None) } else { Err(error) };
         }
         let process = OwnedHandle::from_raw_handle(process);
         let mut code = 0;
-        if GetExitCodeProcess(process.as_raw_handle(), &mut code) == 0 || code != STILL_ACTIVE {
-            return None;
+        if GetExitCodeProcess(process.as_raw_handle(), &mut code) == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if code != STILL_ACTIVE {
+            return Ok(None);
         }
         let (mut created, mut exited, mut kernel, mut user): (FILETIME, FILETIME, FILETIME, FILETIME) =
             (zeroed(), zeroed(), zeroed(), zeroed());
         if GetProcessTimes(process.as_raw_handle(), &mut created, &mut exited, &mut kernel, &mut user) == 0 {
-            return None;
+            return Err(io::Error::last_os_error());
         }
         let ticks = (u64::from(created.dwHighDateTime) << 32 | u64::from(created.dwLowDateTime))
-            .checked_sub(116_444_736_000_000_000)?;
-        Some(UNIX_EPOCH + Duration::from_nanos(ticks * 100))
+            .checked_sub(116_444_736_000_000_000)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid process creation time"))?;
+        Ok(Some(UNIX_EPOCH + Duration::from_nanos(ticks * 100)))
     }
 }
 
