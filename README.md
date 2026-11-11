@@ -186,7 +186,7 @@ differ, so only those are split into `linux/` and `windows/`.
 ## `tj run`: the agent tab's root process
 
 ```text
-tj run [--host claude|codex] [--title T] [--cwd WORKTREE] [--launch-id U] [--item REF] [--parent HOST:ID] -- <agent argv>
+tj run [--host claude|codex] [--title T] [--cwd WORKTREE] [--launch-id U] [--item REF] [--parent HOST:ID] [--session codex:UUID] -- <agent argv>
 tj done              last step of work with no PR: close out after about 10 idle minutes
 tj done --cancel     new input arrived; withdraw that and the idle mark (a no-op outside tj run)
 tj idle --background N|unknown   the turn ended with N background tasks in flight (a no-op outside tj run)
@@ -203,6 +203,10 @@ Only the agent's command line is required, so a shell function can run a typed `
 the host defaults to the executable's name, the folder to the current one, the title to the repository or
 worktree folder's name (suffixed `-2`, `-3`… while an open launch holds it) and the launch id to a random one.
 The executable must be the native `claude` or `codex`, not an npm `.cmd` shim.
+
+`--session codex:UUID` binds a pre-created Codex thread before the native process starts. It requires an
+explicit `--host codex` and an absolute native command in the exact form
+`codex --cd WORKTREE resume UUID [PROMPT]`.
 
 Before each start or restart, `tj run` invokes Agent's `tj-prepare` with the host, working directory
 and host arguments. Agent reconciles the repository's selected plugins and its standards index before
