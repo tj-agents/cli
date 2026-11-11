@@ -101,6 +101,9 @@ The installers' `--bin-dir` defaults to `TJ_BIN_DIR`, otherwise
 to native `pending` to check revision drift too.
 The existing native `pending_native` checks runtime compatibility by invoking `tj_hook`; refresh stale
 checks should use `pending`. Agent's receipt watch registration is a separate integration change.
+Native install replaces the `tj`/`tj_hook` pair even while tabs run it: the old files move to
+`<bin-dir>/.tj-retired` (Windows can rename a running executable but not delete it) and each later install
+removes the ones no longer running. Running wrappers then hand over to the new `tj` when idle.
 
 ### Voice dictation in Claude and Codex
 

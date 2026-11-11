@@ -362,7 +362,7 @@ def test_uninstall_does_not_claim_unreceipted_binaries_are_absent(
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows executable sharing semantics")
-def test_running_windows_binary_defers_upgrade_without_changing_the_pair(
+def test_a_running_windows_binary_is_replaced_and_retired_once_it_exits(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     archive = tmp_path / "native.zip"
@@ -381,16 +381,20 @@ def test_running_windows_binary_defers_upgrade_without_changing_the_pair(
         stderr=subprocess.DEVNULL,
         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
     )
+    retired = directory / native_install.RETIRED
     try:
         assert child.poll() is None
-        with pytest.raises(native_install.NativeInstallError, match="in use"):
-            native_install.ensure_native(directory)
-        assert executable.read_bytes() == before
-        assert (directory / names[1]).read_bytes() == b"old-hook"
-        assert not (directory / native_install.RECEIPT).exists()
+        native_install.ensure_native(directory)
+        assert executable.read_bytes() == b"new-tj"
+        assert (directory / names[1]).read_bytes() == b"new-hook"
+        assert (directory / native_install.RECEIPT).is_file()
+        held = [entry for entry in retired.iterdir() if entry.read_bytes() == before]
+        assert len(held) == 1, "the running binary was not kept aside"
     finally:
         child.terminate()
         child.wait(timeout=10)
+    native_install._prune(retired)
+    assert not any(retired.iterdir())
 
 
 def test_failed_pair_replacement_restores_old_pair(
