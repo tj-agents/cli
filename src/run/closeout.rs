@@ -215,7 +215,7 @@ pub fn owned_preflight(launch: &Launch) -> Result<Plan, String> {
             }
         }
         other_writers(&owner)?;
-        let removals = owner
+        let mut removals = owner
             .paths
             .iter()
             .map(|path| {
@@ -230,6 +230,15 @@ pub fn owned_preflight(launch: &Launch) -> Result<Plan, String> {
                 Ok(removal.clone())
             })
             .collect::<Result<Vec<_>>>()?;
+        if let Some(saved) = saved {
+            for removal in saved.removals {
+                if !owner.paths.contains(&removal.worktree) {
+                    removed(&removal)?;
+                    removals.push(removal);
+                }
+            }
+        }
+        removals.sort_by(|left, right| left.worktree.cmp(&right.worktree));
         let repository = removals.first().map_or_else(|| repository(launch), |removal| Ok(removal.primary.clone()))?;
         Ok(Plan { owner, removals, repository })
     };
@@ -294,6 +303,10 @@ pub fn finish(launch: &Launch, plan: Plan) -> Result<()> {
     }
     journal::write(launch, &plan)?;
     for removal in &plan.removals {
+        if !plan.owner.paths.contains(&removal.worktree) {
+            removed(removal)?;
+            continue;
+        }
         if removal.worktree.try_exists()? {
             remove(removal)?;
         } else {
