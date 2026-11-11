@@ -187,7 +187,7 @@ differ, so only those are split into `linux/` and `windows/`.
 
 ```text
 tj run [--host claude|codex] [--title T] [--cwd WORKTREE] [--launch-id U] [--item REF] [--parent HOST:ID] -- <agent argv>
-tj done              last step of work with no PR: close out after about 10 idle minutes
+tj done              the session's last step: close out after about 10 idle minutes
 tj done --cancel     new input arrived; withdraw that and the idle mark (a no-op outside tj run)
 tj idle --background N|unknown   the turn ended with N background tasks in flight (a no-op outside tj run)
 tj restart [--reason R]  restart this tab's agent in place once it is idle, resuming the same conversation
@@ -222,12 +222,16 @@ With no bound session the agent keeps running and the wrapper says so once. A re
 exits with an error, leaves the tab open with the reason. `tj restart` fails outside `tj run`, and for a
 `--reason` this tab already restarted for, so a restart that did not help is not repeated.
 
-It closes out when any of these happens:
+It closes out only when one of these happens:
 
-- every PR for the item has merged, according to `tj item prs` (checked every two minutes). A PR that closed
-  without merging keeps the tab open, and the wrapper reports it;
-- `tj done` was run and no new input has cancelled it for about 10 minutes;
+- `tj done` was run and no prompt, or Claude tool use, has cancelled it for about 10 minutes;
 - `agent-store` marks the launch or its session `closing`, which is what `tj closeout REF` does.
+
+A merged PR never stops a session: an item can be merged before its session starts or while it still has
+work. The first time `tj item prs` (checked every two minutes) reports every PR for the item merged, the
+wrapper asks the agent once, through its Claude relay or Codex queue, to run `tj done` if nothing is left.
+An agent that is unsure carries on and the tab stays open. A refused check withdraws `tj done` and prints
+the reason; the agent runs it again once the reason is fixed.
 
 Before stopping anything, it checks every linked worktree recorded for the exact launch and native session, including roots created after launch and in other repositories. Each root must be registered, clean and integrated into its freshly fetched default branch; a merged item PR alone cannot authorize deletion. Worktrunk supplies the content checks for squash and rebase merges. Another session with live or unknown process ownership keeps the worktree open.
 
@@ -241,7 +245,7 @@ After stopping its own agent process tree, the wrapper repeats those checks and 
 5. exits 0, so Windows Terminal (`closeOnExit` default) or tmux closes the tab.
 
 Helpers run hidden through `tj_hook` on Windows, and in their own session on Linux, so they never touch the
-agent's console. If the agent exits by itself, the wrapper checks delivery once more and cleans up when a closeout trigger is ready. Otherwise it ends the launch and keeps the unfinished worktrees. It preserves the agent's exit code. `tj closeout` also inspects ended launches whose cleanup has not completed.
+agent's console. If the agent exits by itself, nothing is left running, so the wrapper also cleans up when every PR for the item has merged. Otherwise it ends the launch and keeps the unfinished worktrees. It preserves the agent's exit code. `tj closeout` also inspects ended launches whose cleanup has not completed.
 
 ## `tj message` and `tj subscribe`: messaging between sessions
 
