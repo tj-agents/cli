@@ -59,11 +59,28 @@ pub fn prepare_wrapper() -> io::Result<()> {
 }
 
 /// When a still-running process started, for telling a live wrapper from a reused pid.
-pub fn started_at(pid: u32) -> Option<SystemTime> {
+pub fn started_at(pid: u32) -> io::Result<Option<SystemTime>> {
     os::started_at(pid)
 }
 
 /// Keeps a helper off the agent's console: through `tj_hook` on Windows, in its own session on Linux.
 pub fn hidden(program: &str, hook: &Path) -> Command {
     os::hidden(program, hook)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::started_at;
+
+    #[test]
+    fn current_process_identity_is_stable() {
+        let pid = std::process::id();
+        let first = started_at(pid).unwrap().unwrap();
+        assert_eq!(started_at(pid).unwrap(), Some(first));
+    }
+
+    #[test]
+    fn a_missing_process_is_distinct_from_an_inspection_error() {
+        assert_eq!(started_at(0).unwrap(), None);
+    }
 }

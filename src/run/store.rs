@@ -74,24 +74,64 @@ pub fn bound_session(launch_id: &str) -> Result<Option<String>> {
     Ok(data["session"]["native_id"].as_str().filter(|id| !id.is_empty()).map(str::to_owned))
 }
 
-pub fn worktree(launch: &Launch) -> Result<PathBuf> {
+#[derive(Debug, PartialEq, Eq)]
+pub struct Ownership {
+    pub session: String,
+    pub paths: Vec<PathBuf>,
+    pub location: Option<PathBuf>,
+}
+
+pub fn ownership(launch: &Launch) -> Result<Ownership> {
     let data = call(&["show", "--launch-id", &launch.id])?;
     let session = &data["session"];
-    let Some(worktree) = session["worktree"].as_str() else {
-        return Ok(launch.cwd.clone());
-    };
+    let native_id = session["native_id"].as_str().filter(|id| !id.trim().is_empty());
+    let handle = format!("{}:{}", launch.host.name(), native_id.unwrap_or_default());
     if data["launch"]["launch_id"].as_str() != Some(launch.id.as_str())
+        || data["launch"]["host"].as_str() != Some(launch.host.name())
+        || data["launch"]["session"].as_str() != Some(handle.as_str())
+        || session["session"].as_str() != Some(handle.as_str())
         || session["launch_id"].as_str() != Some(launch.id.as_str())
         || session["host"].as_str() != Some(launch.host.name())
-        || session["native_id"].as_str().is_none_or(str::is_empty)
+        || native_id.is_none()
     {
-        bail!("session worktree is not bound to {} launch {}", launch.host.name(), launch.id);
+        bail!("session is not bound to {} launch {}", launch.host.name(), launch.id);
     }
-    let worktree = PathBuf::from(worktree);
-    if !worktree.is_absolute() {
-        bail!("bound session worktree is not absolute: {}", worktree.display());
+    let data = call(&["worktrees", "--session", &handle, "--launch-id", &launch.id])?;
+    let rows = data["worktrees"].as_array().context("agent-store worktrees returned no list")?;
+    let mut paths = Vec::new();
+    for row in rows {
+        let path = PathBuf::from(row["path"].as_str().context("owned worktree has no path")?);
+        if !path.is_absolute() {
+            bail!("owned worktree is not absolute: {}", path.display());
+        }
+        if row["session"].as_str() != Some(handle.as_str())
+            || row["launch_id"].as_str() != Some(launch.id.as_str())
+            || paths.contains(&path)
+        {
+            bail!("worktree ownership does not match launch {}", launch.id);
+        }
+        paths.push(path);
     }
-    Ok(worktree)
+    paths.sort();
+    let location = session["worktree"].as_str().map(PathBuf::from);
+    if location.as_ref().is_some_and(|path| !path.is_absolute()) {
+        bail!("bound session worktree is not absolute");
+    }
+    Ok(Ownership { session: handle, paths, location })
+}
+
+pub fn release(launch: &Launch, owner: &Ownership, path: &std::path::Path) -> Result<()> {
+    let path = path.to_string_lossy();
+    let data = call(&["release-worktree", "--session", &owner.session, "--launch-id", &launch.id, "--path", &path])?;
+    if data["released"] != Value::Bool(true) {
+        bail!("worktree ownership was not released: {path}");
+    }
+    Ok(())
+}
+
+pub fn sessions() -> Result<Vec<Value>> {
+    let data = call(&["sessions"])?;
+    data["sessions"].as_array().cloned().context("agent-store sessions returned no list")
 }
 
 pub fn end(launch_id: &str, reason: &str) -> Result<()> {
@@ -105,18 +145,19 @@ pub fn mark_closing(item: &str) -> Result<()> {
 pub struct Row {
     pub launch: Launch,
     pub closing: bool,
+    pub ended: bool,
     pub wrapper_pid: u32,
     pub wrapper_started_at: String,
 }
 
-pub fn open_launches(item: Option<&str>) -> Result<Vec<Row>> {
+pub fn launches(item: Option<&str>) -> Result<Vec<Row>> {
     let mut arguments = vec!["launches"];
     if let Some(item) = item {
         arguments.extend(["--item", item]);
     }
     let data = call(&arguments)?;
     let rows = data["launches"].as_array().context("agent-store launches returned no list")?;
-    Ok(rows.iter().filter(|row| state(row) != Some("ended")).filter_map(row).collect())
+    Ok(rows.iter().filter(|row| row["end_reason"].as_str() != Some("closed")).filter_map(row).collect())
 }
 
 fn row(value: &Value) -> Option<Row> {
@@ -130,6 +171,7 @@ fn row(value: &Value) -> Option<Row> {
             item: text(&value["item"]["ref"]),
         },
         closing: state(value) == Some("closing"),
+        ended: state(value) == Some("ended"),
         wrapper_pid: u32::try_from(value["wrapper"]["pid"].as_u64()?).ok()?,
         wrapper_started_at: text(&value["wrapper"]["started_at"])?,
     })

@@ -35,6 +35,7 @@ fn stub(directory: &Path, name: &str, fallback: &str) {
         directory.join(format!("{name}.cmd")),
         format!(
             "@echo off\r\necho %*>>\"%~dp0{name}.log\"\r\n\
+             if exist \"%~dp0{name}-%1.failed\" exit /b 1\r\n\
              if exist \"%~dp0{name}-%1.json\" (type \"%~dp0{name}-%1.json\") else (echo {fallback})\r\n\
              if \"{name}\"==\"tj-prepare\" python \"%~dp0prepare.py\"\r\n"
         ),
@@ -48,6 +49,7 @@ fn stub(directory: &Path, name: &str, fallback: &str) {
             &path,
             format!(
                 "#!/bin/sh\nhere=\"$(dirname \"$0\")\"\necho \"$*\" >> \"$here/{name}.log\"\n\
+                 if [ -f \"$here/{name}-$1.failed\" ]; then exit 1; fi\n\
                  if [ -f \"$here/{name}-$1.json\" ]; then cat \"$here/{name}-$1.json\"; else echo '{fallback}'; fi\n\
                  if [ '{name}' = 'tj-prepare' ]; then exec python3 \"$here/prepare.py\"; fi\n"
             ),
@@ -72,7 +74,21 @@ fn sandbox() -> Sandbox {
     git(&primary, &["worktree", "add", "-q", "../repo.worktrees/Feature-1", "-b", "Feature/1"]);
     let stubs = root.join("stubs");
     std::fs::create_dir(&stubs).unwrap();
-    stub(&stubs, "agent-store", r#"{"ok":true,"data":{}}"#);
+    #[cfg(windows)]
+    std::fs::write(stubs.join("agent-store.cmd"), "@echo off\r\npython \"%~dp0run_store.py\" %*\r\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let path = stubs.join("agent-store");
+        std::fs::write(&path, "#!/bin/sh\nexec python3 \"$(dirname \"$0\")/run_store.py\" \"$@\"\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    std::fs::copy(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/run_store.py"),
+        stubs.join("run_store.py"),
+    )
+    .unwrap();
+    set_store_list(&stubs, "sessions", serde_json::json!([]));
     stub(&stubs, "tj-item", r#"{"prs":[],"all_merged":false}"#);
     stub(&stubs, "tj-prepare", "prepared");
     std::fs::copy(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/prepare.py"), stubs.join("prepare.py"))
@@ -112,6 +128,7 @@ fn fixture() -> PathBuf {
 }
 
 fn run_arguments(sandbox: &Sandbox, launch: &str, host: &str, mode: &str, grace: &str) -> Vec<String> {
+    bind(sandbox, launch, host, false);
     let fixture = fixture();
     [
         "run",
@@ -224,8 +241,75 @@ fn mark_idle(sandbox: &Sandbox, launch: &str, background: &str) {
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
 }
 
+fn set_store_list(stubs: &Path, command: &str, rows: serde_json::Value) {
+    std::fs::write(
+        stubs.join(format!("agent-store-{command}.json")),
+        serde_json::json!({"ok": true, "data": {command: rows}}).to_string(),
+    )
+    .unwrap();
+}
+
+fn bind(sandbox: &Sandbox, launch: &str, host: &str, closing: bool) {
+    let show = sandbox.stubs.join("agent-store-show.json");
+    let mut value = serde_json::json!({
+        "ok": true, "data": {
+            "launch": {"launch_id": launch, "host": host, "session": format!("{host}:sess-1"), "state": "active"},
+            "session": {"session": format!("{host}:sess-1"), "native_id": "sess-1", "host": host,
+                "launch_id": launch, "worktree": sandbox.worktree, "state": "active"}
+        }
+    });
+    if show.exists() {
+        let old: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&show).unwrap()).unwrap();
+        for key in ["launch", "session"] {
+            if let Some(fields) = old["data"][key].as_object() {
+                value["data"][key].as_object_mut().unwrap().extend(fields.clone());
+            } else if key == "session" {
+                value["data"][key] = serde_json::Value::Null;
+            }
+        }
+    }
+    if closing {
+        value["data"]["launch"]["state"] = serde_json::json!("closing");
+    }
+    std::fs::write(&show, value.to_string()).unwrap();
+    if !sandbox.stubs.join("agent-store-worktrees.json").exists() {
+        if sandbox.worktree.exists() {
+            claim(sandbox, launch, host, std::slice::from_ref(&sandbox.worktree));
+        } else {
+            set_store_list(&sandbox.stubs, "worktrees", serde_json::json!([]));
+        }
+    }
+}
+
+fn claim(sandbox: &Sandbox, launch: &str, host: &str, paths: &[PathBuf]) {
+    let rows: Vec<_> = paths
+        .iter()
+        .map(|path| {
+            serde_json::json!({
+                "path": path.canonicalize().unwrap(), "session": format!("{host}:sess-1"), "launch_id": launch,
+                "claimed_at": "2026-11-11T00:00:00Z"
+            })
+        })
+        .collect();
+    set_store_list(&sandbox.stubs, "worktrees", serde_json::json!(rows));
+}
+
 fn set_reply(sandbox: &Sandbox, file: &str, json: &str) {
-    std::fs::write(sandbox.stubs.join(file), json).unwrap();
+    let path = sandbox.stubs.join(file);
+    let mut value: serde_json::Value = serde_json::from_str(json).unwrap();
+    if file == "agent-store-show.json" && path.exists() {
+        let old: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        for key in ["launch", "session"] {
+            if let Some(fields) = value["data"][key].as_object_mut() {
+                if let Some(previous) = old["data"][key].as_object() {
+                    for (name, field) in previous {
+                        fields.entry(name).or_insert_with(|| field.clone());
+                    }
+                }
+            }
+        }
+    }
+    std::fs::write(path, value.to_string()).unwrap();
 }
 
 fn assert_closed_out(sandbox: &Sandbox, output: &Output, launch: &str) {
@@ -263,6 +347,7 @@ fn closes_out_the_worktree_bound_after_launch() {
         let child = spawn(&sandbox, &arguments, &sandbox.root);
         wait_for_log(&sandbox, if keys { "raw" } else { "agent " });
         git(&sandbox.primary, &["worktree", "add", "-q", sandbox.worktree.to_str().unwrap(), "Feature/1"]);
+        claim(&sandbox, &launch, host, std::slice::from_ref(&sandbox.worktree));
         let binding = serde_json::json!({
             "ok": true,
             "data": {
@@ -304,7 +389,13 @@ fn an_unrelated_worktree_binding_does_not_stop_or_clean_the_agent() {
         set_reply(&sandbox, "agent-store-show.json", &binding.to_string());
         set_reply(&sandbox, "tj-item-prs.json", r#"{"prs":[{"url":"u","state":"merged"}],"all_merged":true}"#);
         let mut child = start(&sandbox, launch, "claude", "signal", "2");
-        still_running(&mut child, Duration::from_secs(2));
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while log(&sandbox, "stubs/agent-store.log").lines().filter(|line| line.starts_with("show ")).count() < 3 {
+            assert!(Instant::now() < deadline, "ownership preflight did not run");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        still_running(&mut child, Duration::from_millis(100));
+        assert!(!log(&sandbox, "dummy.log").contains("graceful"));
         assert!(sandbox.worktree.exists());
         assert!(!log(&sandbox, "stubs/tj-item.log").contains("--state Done"));
         binding["data"]["session"]["launch_id"] = serde_json::json!(launch);
@@ -320,12 +411,13 @@ fn an_unrelated_worktree_binding_does_not_stop_or_clean_the_agent() {
 
 #[test]
 fn an_orphaned_launch_cleans_its_bound_worktree_when_the_launch_directory_is_gone() {
-    for host in ["claude", "codex"] {
+    for (host, state) in [("claude", "closing"), ("codex", "closing"), ("claude", "ended"), ("codex", "ended")] {
         let sandbox = sandbox();
         let launch = format!("orphan-{host}");
         let row = serde_json::json!({
             "launch_id": launch, "host": host, "title": "Orphan",
-            "worktree": sandbox.root.join("gone"), "state": "closing",
+            "worktree": sandbox.root.join("gone"), "state": state, "end_reason": "exited",
+            "item": {"ref": ITEM},
             "wrapper": {"pid": 0, "started_at": "2026-01-01T00:00:00Z"}
         });
         set_reply(
@@ -351,6 +443,8 @@ fn an_orphaned_launch_cleans_its_bound_worktree_when_the_launch_directory_is_gon
             })
             .to_string(),
         );
+        bind(&sandbox, &launch, host, true);
+        set_reply(&sandbox, "tj-item-prs.json", r#"{"prs":[{"url":"u","state":"merged"}],"all_merged":true}"#);
         let output = Command::new(env!("CARGO_BIN_EXE_tj"))
             .arg("closeout")
             .envs(environment(&sandbox))
@@ -380,7 +474,7 @@ fn new_input_cancels_done_and_mark_closing_still_closes() {
     done(&sandbox, "cancel", false);
     done(&sandbox, "cancel", true);
     still_running(&mut child, Duration::from_secs(5));
-    set_reply(&sandbox, "agent-store-show.json", r#"{"ok":true,"data":{"launch":{"state":"closing"},"session":null}}"#);
+    set_reply(&sandbox, "agent-store-show.json", CLOSING);
     let output = finish(child, Duration::from_secs(60));
     assert_closed_out(&sandbox, &output, "cancel");
 }
@@ -392,9 +486,20 @@ fn unmerged_commits_keep_the_session_open_until_delivered() {
     git(&sandbox.worktree, &["add", "."]);
     git(&sandbox.worktree, &["commit", "-q", "-m", "work"]);
     let mut child = start(&sandbox, "unmerged", "claude", "signal", "10");
+    set_reply(&sandbox, "tj-item-prs.json", r#"{"prs":[{"state":"merged"}],"all_merged":true}"#);
     done(&sandbox, "unmerged", false);
     still_running(&mut child, Duration::from_secs(5));
     assert!(sandbox.worktree.exists());
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while log(&sandbox, "stubs/agent-store.log").matches("worktrees ").count() < 2 {
+        assert!(Instant::now() < deadline, "closeout did not complete its first ownership preflight");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(sandbox.worktree.exists());
+    assert!(!log(&sandbox, "stubs/tj-item.log").contains("--state Done"));
+    git(&sandbox.primary, &["merge", "--squash", "Feature/1"]);
+    git(&sandbox.primary, &["commit", "-q", "-m", "squash work"]);
+    git(&sandbox.primary, &["push", "-q", "origin", "main"]);
     set_reply(&sandbox, "tj-item-prs.json", r#"{"prs":[{"url":"u","state":"merged"}],"all_merged":true}"#);
     let output = finish(child, Duration::from_secs(60));
     assert!(String::from_utf8_lossy(&output.stderr).contains("worktree has unmerged commits"));
@@ -477,6 +582,27 @@ fn an_agent_that_exits_ends_the_launch_and_keeps_the_worktree() {
     assert_eq!(output.status.code(), Some(3));
     assert!(sandbox.worktree.exists());
     assert!(log(&sandbox, "stubs/agent-store.log").contains("end --launch-id exit --reason exited"));
+}
+
+#[test]
+fn an_agent_that_exits_after_delivery_cleans_its_owned_worktrees() {
+    for host in ["claude", "codex"] {
+        let sandbox = sandbox();
+        set_reply(&sandbox, "tj-item-prs.json", r#"{"prs":[{"url":"u","state":"merged"}],"all_merged":true}"#);
+        let launch = format!("delivered-exit-{host}");
+        let mut arguments = run_arguments(&sandbox, &launch, host, "exit", "10");
+        let poll = arguments.iter().position(|argument| argument == "--poll-seconds").unwrap() + 1;
+        arguments[poll] = "60".into();
+        let child = spawn(&sandbox, &arguments, &sandbox.root);
+        let output = finish(child, Duration::from_secs(60));
+        assert_eq!(output.status.code(), Some(3), "{}", String::from_utf8_lossy(&output.stderr));
+        assert!(!sandbox.worktree.exists());
+        assert!(git(&sandbox.primary, &["branch", "--list", "Feature/1"]).is_empty());
+        let store = log(&sandbox, "stubs/agent-store.log");
+        assert!(store.contains(&format!("end --launch-id {launch} --reason closed")), "{store}");
+        assert!(!store.contains("--reason exited"), "{store}");
+        assert!(log(&sandbox, "stubs/tj-item.log").contains("--state Done"));
+    }
 }
 
 #[cfg(windows)]
@@ -685,7 +811,9 @@ fn a_restart_without_a_bound_session_keeps_the_agent_and_says_so_once() {
         mark_idle(&sandbox, "lonely", "0");
         still_running(&mut child, Duration::from_secs(5));
     }
-    set_reply(&sandbox, "agent-store-show.json", r#"{"ok":true,"data":{"launch":{"state":"closing"},"session":null}}"#);
+    set_reply(&sandbox, "agent-store-show.json", CLOSING);
+    std::fs::remove_file(sandbox.stubs.join("agent-store-show.json")).unwrap();
+    bind(&sandbox, "lonely", "claude", true);
     let output = finish(child, Duration::from_secs(60));
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(stderr.matches("not restarting: no claude session is bound to launch lonely").count(), 1, "{stderr}");
@@ -733,4 +861,178 @@ fn a_shell_started_session_needs_only_the_agent_command() {
     let output = finish(spawn(&sandbox, &unknown, &sandbox.worktree), Duration::from_secs(60));
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("pass --host"));
+}
+
+#[test]
+fn closes_out_all_owned_worktrees_across_repositories() {
+    for host in ["claude", "codex"] {
+        let other = sandbox();
+        let sandbox = sandbox();
+        let extra = sandbox.root.join("extra worktree");
+        git(&sandbox.primary, &["worktree", "add", "-q", extra.to_str().unwrap(), "-b", "Feature/2"]);
+        let launch = format!("collection-{host}");
+        let keys = cfg!(windows) && host == "codex";
+        let mut arguments = run_arguments(&sandbox, &launch, host, if keys { "keys" } else { "signal" }, "2");
+        let cwd = arguments.iter().position(|arg| arg == "--cwd").unwrap() + 1;
+        arguments[cwd] = sandbox.primary.to_string_lossy().into_owned();
+        claim(&sandbox, &launch, host, &[sandbox.worktree.clone(), extra.clone(), other.worktree.clone()]);
+        let child = spawn(&sandbox, &arguments, &sandbox.root);
+        wait_for_log(&sandbox, if keys { "raw" } else { "agent " });
+        set_reply(&sandbox, "tj-item-prs.json", r#"{"prs":[{"state":"merged"}],"all_merged":true}"#);
+        let output = finish(child, Duration::from_secs(60));
+        assert_closed_out(&sandbox, &output, &launch);
+        assert!(!extra.exists());
+        assert!(!other.worktree.exists());
+        assert!(sandbox.primary.exists() && other.primary.exists());
+        assert!(git(&sandbox.primary, &["branch", "--list", "Feature/2"]).is_empty());
+        assert!(git(&other.primary, &["branch", "--list", "Feature/1"]).is_empty());
+        assert_eq!(log(&sandbox, "stubs/agent-store.log").matches("release-worktree ").count(), 3);
+    }
+}
+
+#[test]
+fn one_dirty_owned_worktree_keeps_every_worktree_and_the_agent_open() {
+    let sandbox = sandbox();
+    let extra = sandbox.root.join("dirty worktree");
+    git(&sandbox.primary, &["worktree", "add", "-q", extra.to_str().unwrap(), "-b", "Feature/2"]);
+    let mut child = start(&sandbox, "dirty-collection", "claude", "signal", "2");
+    claim(&sandbox, "dirty-collection", "claude", &[sandbox.worktree.clone(), extra.clone()]);
+    std::fs::write(extra.join("unfinished.txt"), "only copy").unwrap();
+    set_reply(&sandbox, "tj-item-prs.json", r#"{"prs":[{"state":"merged"}],"all_merged":true}"#);
+    still_running(&mut child, Duration::from_secs(4));
+    assert!(sandbox.worktree.exists() && extra.exists());
+    assert!(!log(&sandbox, "stubs/agent-store.log").contains("release-worktree"));
+    assert!(!log(&sandbox, "stubs/tj-item.log").contains("--state Done"));
+    std::fs::remove_file(extra.join("unfinished.txt")).unwrap();
+    let output = finish(child, Duration::from_secs(60));
+    assert_closed_out(&sandbox, &output, "dirty-collection");
+    assert!(!extra.exists());
+}
+
+#[test]
+fn another_live_session_blocks_closeout_even_when_its_metadata_says_ended() {
+    let sandbox = sandbox();
+    let pid = std::process::id();
+    let started = tj_cli::process::agent::started_at(pid).unwrap().unwrap();
+    let started: chrono::DateTime<chrono::Utc> = started.into();
+    set_store_list(
+        &sandbox.stubs,
+        "sessions",
+        serde_json::json!([{
+            "session": "codex:other", "state": "ended", "worktree": sandbox.worktree,
+            "wrapper": {"pid": pid, "started_at": started.to_rfc3339()}
+        }]),
+    );
+    let mut child = start(&sandbox, "live-owner", "claude", "signal", "2");
+    set_reply(&sandbox, "tj-item-prs.json", r#"{"prs":[{"state":"merged"}],"all_merged":true}"#);
+    still_running(&mut child, Duration::from_secs(4));
+    assert!(sandbox.worktree.exists());
+    assert!(!log(&sandbox, "dummy.log").contains("graceful"));
+    set_store_list(&sandbox.stubs, "sessions", serde_json::json!([]));
+    let output = finish(child, Duration::from_secs(60));
+    assert_closed_out(&sandbox, &output, "live-owner");
+    assert!(String::from_utf8_lossy(&output.stderr).contains("another session may still be using"));
+}
+
+#[test]
+fn release_failure_keeps_the_claim_and_never_marks_done() {
+    let sandbox = sandbox();
+    set_reply(&sandbox, "agent-store-release-worktree.json", r#"{"ok":false,"error":{"message":"storage failed"}}"#);
+    let child = start(&sandbox, "failed-release", "claude", "signal", "2");
+    set_reply(&sandbox, "tj-item-prs.json", r#"{"prs":[{"state":"merged"}],"all_merged":true}"#);
+    let output = finish(child, Duration::from_secs(60));
+    assert_eq!(output.status.code(), Some(1));
+    assert!(!sandbox.worktree.exists());
+    assert!(!sandbox.stubs.join("released.json").exists());
+    assert!(!log(&sandbox, "stubs/tj-item.log").contains("--state Done"));
+    assert!(!log(&sandbox, "stubs/agent-store.log").contains("--reason closed"));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("storage failed"));
+    assert!(sandbox.root.join("cache/run/failed-release.closeout.json").is_file());
+    std::fs::remove_file(sandbox.stubs.join("agent-store-release-worktree.json")).unwrap();
+    let output = retry_closeout(&sandbox, "failed-release");
+    assert_closed_out(&sandbox, &output, "failed-release");
+    assert!(!sandbox.root.join("cache/run/failed-release.closeout.json").exists());
+}
+
+fn retry_closeout(sandbox: &Sandbox, launch: &str) -> Output {
+    set_store_list(
+        &sandbox.stubs,
+        "launches",
+        serde_json::json!([{
+            "launch_id": launch, "host": "claude", "title": "Test tab",
+            "worktree": sandbox.worktree, "state": "ended", "end_reason": "exited",
+            "item": {"ref": ITEM},
+            "wrapper": {"pid": 0, "started_at": "2026-01-01T00:00:00Z"}
+        }]),
+    );
+    Command::new(env!("CARGO_BIN_EXE_tj"))
+        .arg("closeout")
+        .envs(environment(sandbox))
+        .current_dir(&sandbox.root)
+        .output()
+        .unwrap()
+}
+
+#[test]
+fn tracker_and_launch_finalization_failures_can_be_retried_after_all_releases() {
+    for stage in ["tracker", "end"] {
+        let sandbox = sandbox();
+        let failed = if stage == "tracker" { "tj-item-progress.failed" } else { "agent-store-end.json" };
+        set_reply(&sandbox, failed, r#"{"ok":false,"error":{"message":"finalization failed"}}"#);
+        let launch = format!("finalize-{stage}");
+        let child = start(&sandbox, &launch, "claude", "signal", "2");
+        set_reply(&sandbox, "tj-item-prs.json", r#"{"prs":[{"state":"merged"}],"all_merged":true}"#);
+        let output = finish(child, Duration::from_secs(60));
+        assert_eq!(output.status.code(), Some(1), "{}", String::from_utf8_lossy(&output.stderr));
+        assert!(!sandbox.worktree.exists());
+        assert!(sandbox.stubs.join("released.json").is_file());
+        let journal = sandbox.root.join("cache/run").join(format!("{launch}.closeout.json"));
+        assert!(journal.is_file());
+        std::fs::remove_file(sandbox.stubs.join(failed)).unwrap();
+        git(&sandbox.primary, &["branch", "Feature/1"]);
+        let ended = log(&sandbox, "stubs/agent-store.log").matches("--reason closed").count();
+        let refused = retry_closeout(&sandbox, &launch);
+        assert_eq!(refused.status.code(), Some(1));
+        assert!(String::from_utf8_lossy(&refused.stdout).contains("branch was retained"));
+        assert_eq!(log(&sandbox, "stubs/agent-store.log").matches("--reason closed").count(), ended);
+        assert!(journal.is_file());
+        assert!(!git(&sandbox.primary, &["branch", "--list", "Feature/1"]).is_empty());
+        git(&sandbox.primary, &["branch", "-d", "Feature/1"]);
+        let output = retry_closeout(&sandbox, &launch);
+        assert_closed_out(&sandbox, &output, &launch);
+        assert!(!journal.exists());
+        assert_eq!(log(&sandbox, "stubs/agent-store.log").matches("release-worktree ").count(), 1);
+    }
+}
+
+#[test]
+fn changes_written_during_shutdown_are_kept_and_never_marked_done() {
+    let sandbox = sandbox();
+    std::fs::write(
+        sandbox.root.join("dirty-on-stop"),
+        sandbox.worktree.join("unfinished.txt").to_string_lossy().as_bytes(),
+    )
+    .unwrap();
+    let child = start(&sandbox, "shutdown-change", "claude", "signal", "2");
+    set_reply(&sandbox, "tj-item-prs.json", r#"{"prs":[{"state":"merged"}],"all_merged":true}"#);
+    let output = finish(child, Duration::from_secs(60));
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(std::fs::read_to_string(sandbox.worktree.join("unfinished.txt")).unwrap(), "unfinished");
+    assert!(!log(&sandbox, "stubs/tj-item.log").contains("--state Done"));
+    assert!(!log(&sandbox, "stubs/agent-store.log").contains("release-worktree"));
+}
+
+#[test]
+fn an_unclaimed_linked_worktree_requires_recovery_before_closing() {
+    let sandbox = sandbox();
+    let mut child = start(&sandbox, "unclaimed", "claude", "signal", "2");
+    set_store_list(&sandbox.stubs, "worktrees", serde_json::json!([]));
+    set_reply(&sandbox, "tj-item-prs.json", r#"{"prs":[{"state":"merged"}],"all_merged":true}"#);
+    still_running(&mut child, Duration::from_secs(4));
+    assert!(sandbox.worktree.exists());
+    assert!(!log(&sandbox, "dummy.log").contains("graceful"));
+    claim(&sandbox, "unclaimed", "claude", std::slice::from_ref(&sandbox.worktree));
+    let output = finish(child, Duration::from_secs(60));
+    assert_closed_out(&sandbox, &output, "unclaimed");
+    assert!(String::from_utf8_lossy(&output.stderr).contains("no recorded ownership; recovery required"));
 }
