@@ -1,6 +1,7 @@
 pub mod closeout;
-pub mod restart;
+pub mod owner;
 pub(crate) mod store;
+pub mod update;
 
 use std::collections::HashSet;
 use std::ffi::{OsStr, OsString};
@@ -65,6 +66,13 @@ pub struct Args {
     grace_seconds: u64,
     #[arg(long, hide = true, default_value_t = 30)]
     restart_grace_seconds: u64,
+    #[arg(long, hide = true, default_value_t = 2)]
+    plugin_grace_seconds: u64,
+    #[arg(long, hide = true, default_value_t = 2)]
+    input_idle_seconds: u64,
+    /// Continues this launch in a replaced tj binary: the launch, its marks and its conversation already exist.
+    #[arg(long, hide = true)]
+    successor: bool,
     /// The agent's command line.
     #[arg(last = true, required = true)]
     agent: Vec<OsString>,
@@ -184,7 +192,6 @@ enum Trigger {
 
 struct Watch {
     launch: Launch,
-    environment: [(&'static str, String); 4],
     marks: PathBuf,
     poll: Duration,
     idle: Duration,
@@ -264,34 +271,51 @@ fn stop(agent: &mut Agent, host: Host, grace: Duration) -> Result<()> {
     agent.kill_tree(Duration::from_secs(30)).context("could not end the agent's processes")
 }
 
-enum Restarted {
-    Kept,
-    Resumed(Agent),
+fn successor_arguments(args: &Args, launch: &Launch, agent: Vec<OsString>) -> Vec<OsString> {
+    let mut arguments: Vec<OsString> =
+        ["run", "--host", launch.host.name(), "--title", &launch.title, "--cwd"].map(OsString::from).to_vec();
+    arguments.push(launch.cwd.clone().into_os_string());
+    if let Some(item) = &launch.item {
+        arguments.extend(["--item", item].map(OsString::from));
+    }
+    let seconds = [
+        ("--poll-seconds", args.poll_seconds),
+        ("--idle-seconds", args.idle_seconds),
+        ("--grace-seconds", args.grace_seconds),
+        ("--restart-grace-seconds", args.restart_grace_seconds),
+        ("--plugin-grace-seconds", args.plugin_grace_seconds),
+        ("--input-idle-seconds", args.input_idle_seconds),
+    ];
+    for (name, value) in seconds {
+        arguments.extend([OsString::from(name), OsString::from(value.to_string())]);
+    }
+    arguments.extend(["--launch-id", &launch.id, "--successor", "--"].map(OsString::from));
+    arguments.extend(agent);
+    arguments
 }
 
-fn restart(agent: &mut Agent, watch: &mut Watch, command: &[OsString], grace: Duration) -> Result<Restarted> {
+/// Stops the agent and hands the tab to the replaced tj binary, resuming the same conversation.
+fn restart(agent: &mut Agent, watch: &mut Watch, args: &Args, exe: &Path) -> Result<Option<ExitCode>> {
     let host = watch.launch.host;
     let session = match store::bound_session(&watch.launch.id) {
         Ok(Some(session)) => session,
         Ok(None) => {
             watch.report(format!(
-                "not restarting: no {} session is bound to launch {} yet",
+                "not updating tj: no {} session is bound to launch {} yet",
                 host.name(),
                 watch.launch.id
             ));
-            return Ok(Restarted::Kept);
+            return Ok(None);
         }
         Err(error) => {
-            watch.report(format!("not restarting: {error:#}"));
-            return Ok(Restarted::Kept);
+            watch.report(format!("not updating tj: {error:#}"));
+            return Ok(None);
         }
     };
-    eprintln!("\r\ntj run: restarting to resume {}:{session}\r", host.name());
-    stop(agent, host, grace)?;
-    prepare(&watch.launch, command);
-    let resumed = Agent::start(&host.resume(command, &session), &watch.launch.cwd, &watch.environment)
-        .with_context(|| format!("could not resume {}:{session}", host.name()))?;
-    Ok(Restarted::Resumed(resumed))
+    eprintln!("\r\ntj run: tj was updated; resuming {}:{session} in the new version\r", host.name());
+    stop(agent, host, Duration::from_secs(args.grace_seconds))?;
+    let resume = host.resume(&args.agent, &session);
+    update::successor::hand_over(exe, &successor_arguments(args, &watch.launch, resume)).map(Some)
 }
 
 fn wait_for_enter() {
@@ -305,9 +329,12 @@ fn rfc3339(time: SystemTime) -> String {
 
 pub fn run(args: Args) -> Result<ExitCode> {
     agent::prepare_wrapper().context("could not prepare the console")?;
+    let exe = std::env::current_exe().context("could not locate the tj executable")?;
     let launch = launch(&args)?;
     let marks = marks(&launch.id)?;
-    let _ = std::fs::remove_dir_all(&marks);
+    if !args.successor {
+        let _ = std::fs::remove_dir_all(&marks);
+    }
     let pid = std::process::id();
     let started_at = rfc3339(agent::started_at(pid)?.context("could not identify this wrapper process")?);
     let environment = [
@@ -316,16 +343,22 @@ pub fn run(args: Args) -> Result<ExitCode> {
         ("TJ_RUN_LAUNCH_ID", launch.id.clone()),
         ("AGENT_CLI_TAB_TITLE", launch.title.clone()),
     ];
-    record_launch(&launch, args.parent.as_deref(), pid, &started_at);
+    if !args.successor {
+        record_launch(&launch, args.parent.as_deref(), pid, &started_at);
+    }
     prepare(&launch, &args.agent);
     let mut agent = Agent::start(&args.agent, &launch.cwd, &environment)
         .with_context(|| format!("could not start {}", args.agent[0].to_string_lossy()))?;
     let poll = Duration::from_secs(args.poll_seconds);
     let grace = Duration::from_secs(args.grace_seconds);
-    let request = restart::Request::new(&marks, Duration::from_secs(args.restart_grace_seconds));
+    let graces = update::gate::Graces {
+        plugins: Duration::from_secs(args.plugin_grace_seconds),
+        restart: Duration::from_secs(args.restart_grace_seconds),
+        input: Duration::from_secs(args.input_idle_seconds),
+    };
+    let mut watcher = update::Watcher::new(exe, update::published(launch.host)?);
     let mut watch = Watch {
         launch,
-        environment,
         marks,
         poll,
         idle: Duration::from_secs(args.idle_seconds),
@@ -333,7 +366,7 @@ pub fn run(args: Args) -> Result<ExitCode> {
         reported: HashSet::new(),
         asked: false,
     };
-    let mut resumed = false;
+    let resumed = args.successor;
     let removal = loop {
         if let Some(code) = agent.try_wait()? {
             agent.kill_tree(Duration::from_secs(30))?;
@@ -370,24 +403,22 @@ pub fn run(args: Args) -> Result<ExitCode> {
                 }
             }
         }
-        if let Some(reason) = request.due() {
-            match restart(&mut agent, &mut watch, &args.agent, grace) {
-                Ok(Restarted::Kept) => {}
-                Ok(Restarted::Resumed(next)) => {
-                    agent = next;
-                    resumed = true;
-                    request.restarted(&reason);
-                }
-                Err(error) => {
-                    eprintln!("tj run: restart stopped: {error:#}");
-                    let _ = std::fs::remove_dir_all(&watch.marks);
-                    if let Err(error) = store::end(&watch.launch.id, "exited") {
-                        eprintln!("tj run: {error:#}");
-                    }
-                    wait_for_enter();
-                    return Ok(ExitCode::FAILURE);
+        let host = update::host(watch.launch.host);
+        match update::due(&mut watcher, host, agent.pid(), graces) {
+            Some(update::gate::Apply::Plugins) => {
+                let revision = watcher.revision();
+                match host.apply() {
+                    Ok(()) => watcher.applied(revision),
+                    Err(error) => watch.report(format!("could not update {}: {error}", watch.launch.host.name())),
                 }
             }
+            Some(update::gate::Apply::Binary) => {
+                let exe = watcher.exe().to_path_buf();
+                if let Some(code) = restart(&mut agent, &mut watch, &args, &exe)? {
+                    return Ok(code);
+                }
+            }
+            None => {}
         }
         std::thread::sleep(Duration::from_millis(500));
     };
@@ -403,28 +434,28 @@ pub fn run(args: Args) -> Result<ExitCode> {
 
 #[derive(clap::Args)]
 pub struct DoneArgs {
-    /// Withdraw the mark and the idle mark, because new input arrived. A no-op outside `tj run`.
+    /// Withdraw the mark, because new input arrived. A no-op outside `tj run`.
     #[arg(long)]
     cancel: bool,
 }
 
 pub fn done(args: DoneArgs) -> Result<ExitCode> {
-    let Some(launch_id) = launch_id() else {
+    let Some(launch_id) = owner::launch() else {
         if args.cancel {
             return Ok(ExitCode::SUCCESS);
+        }
+        if launch_id().is_some() {
+            bail!("tj done only works from the tab's own agent; this process inherited another tab's tj run");
         }
         bail!("tj done only works inside a tj run session (TJ_RUN_LAUNCH_ID is not set)");
     };
     let marks = marks(&launch_id)?;
     let marker = marks.join("done");
     if args.cancel {
-        for mark in [marker, marks.join(restart::IDLE)] {
-            match std::fs::remove_file(&mark) {
-                Err(error) if error.kind() != std::io::ErrorKind::NotFound => return Err(error.into()),
-                _ => {}
-            }
+        match std::fs::remove_file(&marker) {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => return Err(error.into()),
+            _ => return Ok(ExitCode::SUCCESS),
         }
-        return Ok(ExitCode::SUCCESS);
     }
     std::fs::create_dir_all(marker.parent().context("marker has no folder")?)?;
     std::fs::write(&marker, rfc3339(SystemTime::now()))?;

@@ -42,6 +42,10 @@ impl Agent {
         Ok(Self { pid: child.id() as libc::pid_t, exit: None })
     }
 
+    pub fn pid(&self) -> u32 {
+        self.pid.unsigned_abs()
+    }
+
     /// Reaps every exited child, including descendants adopted as subreaper, keeping the agent's status.
     pub fn try_wait(&mut self) -> io::Result<Option<i32>> {
         loop {
@@ -64,12 +68,7 @@ impl Agent {
     pub fn stop(&mut self, stop: Stop) -> io::Result<()> {
         match stop {
             Stop::Signal => check(unsafe { libc::killpg(self.pid, libc::SIGINT) }),
-            Stop::Keys => {
-                let pane = std::env::var("TMUX_PANE")
-                    .map_err(|_| io::Error::new(io::ErrorKind::Unsupported, "keys can only be sent inside tmux"))?;
-                let status = Command::new("tmux").args(["send-keys", "-t", &pane, "C-c"]).status()?;
-                if status.success() { Ok(()) } else { Err(io::Error::other("tmux send-keys failed")) }
-            }
+            Stop::Keys => tmux(&["C-c"]),
         }
     }
 
@@ -90,6 +89,40 @@ impl Agent {
             unsafe { libc::tcsetpgrp(libc::STDIN_FILENO, libc::getpgrp()) };
         }
     }
+}
+
+fn tmux(keys: &[&str]) -> io::Result<()> {
+    let pane = std::env::var("TMUX_PANE")
+        .map_err(|_| io::Error::new(io::ErrorKind::Unsupported, "keys can only be sent inside tmux"))?;
+    let status = Command::new("tmux").args(["send-keys", "-t", &pane]).args(keys).status()?;
+    if status.success() { Ok(()) } else { Err(io::Error::other("tmux send-keys failed")) }
+}
+
+pub fn type_text(text: &str) -> io::Result<()> {
+    tmux(&["-l", text])
+}
+
+pub fn press_enter() -> io::Result<()> {
+    tmux(&["Enter"])
+}
+
+pub fn input_idle() -> Option<Duration> {
+    None
+}
+
+pub fn processes() -> io::Result<std::collections::HashMap<u32, (u32, String)>> {
+    let mut table = std::collections::HashMap::new();
+    for entry in std::fs::read_dir("/proc")? {
+        let Some(pid) = entry?.file_name().to_str().and_then(|name| name.parse::<u32>().ok()) else { continue };
+        let Ok(Some(fields)) = stat_fields(libc::pid_t::try_from(pid).map_err(io::Error::other)?) else { continue };
+        let parent = fields.get(1).and_then(|parent| parent.parse().ok()).unwrap_or(0);
+        let image = std::fs::read_link(format!("/proc/{pid}/exe"))
+            .ok()
+            .and_then(|path| path.file_name().map(|name| name.to_string_lossy().into_owned()))
+            .unwrap_or_default();
+        table.insert(pid, (parent, image));
+    }
+    Ok(table)
 }
 
 fn adopted_children() -> Vec<libc::pid_t> {

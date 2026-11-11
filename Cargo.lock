@@ -652,6 +652,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "terminal_size",
+ "thiserror",
  "walkdir",
  "which",
  "windows-sys",
