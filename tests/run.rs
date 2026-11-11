@@ -276,9 +276,9 @@ fn set_status(sandbox: &Sandbox, status: &str) {
     std::fs::write(sessions.join(format!("{pid}.json")), record.to_string()).unwrap();
 }
 
-fn publish(sandbox: &Sandbox, revision: &str) {
+fn publish(sandbox: &Sandbox, host: &str, revision: &str) {
     let output = Command::new(env!("CARGO_BIN_EXE_tj"))
-        .args(["update", "--revision", revision])
+        .args(["update", "--host", host, "--revision", revision])
         .env("TJ_CACHE_DIR", sandbox.root.join("cache"))
         .output()
         .unwrap();
@@ -824,21 +824,27 @@ fn only_the_tabs_own_agent_can_mark_it_done() {
 
 #[cfg(windows)]
 #[test]
-fn a_published_plugin_update_is_applied_to_an_idle_claude_in_place_once() {
+fn each_claude_update_is_applied_to_an_idle_claude_in_place_once() {
     let sandbox = sandbox();
     set_reply(&sandbox, "agent-store-show.json", BOUND);
     let child = spawn(&sandbox, &with_prompt(&sandbox, "plugins", "claude", "keys"), &sandbox.root);
     wait_for_log(&sandbox, "raw");
     set_status(&sandbox, "busy");
-    publish(&sandbox, "plugins b");
+    publish(&sandbox, "claude", "plugins b");
     std::thread::sleep(Duration::from_secs(4));
     assert!(!log(&sandbox, "dummy.log").contains("typed"), "typed into a turn that never ended");
     set_status(&sandbox, "idle");
     wait_for_log(&sandbox, "typed /reload-plugins");
-    publish(&sandbox, "plugins b");
+    publish(&sandbox, "codex", "plugins c");
+    std::thread::sleep(Duration::from_secs(4));
+    assert_eq!(log(&sandbox, "dummy.log").matches("typed /reload-plugins").count(), 1, "a Codex update reached Claude");
+    publish(&sandbox, "claude", "plugins b");
+    wait_until("a second Claude update of the same plugins was skipped", || {
+        log(&sandbox, "dummy.log").matches("typed /reload-plugins").count() == 2
+    });
     std::thread::sleep(Duration::from_secs(4));
     let agent = log(&sandbox, "dummy.log");
-    assert_eq!(agent.matches("typed /reload-plugins").count(), 1, "{agent}");
+    assert_eq!(agent.matches("typed /reload-plugins").count(), 2, "{agent}");
     assert_eq!(agent.matches("agent plugins Test tab").count(), 1, "the agent restarted: {agent}");
     set_reply(&sandbox, "agent-store-show.json", CLOSING);
     let output = finish(child, Duration::from_secs(60));
@@ -846,7 +852,7 @@ fn a_published_plugin_update_is_applied_to_an_idle_claude_in_place_once() {
 }
 
 #[test]
-fn a_published_plugin_update_is_applied_to_codex_through_its_app_server() {
+fn a_codex_update_is_applied_through_its_app_server() {
     let sandbox = sandbox();
     let codex = fake_codex(&sandbox);
     set_reply(&sandbox, "agent-store-show.json", BOUND);
@@ -868,7 +874,7 @@ fn a_published_plugin_update_is_applied_to_codex_through_its_app_server() {
     }
     let child = command.spawn().unwrap();
     wait_for_log(&sandbox, if keys { "raw" } else { "agent " });
-    publish(&sandbox, "plugins b");
+    publish(&sandbox, "codex", "plugins b");
     wait_until("the Codex app-server was never asked to take the update", || {
         std::fs::read_to_string(&codex).unwrap_or_default().contains(r#""reloadUserConfig": true"#)
     });
