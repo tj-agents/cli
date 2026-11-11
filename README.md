@@ -213,8 +213,8 @@ shell or agent started from inside the session inherits `TJ_RUN_*` but is ignore
 launch the caller belongs to, for Agent's `SessionStart` binding.
 
 Running tabs apply updates by themselves. Agent's `tj plugins update` ends with a hidden
-`tj update --revision R`, which replaces `<cache>/published`; every wrapper checks it and its own executable
-on each half-second poll and applies each new revision once, in place:
+`tj update --host H --revision R`, which replaces `<cache>/published/<host>`; every wrapper of that host checks
+it and its own executable on each half-second poll and applies each publish once, in place:
 
 - Claude: once Claude's own record for the agent process, `<claude home>/sessions/<pid>.json`, has said
   `idle` for 2 s and the keyboard and mouse have been idle 2 s (Windows; Linux has only Claude's status), the
@@ -296,7 +296,7 @@ the subscription expired. A Claude child reports to a Codex parent with `tj mess
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `TJ_F_ROOT` | `~/projects`, then `~/source/repos` | where `f` searches |
-| `TJ_CACHE_DIR` | OS cache folder + `/tj` | where `cr` keeps its index, `tj done` its marks, `tj update` the published revision and each Claude relay its endpoint |
+| `TJ_CACHE_DIR` | OS cache folder + `/tj` | where `cr` keeps its index, `tj done` its marks, `tj update` the published updates and each Claude relay its endpoint |
 | `TJ_BIN_DIR` | `~/.local/bin` / `%LOCALAPPDATA%\Programs\tj` | where the installer puts `tj` and `tj_hook` |
 | `CLAUDE_CONFIG_DIR` | `~/.claude` | Claude Code's config folder, as Claude Code itself reads it |
 | `CODEX_HOME` | `~/.codex` | Codex's config folder, as Codex itself reads it |
