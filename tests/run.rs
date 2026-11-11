@@ -9,6 +9,7 @@ const BOUND: &str =
 const CLOSING: &str =
     r#"{"ok":true,"data":{"launch":{"state":"closing"},"session":{"native_id":"sess-1","state":"active"}}}"#;
 const PREBOUND: &str = "123e4567-e89b-12d3-a456-426614174000";
+const MERGED: &str = r#"{"prs":[{"url":"u","state":"merged"}],"all_merged":true}"#;
 
 struct Sandbox {
     _directory: tempfile::TempDir,
@@ -92,6 +93,7 @@ fn sandbox() -> Sandbox {
     set_store_list(&stubs, "sessions", serde_json::json!([]));
     stub(&stubs, "tj-item", r#"{"prs":[],"all_merged":false}"#);
     stub(&stubs, "tj-prepare", "prepared");
+    stub(&stubs, "codex", "queued");
     std::fs::copy(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/prepare.py"), stubs.join("prepare.py"))
         .unwrap();
     for folder in ["home", "cache"] {
@@ -271,6 +273,26 @@ fn done(sandbox: &Sandbox, launch: &str, cancel: bool) {
     assert!(command.output().unwrap().status.success());
 }
 
+fn refused(sandbox: &Sandbox, child: &mut Child, launch: &str) {
+    done(sandbox, launch, false);
+    let mark = sandbox.root.join("cache").join("run").join(launch).join("done");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while mark.exists() {
+        assert!(Instant::now() < deadline, "closeout never checked the done mark");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    still_running(child, Duration::from_millis(500));
+    assert!(!log(sandbox, "dummy.log").contains("graceful"), "the agent was stopped");
+}
+
+fn wait_for_polls(sandbox: &Sandbox, file: &str, prefix: &str, count: usize) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while log(sandbox, file).lines().filter(|line| line.starts_with(prefix)).count() < count {
+        assert!(Instant::now() < deadline, "{file} never logged {count} {prefix:?} lines");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
 fn request_restart(sandbox: &Sandbox, launch: &str, reason: &str) -> Output {
     Command::new(env!("CARGO_BIN_EXE_tj"))
         .args(["restart", "--reason", reason])
@@ -372,14 +394,38 @@ fn assert_closed_out(sandbox: &Sandbox, output: &Output, launch: &str) {
 }
 
 #[test]
-fn closes_out_when_every_pr_has_merged() {
+fn an_item_merged_before_the_session_started_never_stops_it() {
     let sandbox = sandbox();
-    set_reply(&sandbox, "tj-item-prs.json", r#"{"prs":[{"url":"u","state":"merged"}],"all_merged":true}"#);
-    let child = start(&sandbox, "merged", "claude", "signal", "10");
+    set_reply(&sandbox, "tj-item-prs.json", MERGED);
+    let mut child = start(&sandbox, "merged-before", "claude", "signal", "10");
+    wait_for_polls(&sandbox, "stubs/agent-store.log", "show --launch-id merged-before", 4);
+    still_running(&mut child, Duration::from_millis(500));
+    assert!(sandbox.worktree.exists());
+    assert!(!log(&sandbox, "dummy.log").contains("graceful"), "the agent was stopped");
+    assert!(!log(&sandbox, "stubs/tj-item.log").contains("--state Done"));
+    set_reply(&sandbox, "agent-store-show.json", CLOSING);
     let output = finish(child, Duration::from_secs(60));
-    assert_closed_out(&sandbox, &output, "merged");
-    assert!(log(&sandbox, "dummy.log").contains("graceful"), "the agent was not stopped gracefully");
-    assert!(git(&sandbox.primary, &["branch", "--list", "Feature/1"]).is_empty(), "the merged branch is still there");
+    assert_closed_out(&sandbox, &output, "merged-before");
+}
+
+#[test]
+fn a_merge_mid_session_asks_the_agent_once_and_only_its_done_closes_out() {
+    let sandbox = sandbox();
+    let keys = cfg!(windows);
+    let mut child = start(&sandbox, "merged-during", "codex", if keys { "keys" } else { "signal" }, "10");
+    wait_for_polls(&sandbox, "stubs/tj-item.log", "prs ", 1);
+    set_reply(&sandbox, "tj-item-prs.json", MERGED);
+    wait_for_polls(&sandbox, "stubs/codex.log", "queue --thread sess-1 --message", 1);
+    wait_for_polls(&sandbox, "stubs/agent-store.log", "show --launch-id merged-during", 8);
+    still_running(&mut child, Duration::from_millis(500));
+    assert!(sandbox.worktree.exists());
+    assert!(!log(&sandbox, "dummy.log").contains("graceful"), "the agent was stopped");
+    let asked = log(&sandbox, "stubs/codex.log");
+    assert_eq!(asked.lines().count(), 1, "{asked}");
+    assert!(asked.contains("tj done"), "{asked}");
+    done(&sandbox, "merged-during", false);
+    let output = finish(child, Duration::from_secs(60));
+    assert_closed_out(&sandbox, &output, "merged-during");
 }
 
 #[test]
@@ -408,8 +454,8 @@ fn closes_out_the_worktree_bound_after_launch() {
             }
         });
         set_reply(&sandbox, "agent-store-show.json", &binding.to_string());
-        set_reply(&sandbox, "tj-item-prs.json", r#"{"prs":[{"url":"u","state":"merged"}],"all_merged":true}"#);
-        let output = finish(child, Duration::from_secs(30));
+        done(&sandbox, &launch, false);
+        let output = finish(child, Duration::from_secs(60));
         assert_closed_out(&sandbox, &output, &launch);
         let store = log(&sandbox, "stubs/agent-store.log");
         let recorded = store.lines().find(|line| line.starts_with("launch ")).unwrap();
@@ -436,22 +482,16 @@ fn an_unrelated_worktree_binding_does_not_stop_or_clean_the_agent() {
         });
         binding["data"]["session"][field] = serde_json::Value::String(wrong.to_owned());
         set_reply(&sandbox, "agent-store-show.json", &binding.to_string());
-        set_reply(&sandbox, "tj-item-prs.json", r#"{"prs":[{"url":"u","state":"merged"}],"all_merged":true}"#);
         let mut child = start(&sandbox, launch, "claude", "signal", "2");
-        let deadline = Instant::now() + Duration::from_secs(30);
-        while log(&sandbox, "stubs/agent-store.log").lines().filter(|line| line.starts_with("show ")).count() < 3 {
-            assert!(Instant::now() < deadline, "ownership preflight did not run");
-            std::thread::sleep(Duration::from_millis(100));
-        }
-        still_running(&mut child, Duration::from_millis(100));
-        assert!(!log(&sandbox, "dummy.log").contains("graceful"));
+        refused(&sandbox, &mut child, launch);
         assert!(sandbox.worktree.exists());
         assert!(!log(&sandbox, "stubs/tj-item.log").contains("--state Done"));
         binding["data"]["session"]["launch_id"] = serde_json::json!(launch);
         binding["data"]["session"]["host"] = serde_json::json!("claude");
         binding["data"]["session"]["worktree"] = serde_json::json!(sandbox.worktree);
         set_reply(&sandbox, "agent-store-show.json", &binding.to_string());
-        let output = finish(child, Duration::from_secs(30));
+        done(&sandbox, launch, false);
+        let output = finish(child, Duration::from_secs(60));
         assert_closed_out(&sandbox, &output, launch);
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(stderr.contains("not bound") || stderr.contains("not absolute"), "{stderr}");
@@ -514,6 +554,8 @@ fn closes_out_after_done_and_idle() {
     done(&sandbox, "idle", false);
     let output = finish(child, Duration::from_secs(60));
     assert_closed_out(&sandbox, &output, "idle");
+    assert!(log(&sandbox, "dummy.log").contains("graceful"), "the agent was not stopped gracefully");
+    assert!(git(&sandbox.primary, &["branch", "--list", "Feature/1"]).is_empty(), "the merged branch is still there");
 }
 
 #[test]
@@ -535,21 +577,13 @@ fn unmerged_commits_keep_the_session_open_until_delivered() {
     git(&sandbox.worktree, &["add", "."]);
     git(&sandbox.worktree, &["commit", "-q", "-m", "work"]);
     let mut child = start(&sandbox, "unmerged", "claude", "signal", "10");
-    set_reply(&sandbox, "tj-item-prs.json", r#"{"prs":[{"state":"merged"}],"all_merged":true}"#);
-    done(&sandbox, "unmerged", false);
-    still_running(&mut child, Duration::from_secs(5));
-    assert!(sandbox.worktree.exists());
-    let deadline = Instant::now() + Duration::from_secs(30);
-    while log(&sandbox, "stubs/agent-store.log").matches("worktrees ").count() < 2 {
-        assert!(Instant::now() < deadline, "closeout did not complete its first ownership preflight");
-        std::thread::sleep(Duration::from_millis(100));
-    }
+    refused(&sandbox, &mut child, "unmerged");
     assert!(sandbox.worktree.exists());
     assert!(!log(&sandbox, "stubs/tj-item.log").contains("--state Done"));
     git(&sandbox.primary, &["merge", "--squash", "Feature/1"]);
     git(&sandbox.primary, &["commit", "-q", "-m", "squash work"]);
     git(&sandbox.primary, &["push", "-q", "origin", "main"]);
-    set_reply(&sandbox, "tj-item-prs.json", r#"{"prs":[{"url":"u","state":"merged"}],"all_merged":true}"#);
+    done(&sandbox, "unmerged", false);
     let output = finish(child, Duration::from_secs(60));
     assert!(String::from_utf8_lossy(&output.stderr).contains("worktree has unmerged commits"));
     assert_eq!(output.status.code(), Some(0));
@@ -559,8 +593,8 @@ fn unmerged_commits_keep_the_session_open_until_delivered() {
 #[test]
 fn an_agent_ignoring_the_stop_is_killed_with_its_tree() {
     let sandbox = sandbox();
-    set_reply(&sandbox, "tj-item-prs.json", r#"{"prs":[{"url":"u","state":"merged"}],"all_merged":true}"#);
     let child = start(&sandbox, "stubborn", "claude", "stubborn", "2");
+    done(&sandbox, "stubborn", false);
     let output = finish(child, Duration::from_secs(60));
     assert_closed_out(&sandbox, &output, "stubborn");
     assert!(!log(&sandbox, "dummy.log").contains("graceful"));
@@ -717,9 +751,9 @@ fn an_agent_that_exits_after_delivery_cleans_its_owned_worktrees() {
 #[test]
 fn codex_is_stopped_with_a_ctrl_c_keypress() {
     let sandbox = sandbox();
-    set_reply(&sandbox, "tj-item-prs.json", r#"{"prs":[{"url":"u","state":"merged"}],"all_merged":true}"#);
     let child = start(&sandbox, "codex", "codex", "keys", "10");
     wait_for_log(&sandbox, "raw");
+    done(&sandbox, "codex", false);
     let output = finish(child, Duration::from_secs(60));
     assert_closed_out(&sandbox, &output, "codex");
     assert!(log(&sandbox, "dummy.log").contains("graceful"), "the keypress did not reach the agent");
@@ -732,7 +766,6 @@ fn tmux_pane_closes_after_codex_is_stopped_with_a_keypress() {
         panic!("tmux is required for the pane test");
     }
     let sandbox = sandbox();
-    set_reply(&sandbox, "tj-item-prs.json", r#"{"prs":[{"url":"u","state":"merged"}],"all_merged":true}"#);
     let socket = sandbox.root.join("tmux.sock");
     struct Server(PathBuf);
     impl Drop for Server {
@@ -765,6 +798,7 @@ fn tmux_pane_closes_after_codex_is_stopped_with_a_keypress() {
     }
     assert!(tmux.arg(script).status().unwrap().success());
     wait_for_log(&sandbox, "raw");
+    done(&sandbox, "pane", false);
     let deadline = Instant::now() + Duration::from_secs(60);
     while Command::new("tmux").arg("-S").arg(&socket).args(["has-session", "-t", "run"]).status().unwrap().success() {
         if Instant::now() > deadline {
@@ -986,8 +1020,8 @@ fn closes_out_all_owned_worktrees_across_repositories() {
         claim(&sandbox, &launch, host, &[sandbox.worktree.clone(), extra.clone(), other.worktree.clone()]);
         let child = spawn(&sandbox, &arguments, &sandbox.root);
         wait_for_log(&sandbox, if keys { "raw" } else { "agent " });
-        set_reply(&sandbox, "tj-item-prs.json", r#"{"prs":[{"state":"merged"}],"all_merged":true}"#);
-        let output = finish(child, Duration::from_secs(60));
+        done(&sandbox, &launch, false);
+        let output = finish(child, Duration::from_secs(120));
         assert_closed_out(&sandbox, &output, &launch);
         assert!(!extra.exists());
         assert!(!other.worktree.exists());
@@ -1006,15 +1040,17 @@ fn one_dirty_owned_worktree_keeps_every_worktree_and_the_agent_open() {
     let mut child = start(&sandbox, "dirty-collection", "claude", "signal", "2");
     claim(&sandbox, "dirty-collection", "claude", &[sandbox.worktree.clone(), extra.clone()]);
     std::fs::write(extra.join("unfinished.txt"), "only copy").unwrap();
-    set_reply(&sandbox, "tj-item-prs.json", r#"{"prs":[{"state":"merged"}],"all_merged":true}"#);
-    still_running(&mut child, Duration::from_secs(4));
+    refused(&sandbox, &mut child, "dirty-collection");
     assert!(sandbox.worktree.exists() && extra.exists());
     assert!(!log(&sandbox, "stubs/agent-store.log").contains("release-worktree"));
     assert!(!log(&sandbox, "stubs/tj-item.log").contains("--state Done"));
     std::fs::remove_file(extra.join("unfinished.txt")).unwrap();
-    let output = finish(child, Duration::from_secs(60));
+    done(&sandbox, "dirty-collection", false);
+    let output = finish(child, Duration::from_secs(120));
     assert_closed_out(&sandbox, &output, "dirty-collection");
     assert!(!extra.exists());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(stderr.matches("worktree has uncommitted changes").count(), 1, "{stderr}");
 }
 
 #[test]
@@ -1032,11 +1068,10 @@ fn another_live_session_blocks_closeout_even_when_its_metadata_says_ended() {
         }]),
     );
     let mut child = start(&sandbox, "live-owner", "claude", "signal", "2");
-    set_reply(&sandbox, "tj-item-prs.json", r#"{"prs":[{"state":"merged"}],"all_merged":true}"#);
-    still_running(&mut child, Duration::from_secs(4));
+    refused(&sandbox, &mut child, "live-owner");
     assert!(sandbox.worktree.exists());
-    assert!(!log(&sandbox, "dummy.log").contains("graceful"));
     set_store_list(&sandbox.stubs, "sessions", serde_json::json!([]));
+    done(&sandbox, "live-owner", false);
     let output = finish(child, Duration::from_secs(60));
     assert_closed_out(&sandbox, &output, "live-owner");
     assert!(String::from_utf8_lossy(&output.stderr).contains("another session may still be using"));
@@ -1047,7 +1082,7 @@ fn release_failure_keeps_the_claim_and_never_marks_done() {
     let sandbox = sandbox();
     set_reply(&sandbox, "agent-store-release-worktree.json", r#"{"ok":false,"error":{"message":"storage failed"}}"#);
     let child = start(&sandbox, "failed-release", "claude", "signal", "2");
-    set_reply(&sandbox, "tj-item-prs.json", r#"{"prs":[{"state":"merged"}],"all_merged":true}"#);
+    done(&sandbox, "failed-release", false);
     let output = finish(child, Duration::from_secs(60));
     assert_eq!(output.status.code(), Some(1));
     assert!(!sandbox.worktree.exists());
@@ -1089,7 +1124,7 @@ fn tracker_and_launch_finalization_failures_can_be_retried_after_all_releases() 
         set_reply(&sandbox, failed, r#"{"ok":false,"error":{"message":"finalization failed"}}"#);
         let launch = format!("finalize-{stage}");
         let child = start(&sandbox, &launch, "claude", "signal", "2");
-        set_reply(&sandbox, "tj-item-prs.json", r#"{"prs":[{"state":"merged"}],"all_merged":true}"#);
+        done(&sandbox, &launch, false);
         let output = finish(child, Duration::from_secs(60));
         assert_eq!(output.status.code(), Some(1), "{}", String::from_utf8_lossy(&output.stderr));
         assert!(!sandbox.worktree.exists());
@@ -1122,7 +1157,7 @@ fn changes_written_during_shutdown_are_kept_and_never_marked_done() {
     )
     .unwrap();
     let child = start(&sandbox, "shutdown-change", "claude", "signal", "2");
-    set_reply(&sandbox, "tj-item-prs.json", r#"{"prs":[{"state":"merged"}],"all_merged":true}"#);
+    done(&sandbox, "shutdown-change", false);
     let output = finish(child, Duration::from_secs(60));
     assert_eq!(output.status.code(), Some(1));
     assert_eq!(std::fs::read_to_string(sandbox.worktree.join("unfinished.txt")).unwrap(), "unfinished");
@@ -1135,11 +1170,10 @@ fn an_unclaimed_linked_worktree_requires_recovery_before_closing() {
     let sandbox = sandbox();
     let mut child = start(&sandbox, "unclaimed", "claude", "signal", "2");
     set_store_list(&sandbox.stubs, "worktrees", serde_json::json!([]));
-    set_reply(&sandbox, "tj-item-prs.json", r#"{"prs":[{"state":"merged"}],"all_merged":true}"#);
-    still_running(&mut child, Duration::from_secs(4));
+    refused(&sandbox, &mut child, "unclaimed");
     assert!(sandbox.worktree.exists());
-    assert!(!log(&sandbox, "dummy.log").contains("graceful"));
     claim(&sandbox, "unclaimed", "claude", std::slice::from_ref(&sandbox.worktree));
+    done(&sandbox, "unclaimed", false);
     let output = finish(child, Duration::from_secs(60));
     assert_closed_out(&sandbox, &output, "unclaimed");
     assert!(String::from_utf8_lossy(&output.stderr).contains("no recorded ownership; recovery required"));
