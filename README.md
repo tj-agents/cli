@@ -229,20 +229,19 @@ It closes out when any of these happens:
 - `tj done` was run and no new input has cancelled it for about 10 minutes;
 - `agent-store` marks the launch or its session `closing`, which is what `tj closeout REF` does.
 
-Before stopping anything, it proves that closeout loses nothing: the worktree must be clean, it must have no
-commits off the default branch unless the PRs merged, and worktrunk's `pre-remove` hooks must pass. If any of
-these fails, the session stays open and the wrapper prints the reason. Closeout then:
+Before stopping anything, it checks every linked worktree recorded for the exact launch and native session, including roots created after launch and in other repositories. Each root must be registered, clean and integrated into its freshly fetched default branch; a merged item PR alone cannot authorize deletion. Worktrunk supplies the content checks for squash and rebase merges. Another session with live or unknown process ownership keeps the worktree open.
+
+After stopping its own agent process tree, the wrapper repeats those checks and refuses changed ownership or content. Each worktree and branch must disappear before its ownership record is released. The item becomes Done and the launch closes only after all owned roots are removed. Primary checkouts remain. A missing or unrecorded ownership root requires recovery; cleanup never guesses ownership from a neighbouring folder or adopts legacy location metadata.
 
 1. asks the agent to exit: a console break or SIGINT for Claude, a Ctrl+C keypress for Codex (through
    `tmux send-keys` on Linux);
 2. kills what is left after 10 s and waits until no process of the tree remains;
-3. runs `git-wt remove --foreground`, but only on a linked worktree, never a primary checkout;
+3. runs `git-wt remove --foreground` for each owned linked worktree;
 4. runs `tj item progress REF --state Done` and `agent-store end`;
 5. exits 0, so Windows Terminal (`closeOnExit` default) or tmux closes the tab.
 
 Helpers run hidden through `tj_hook` on Windows, and in their own session on Linux, so they never touch the
-agent's console. If the agent exits by itself, the wrapper ends the launch, keeps the worktree and exits
-with the agent's code.
+agent's console. If the agent exits by itself, the wrapper checks delivery once more and cleans up when a closeout trigger is ready. Otherwise it ends the launch and keeps the unfinished worktrees. It preserves the agent's exit code. `tj closeout` also inspects ended launches whose cleanup has not completed.
 
 ## `tj message` and `tj subscribe`: messaging between sessions
 

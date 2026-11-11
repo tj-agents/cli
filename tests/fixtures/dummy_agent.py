@@ -3,6 +3,7 @@ import signal
 import subprocess
 import sys
 import time
+from pathlib import Path
 
 WINDOWS = os.name == "nt"
 
@@ -13,6 +14,11 @@ def note(line: str) -> None:
 
 
 def graceful(*_: object) -> None:
+    marker = Path(os.environ["DUMMY_LOG"]).with_name("dirty-on-stop")
+    if marker.exists():
+        Path(marker.read_text(encoding="utf-8")).write_text(
+            "unfinished", encoding="utf-8"
+        )
     note("graceful")
     sys.exit(0)
 
@@ -45,7 +51,9 @@ def main() -> None:
         note(f"grandchild {os.getpid()}")
         while True:
             time.sleep(1)
-    note(f"agent {os.environ['TJ_RUN_LAUNCH_ID']} {os.environ['AGENT_CLI_TAB_TITLE']} {os.getcwd()}")
+    note(
+        f"agent {os.environ['TJ_RUN_LAUNCH_ID']} {os.environ['AGENT_CLI_TAB_TITLE']} {os.getcwd()}"
+    )
     note(f"args {' '.join(sys.argv[2:])}")
     subprocess.Popen([sys.executable, __file__, "grandchild"])
     if mode == "exit":
@@ -53,7 +61,9 @@ def main() -> None:
         sys.exit(3)
     if mode == "keys":
         read_keys()
-    stops = [signal.SIGBREAK, signal.SIGINT] if WINDOWS else [signal.SIGINT, signal.SIGTERM]
+    stops = (
+        [signal.SIGBREAK, signal.SIGINT] if WINDOWS else [signal.SIGINT, signal.SIGTERM]
+    )
     for stop in stops:
         signal.signal(stop, graceful if mode == "signal" else signal.SIG_IGN)
     while True:

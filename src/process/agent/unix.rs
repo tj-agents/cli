@@ -97,15 +97,21 @@ fn adopted_children() -> Vec<libc::pid_t> {
     let Ok(entries) = std::fs::read_dir("/proc") else { return Vec::new() };
     entries
         .filter_map(|entry| entry.ok()?.file_name().to_str()?.parse::<libc::pid_t>().ok())
-        .filter(|pid| stat_fields(*pid).is_some_and(|fields| fields.get(1) == Some(&me)))
+        .filter(|pid| stat_fields(*pid).ok().flatten().is_some_and(|fields| fields.get(1) == Some(&me)))
         .collect()
 }
 
 /// `/proc/<pid>/stat` from the state field on: [state, ppid, pgrp, …, starttime at 19].
-fn stat_fields(pid: libc::pid_t) -> Option<Vec<String>> {
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    let rest = &stat[stat.rfind(')')? + 2..];
-    Some(rest.split_whitespace().map(str::to_owned).collect())
+fn stat_fields(pid: libc::pid_t) -> io::Result<Option<Vec<String>>> {
+    let stat = match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Ok(stat) => stat,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let offset = stat.rfind(')').ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid process stat"))?;
+    let rest =
+        stat.get(offset + 2..).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid process fields"))?;
+    Ok(Some(rest.split_whitespace().map(str::to_owned).collect()))
 }
 
 pub fn prepare_wrapper() -> io::Result<()> {
@@ -117,18 +123,23 @@ pub fn prepare_wrapper() -> io::Result<()> {
     }
 }
 
-pub fn started_at(pid: u32) -> Option<SystemTime> {
-    let fields = stat_fields(pid as libc::pid_t)?;
+pub fn started_at(pid: u32) -> io::Result<Option<SystemTime>> {
+    let pid = libc::pid_t::try_from(pid).map_err(io::Error::other)?;
+    let Some(fields) = stat_fields(pid)? else { return Ok(None) };
     if fields.first().is_some_and(|state| state == "Z") {
-        return None;
+        return Ok(None);
     }
-    let ticks: u64 = fields.get(19)?.parse().ok()?;
-    let boot: u64 = std::fs::read_to_string("/proc/stat")
-        .ok()?
+    let invalid = || io::Error::new(io::ErrorKind::InvalidData, "cannot read process creation time");
+    let ticks: u64 = fields.get(19).ok_or_else(invalid)?.parse().map_err(io::Error::other)?;
+    let boot: u64 = std::fs::read_to_string("/proc/stat")?
         .lines()
-        .find_map(|line| line.strip_prefix("btime ")?.trim().parse().ok())?;
-    let hertz = u64::try_from(unsafe { libc::sysconf(libc::_SC_CLK_TCK) }).ok().filter(|hertz| *hertz > 0)?;
-    Some(UNIX_EPOCH + Duration::from_secs(boot) + Duration::from_millis(ticks * 1000 / hertz))
+        .find_map(|line| line.strip_prefix("btime ")?.trim().parse().ok())
+        .ok_or_else(invalid)?;
+    let hertz = u64::try_from(unsafe { libc::sysconf(libc::_SC_CLK_TCK) })
+        .ok()
+        .filter(|hertz| *hertz > 0)
+        .ok_or_else(invalid)?;
+    Ok(Some(UNIX_EPOCH + Duration::from_secs(boot) + Duration::from_millis(ticks * 1000 / hertz)))
 }
 
 pub fn hidden(program: &str, _hook: &Path) -> Command {
