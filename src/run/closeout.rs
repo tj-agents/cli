@@ -8,6 +8,8 @@ use serde_json::Value;
 use super::{Launch, hidden, store};
 use crate::paths;
 
+mod journal;
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum Prs {
     AllMerged,
@@ -19,11 +21,18 @@ fn repository(launch: &Launch) -> Result<PathBuf> {
     if launch.cwd.is_dir() {
         return Ok(launch.cwd.clone());
     }
-    for path in store::ownership(launch)?.paths {
+    let owner = store::ownership(launch)?;
+    for path in owner.paths {
         if path.is_dir() {
             let common = git(&path, &["rev-parse", "--path-format=absolute", "--git-common-dir"])?;
             return Ok(Path::new(&common).parent().context("git common dir has no parent")?.to_path_buf());
         }
+    }
+    if let Some(saved) = journal::read(launch)? {
+        if saved.session != owner.session {
+            bail!("cleanup journal belongs to another session; recovery required");
+        }
+        return Ok(saved.repository);
     }
     bail!("launch directory is gone and no owned repository is available")
 }
@@ -52,7 +61,7 @@ pub fn prs(launch: &Launch) -> Result<Prs> {
     Ok(Prs::Pending)
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct Removal {
     primary: PathBuf,
     worktree: PathBuf,
@@ -193,6 +202,10 @@ fn preflight(path: &Path) -> Result<Removal> {
 pub fn owned_preflight(launch: &Launch) -> Result<Plan, String> {
     let prepare = || -> Result<Plan> {
         let owner = store::ownership(launch)?;
+        let saved = journal::read(launch)?;
+        if saved.as_ref().is_some_and(|saved| saved.session != owner.session) {
+            bail!("cleanup journal belongs to another session; recovery required");
+        }
         for path in [Some(&launch.cwd), owner.location.as_ref()].into_iter().flatten().filter(|path| path.exists()) {
             if let Some((root, _)) = linked(path)? {
                 let root = identity(&root)?;
@@ -202,7 +215,21 @@ pub fn owned_preflight(launch: &Launch) -> Result<Plan, String> {
             }
         }
         other_writers(&owner)?;
-        let removals = owner.paths.iter().map(|path| preflight(path)).collect::<Result<Vec<_>>>()?;
+        let removals = owner
+            .paths
+            .iter()
+            .map(|path| {
+                if path.try_exists()? {
+                    return preflight(path);
+                }
+                let removal = saved
+                    .as_ref()
+                    .and_then(|saved| saved.removals.iter().find(|removal| removal.worktree == *path))
+                    .context("missing owned root has no cleanup journal; recovery required")?;
+                removed(removal)?;
+                Ok(removal.clone())
+            })
+            .collect::<Result<Vec<_>>>()?;
         let repository = removals.first().map_or_else(|| repository(launch), |removal| Ok(removal.primary.clone()))?;
         Ok(Plan { owner, removals, repository })
     };
@@ -236,15 +263,25 @@ fn remove(removal: &Removal) -> Result<()> {
         std::fs::remove_dir(&removal.worktree)
             .with_context(|| format!("{} is still there: {last}", removal.worktree.display()))?;
     }
+    removed(removal)
+}
+
+fn removed(removal: &Removal) -> Result<()> {
+    if removal.worktree.try_exists()? {
+        bail!("worktree is still present: {}", removal.worktree.display());
+    }
     let listed = git(&removal.primary, &["worktree", "list", "--porcelain", "-z"])?;
     if listed
         .split('\0')
         .filter_map(|line| line.strip_prefix("worktree "))
         .any(|path| paths::norm(path) == paths::norm(&removal.registration.to_string_lossy()))
     {
-        bail!("worktree is still registered: {worktree}");
+        bail!("worktree is still registered: {}", removal.worktree.display());
     }
-    if !git(&removal.primary, &["branch", "--list", &removal.branch])?.is_empty() {
+    if git(&removal.primary, &["branch", "--format=%(refname)"])?
+        .lines()
+        .any(|branch| branch == format!("refs/heads/{}", removal.branch))
+    {
         bail!("worktree branch was retained: {}", removal.branch);
     }
     Ok(())
@@ -255,8 +292,13 @@ pub fn finish(launch: &Launch, plan: Plan) -> Result<()> {
     if rechecked.owner != plan.owner || rechecked.removals != plan.removals {
         bail!("worktree ownership or content changed while stopping the agent; recovery required");
     }
+    journal::write(launch, &plan)?;
     for removal in &plan.removals {
-        remove(removal)?;
+        if removal.worktree.try_exists()? {
+            remove(removal)?;
+        } else {
+            removed(removal)?;
+        }
         store::release(launch, &plan.owner, &removal.worktree)?;
     }
     if !store::ownership(launch)?.paths.is_empty() {
@@ -273,7 +315,8 @@ pub fn finish(launch: &Launch, plan: Plan) -> Result<()> {
             bail!("tj item progress {item}: {}", String::from_utf8_lossy(&output.stderr).trim());
         }
     }
-    store::end(&launch.id, "closed")
+    store::end(&launch.id, "closed")?;
+    journal::clear(launch)
 }
 
 fn wrapper_alive(row: &store::Row) -> Result<bool> {

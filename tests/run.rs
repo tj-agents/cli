@@ -35,6 +35,7 @@ fn stub(directory: &Path, name: &str, fallback: &str) {
         directory.join(format!("{name}.cmd")),
         format!(
             "@echo off\r\necho %*>>\"%~dp0{name}.log\"\r\n\
+             if exist \"%~dp0{name}-%1.failed\" exit /b 1\r\n\
              if exist \"%~dp0{name}-%1.json\" (type \"%~dp0{name}-%1.json\") else (echo {fallback})\r\n\
              if \"{name}\"==\"tj-prepare\" python \"%~dp0prepare.py\"\r\n"
         ),
@@ -48,6 +49,7 @@ fn stub(directory: &Path, name: &str, fallback: &str) {
             &path,
             format!(
                 "#!/bin/sh\nhere=\"$(dirname \"$0\")\"\necho \"$*\" >> \"$here/{name}.log\"\n\
+                 if [ -f \"$here/{name}-$1.failed\" ]; then exit 1; fi\n\
                  if [ -f \"$here/{name}-$1.json\" ]; then cat \"$here/{name}-$1.json\"; else echo '{fallback}'; fi\n\
                  if [ '{name}' = 'tj-prepare' ]; then exec python3 \"$here/prepare.py\"; fi\n"
             ),
@@ -945,6 +947,53 @@ fn release_failure_keeps_the_claim_and_never_marks_done() {
     assert!(!log(&sandbox, "stubs/tj-item.log").contains("--state Done"));
     assert!(!log(&sandbox, "stubs/agent-store.log").contains("--reason closed"));
     assert!(String::from_utf8_lossy(&output.stderr).contains("storage failed"));
+    assert!(sandbox.root.join("cache/run/failed-release.closeout.json").is_file());
+    std::fs::remove_file(sandbox.stubs.join("agent-store-release-worktree.json")).unwrap();
+    let output = retry_closeout(&sandbox, "failed-release");
+    assert_closed_out(&sandbox, &output, "failed-release");
+    assert!(!sandbox.root.join("cache/run/failed-release.closeout.json").exists());
+}
+
+fn retry_closeout(sandbox: &Sandbox, launch: &str) -> Output {
+    set_store_list(
+        &sandbox.stubs,
+        "launches",
+        serde_json::json!([{
+            "launch_id": launch, "host": "claude", "title": "Test tab",
+            "worktree": sandbox.worktree, "state": "ended", "end_reason": "exited",
+            "item": {"ref": ITEM},
+            "wrapper": {"pid": 0, "started_at": "2026-01-01T00:00:00Z"}
+        }]),
+    );
+    Command::new(env!("CARGO_BIN_EXE_tj"))
+        .arg("closeout")
+        .envs(environment(sandbox))
+        .current_dir(&sandbox.root)
+        .output()
+        .unwrap()
+}
+
+#[test]
+fn tracker_and_launch_finalization_failures_can_be_retried_after_all_releases() {
+    for stage in ["tracker", "end"] {
+        let sandbox = sandbox();
+        let failed = if stage == "tracker" { "tj-item-progress.failed" } else { "agent-store-end.json" };
+        set_reply(&sandbox, failed, r#"{"ok":false,"error":{"message":"finalization failed"}}"#);
+        let launch = format!("finalize-{stage}");
+        let child = start(&sandbox, &launch, "claude", "signal", "2");
+        set_reply(&sandbox, "tj-item-prs.json", r#"{"prs":[{"state":"merged"}],"all_merged":true}"#);
+        let output = finish(child, Duration::from_secs(60));
+        assert_eq!(output.status.code(), Some(1), "{}", String::from_utf8_lossy(&output.stderr));
+        assert!(!sandbox.worktree.exists());
+        assert!(sandbox.stubs.join("released.json").is_file());
+        let journal = sandbox.root.join("cache/run").join(format!("{launch}.closeout.json"));
+        assert!(journal.is_file());
+        std::fs::remove_file(sandbox.stubs.join(failed)).unwrap();
+        let output = retry_closeout(&sandbox, &launch);
+        assert_closed_out(&sandbox, &output, &launch);
+        assert!(!journal.exists());
+        assert_eq!(log(&sandbox, "stubs/agent-store.log").matches("release-worktree ").count(), 1);
+    }
 }
 
 #[test]
