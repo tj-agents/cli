@@ -209,20 +209,20 @@ the host defaults to the executable's name, the folder to the current one, the t
 worktree folder's name (suffixed `-2`, `-3`… while an open launch holds it) and the launch id to a random one.
 The executable must be the native `claude` or `codex`, not an npm `.cmd` shim.
 
-Before each start, `tj run` invokes Agent's `tj-prepare` with the host, working directory
-and host arguments. Agent reconciles the repository's selected plugins and its standards index before
-the host reads native instructions. Missing preparation or a preparation failure prints a warning and
-the session still starts. Install Agent to provide `tj-prepare`.
+In a repository whose `.agents/plugins.json` selects a `@tj-agents` plugin, `tj run` invokes Agent's
+`tj-prepare` before each start with the host, working directory and host arguments. Agent reconciles the
+repository's selected plugins and its standards index before the host reads native instructions. Missing
+preparation or a preparation failure prints a warning and the session still starts. Install Agent to provide
+`tj-prepare`.
 
-A launch in a repository whose `.agents/plugins.json` selects a `@tj-agents` plugin also checks, once and
-alongside `tj-prepare`, whether `tj-agents/marketplace` moved past the commit this host last converged to: one
-conditional `GET` of its `main` commit with `If-None-Match` set to the first line of `<cache>/published/<host>`,
-with a 1 s timeout. At most one launch per host checks a minute (`<cache>/update/<host>.lock` and
-`<host>.checked`), within GitHub's 60 unauthenticated requests an hour. A `304` costs nothing more. A `200`
-starts `tj-plugins update --host H` in the background, logging to `<cache>/update/<host>.log`, and the launch goes
-on; it publishes when done, and the update reaches open tabs as below. One commit is installed at most once
-every 10 minutes, so a failed install, which publishes nothing, is retried by a later launch. Any other answer
-or no answer prints one line and the launch goes on.
+Such a launch also checks, once and alongside `tj-prepare`, whether `tj-agents/marketplace` moved past the
+commit this host last converged to: one conditional `GET` of its `main` commit with `If-None-Match` set to the
+first line of `<cache>/published/<host>`, with a 1 s timeout. At most one launch per host checks a minute
+(`<cache>/update/<host>.lock` and `<host>.checked`), within GitHub's 60 unauthenticated requests an hour. A
+`304` costs nothing more. A `200` starts `tj-plugins update --host H` in the background, logging to
+`<cache>/update/<host>.log`, and the launch goes on; it publishes when done, and the update reaches open tabs
+as below. One commit is installed at most once every 10 minutes, so a failed install, which publishes nothing,
+is retried by a later launch. Any other answer or no answer prints one line and the launch goes on.
 
 Only the tab's own agent speaks for it. `tj done` acts only when
 the caller descends from the wrapper through its agent, with no second copy of that agent in between; a tab,
