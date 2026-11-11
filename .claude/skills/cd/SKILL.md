@@ -1,6 +1,6 @@
 ---
 name: cd
-description: Navigate the current task into a nested directory, repository or linked worktree while preserving its conversation and owner. Use when work moves to another directory, including after creating, cloning, locating or selecting it, or when releasing a directory for removal.
+description: Use when navigating this task to another directory or checkout, or releasing a directory, while preserving its conversation and owner.
 kind: utility
 domain: cli
 route: infer
