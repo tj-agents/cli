@@ -1,3 +1,4 @@
+mod app_server;
 mod bridge;
 mod cr;
 mod external;
@@ -34,10 +35,13 @@ enum Command {
     Run(run::Args),
     /// Mark this tab's work done; `tj run` closes it out after an idle grace
     Done(run::DoneArgs),
-    /// Ask `tj run` to restart this tab's agent once it is idle, resuming the same conversation
-    Restart(run::restart::Args),
-    /// Mark this tab's agent idle between turns (run by its Stop hook); a no-op outside `tj run`
-    Idle(run::restart::IdleArgs),
+    /// Publish an installed plugin revision; every tab under `tj run` reloads it in place once idle
+    Reload(run::reload::Args),
+    /// Update plugins and tj, then apply the update to this tab's agent now, in place
+    Refresh,
+    /// Prints the `tj run` launch this process belongs to, if any (run by the agent's SessionStart hook)
+    #[command(hide = true)]
+    Launch,
     /// Close out a work item's sessions, or sweep launches whose tab is gone
     Closeout(run::closeout::Args),
     /// Send a message to another Claude or Codex session, addressed by its tab title
@@ -63,8 +67,9 @@ fn main() -> ExitCode {
         Command::Init(args) => init::run(args),
         Command::Run(args) => run::run(args),
         Command::Done(args) => run::done(args),
-        Command::Restart(args) => run::restart::run(args),
-        Command::Idle(args) => run::restart::idle(args),
+        Command::Reload(args) => run::reload::publish(args),
+        Command::Refresh => run::reload::refresh(),
+        Command::Launch => Ok(run::reload::launch()),
         Command::Closeout(args) => run::closeout::run(args),
         Command::Message(args) => message::run(args),
         Command::Subscribe(args) => subscribe::run(args),
