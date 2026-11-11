@@ -14,7 +14,6 @@ use tj_cli::process::agent::{self, Agent, Stop};
 
 use crate::host::Host;
 use crate::paths;
-use closeout::Prs;
 
 impl Host {
     /// Claude exits cleanly on a console break or SIGINT; Codex has no handler and only quits on the key.
@@ -234,7 +233,6 @@ fn end_not_started(launch: &Launch, prebound: &PreboundSession, wrapper_pid: u32
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Trigger {
-    Merged,
     Done,
     Closing,
 }
@@ -247,6 +245,7 @@ struct Watch {
     idle: Duration,
     next_poll: Instant,
     reported: HashSet<String>,
+    asked: bool,
 }
 
 impl Watch {
@@ -257,38 +256,49 @@ impl Watch {
         }
     }
 
-    fn trigger(&mut self) -> Option<Trigger> {
-        let idle = self
-            .marks
+    fn done(&self) -> bool {
+        self.marks
             .join("done")
             .metadata()
             .and_then(|meta| meta.modified())
             .ok()
-            .and_then(|marked| SystemTime::now().duration_since(marked).ok());
-        if idle.is_some_and(|idle| idle >= self.idle) {
+            .and_then(|marked| SystemTime::now().duration_since(marked).ok())
+            .is_some_and(|idle| idle >= self.idle)
+    }
+
+    fn closing(&mut self) -> bool {
+        store::closing(&self.launch.id).unwrap_or_else(|error| {
+            self.report(format!("{error:#}"));
+            false
+        })
+    }
+
+    fn delivered(&mut self) -> bool {
+        closeout::delivered(&self.launch).unwrap_or_else(|error| {
+            self.report(format!("{error:#}"));
+            false
+        })
+    }
+
+    fn trigger(&mut self) -> Option<Trigger> {
+        if self.done() {
             return Some(Trigger::Done);
         }
         if Instant::now() < self.next_poll {
             return None;
         }
         self.next_poll = Instant::now() + self.poll;
-        match store::closing(&self.launch.id) {
-            Ok(true) => return Some(Trigger::Closing),
-            Ok(false) => {}
-            Err(error) => self.report(format!("{error:#}")),
+        if self.closing() {
+            return Some(Trigger::Closing);
         }
-        match closeout::prs(&self.launch) {
-            Ok(Prs::AllMerged) => Some(Trigger::Merged),
-            Ok(Prs::ClosedUnmerged(urls)) => {
-                self.report(format!("closed without merging, staying open: {}", urls.join(" ")));
-                None
-            }
-            Ok(Prs::Pending) => None,
-            Err(error) => {
-                self.report(format!("{error:#}"));
-                None
+        if !self.asked && self.delivered() {
+            let item = self.launch.item.clone().unwrap_or_default();
+            match closeout::ask(&self.launch, &item) {
+                Ok(()) => self.asked = true,
+                Err(error) => self.report(format!("could not ask the agent to close out: {error:#}")),
             }
         }
+        None
     }
 }
 
@@ -398,6 +408,7 @@ pub fn run(args: Args) -> Result<ExitCode> {
         idle: Duration::from_secs(args.idle_seconds),
         next_poll: Instant::now() + poll,
         reported: HashSet::new(),
+        asked: false,
     };
     let mut resumed = false;
     let removal = loop {
@@ -407,8 +418,7 @@ pub fn run(args: Args) -> Result<ExitCode> {
                 eprintln!("\r\ntj run: the resumed agent exited with code {code}\r");
                 wait_for_enter();
             }
-            watch.next_poll = Instant::now();
-            let closing = watch.trigger().is_some();
+            let closing = watch.done() || watch.closing() || watch.delivered();
             let _ = std::fs::remove_dir_all(&watch.marks);
             if closing {
                 let result = closeout::owned_preflight(&watch.launch)
