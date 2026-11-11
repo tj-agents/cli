@@ -214,13 +214,23 @@ and host arguments. Agent reconciles the repository's selected plugins and its s
 the host reads native instructions. Missing preparation or a preparation failure prints a warning and
 the session still starts. Install Agent to provide `tj-prepare`.
 
+A launch in a repository whose `.agents/plugins.json` selects a `@tj-agents` plugin also checks, once and
+alongside `tj-prepare`, whether `tj-agents/marketplace` moved past the commit this host last converged to: one
+conditional `GET` of its `main` commit with `If-None-Match` set to the first line of `<cache>/published/<host>`,
+with a 1 s timeout. At most one launch per host checks a minute (`<cache>/update/<host>.lock` and
+`<host>.checked`), within GitHub's 60 unauthenticated requests an hour. A `304` costs nothing more. A `200`
+starts `tj-plugins update --host H` in the background, logging to `<cache>/update/<host>.log`, and the launch goes
+on; it publishes when done, and the update reaches open tabs as below. One commit is installed at most once
+every 10 minutes, so a failed install, which publishes nothing, is retried by a later launch. Any other answer
+or no answer prints one line and the launch goes on.
+
 Only the tab's own agent speaks for it. `tj done` acts only when
 the caller descends from the wrapper through its agent, with no second copy of that agent in between; a tab,
 shell or agent started from inside the session inherits `TJ_RUN_*` but is ignored. `tj launch` prints the
 launch the caller belongs to, for Agent's `SessionStart` binding.
 
 Running tabs apply updates by themselves. Agent's `tj plugins update` ends with a hidden
-`tj update --host H --revision R`, which replaces `<cache>/published/<host>`; every wrapper of that host checks
+`tj update --host H --revision <marketplace commit>`, which replaces `<cache>/published/<host>`; every wrapper of that host checks
 it and its own executable on each half-second poll and applies each publish once, in place:
 
 - Claude: once Claude's own record for the agent process, `<claude home>/sessions/<pid>.json`, has said
@@ -303,7 +313,7 @@ the subscription expired. A Claude child reports to a Codex parent with `tj mess
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `TJ_F_ROOT` | `~/projects`, then `~/source/repos` | where `f` searches |
-| `TJ_CACHE_DIR` | OS cache folder + `/tj` | where `cr` keeps its index, `tj done` its marks, `tj update` the published updates and each Claude relay its endpoint |
+| `TJ_CACHE_DIR` | OS cache folder + `/tj` | where `cr` keeps its index, `tj done` its marks, `tj update` the published updates, `tj run` its update check and each Claude relay its endpoint |
 | `TJ_BIN_DIR` | `~/.local/bin` / `%LOCALAPPDATA%\Programs\tj` | where the installer puts `tj` and `tj_hook` |
 | `CLAUDE_CONFIG_DIR` | `~/.claude` | Claude Code's config folder, as Claude Code itself reads it |
 | `CODEX_HOME` | `~/.codex` | Codex's config folder, as Codex itself reads it |

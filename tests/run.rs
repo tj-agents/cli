@@ -1163,3 +1163,139 @@ fn an_unclaimed_linked_worktree_requires_recovery_before_closing() {
     assert_closed_out(&sandbox, &output, "unclaimed");
     assert!(String::from_utf8_lossy(&output.stderr).contains("no recorded ownership; recovery required"));
 }
+
+const MARKETPLACE_SHA: &str = "3f0578aa4000485aa25477e36592978fa5fa750f";
+const UPSTREAM_SHA: &str = "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678";
+
+struct Upstream {
+    url: String,
+    requests: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+impl Upstream {
+    /// Answers every request with `reply`, or holds the connection open without answering when it is empty.
+    fn serve(reply: String) -> Self {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/repos/tj-agents/marketplace/commits/main", listener.local_addr().unwrap());
+        let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = requests.clone();
+        std::thread::spawn(move || {
+            for mut stream in listener.incoming().map_while(Result::ok) {
+                let mut request = Vec::new();
+                let mut byte = [0u8; 1];
+                while !request.ends_with(b"\r\n\r\n") && stream.read(&mut byte).is_ok_and(|read| read == 1) {
+                    request.push(byte[0]);
+                }
+                seen.lock().unwrap().push(String::from_utf8_lossy(&request).to_lowercase());
+                if reply.is_empty() {
+                    std::thread::sleep(Duration::from_secs(120));
+                } else {
+                    let _ = stream.write_all(reply.as_bytes());
+                }
+            }
+        });
+        Self { url, requests }
+    }
+
+    fn unchanged() -> Self {
+        Self::serve("HTTP/1.1 304 Not Modified\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_owned())
+    }
+
+    fn changed() -> Self {
+        Self::serve(format!("HTTP/1.1 200 OK\r\nContent-Length: 40\r\nConnection: close\r\n\r\n{UPSTREAM_SHA}"))
+    }
+
+    fn requests(&self) -> Vec<String> {
+        self.requests.lock().unwrap().clone()
+    }
+}
+
+fn select_tj_agents(sandbox: &Sandbox) {
+    let folder = sandbox.worktree.join(".agents");
+    std::fs::create_dir_all(&folder).unwrap();
+    std::fs::write(folder.join("plugins.json"), r#"{"plugins":["agent@tj-agents"]}"#).unwrap();
+}
+
+fn launch_checking(sandbox: &Sandbox, upstream: &Upstream, launch: &str) -> (Output, Duration) {
+    let mut arguments = run_arguments(sandbox, launch, "claude", "exit", "10");
+    let separator = arguments.iter().position(|argument| argument == "--").unwrap();
+    arguments.splice(separator..separator, ["--update-url".to_owned(), upstream.url.clone()]);
+    let started = Instant::now();
+    let child = spawn(sandbox, &arguments, &sandbox.root);
+    wait_for_log(sandbox, &format!("agent {launch}"));
+    let reached = started.elapsed();
+    (finish(child, Duration::from_secs(60)), reached)
+}
+
+fn update_state(sandbox: &Sandbox, file: &str) -> PathBuf {
+    sandbox.root.join("cache").join("update").join(file)
+}
+
+#[test]
+fn an_unchanged_marketplace_costs_one_conditional_request_a_minute_and_installs_nothing() {
+    let sandbox = sandbox();
+    select_tj_agents(&sandbox);
+    publish(&sandbox, "claude", MARKETPLACE_SHA);
+    let upstream = Upstream::unchanged();
+    let (output, _) = launch_checking(&sandbox, &upstream, "unchanged");
+    assert!(
+        !String::from_utf8_lossy(&output.stderr).contains("tj-agents"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let requests = upstream.requests();
+    assert_eq!(requests.len(), 1);
+    assert!(requests[0].contains(&format!("if-none-match: \"{MARKETPLACE_SHA}\"")), "{}", requests[0]);
+    assert!(requests[0].contains("accept: application/vnd.github.sha"), "{}", requests[0]);
+    launch_checking(&sandbox, &upstream, "again");
+    assert_eq!(upstream.requests().len(), 1, "checked again within a minute");
+    assert_eq!(log(&sandbox, "stubs/tj-plugins.log"), "");
+}
+
+#[test]
+fn a_changed_marketplace_installs_in_the_background_once_per_commit() {
+    let sandbox = sandbox();
+    select_tj_agents(&sandbox);
+    stub(&sandbox.stubs, "tj-plugins", "updated");
+    let upstream = Upstream::changed();
+    let (output, _) = launch_checking(&sandbox, &upstream, "changed");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("updating claude plugins in the background"), "{stderr}");
+    wait_until("tj-plugins never ran", || log(&sandbox, "stubs/tj-plugins.log").contains("update --host claude"));
+    assert!(!upstream.requests()[0].contains("if-none-match"), "{}", upstream.requests()[0]);
+    std::fs::remove_file(update_state(&sandbox, "claude.checked")).unwrap();
+    launch_checking(&sandbox, &upstream, "retry");
+    assert_eq!(upstream.requests().len(), 2);
+    assert_eq!(log(&sandbox, "stubs/tj-plugins.log").lines().count(), 1, "installed the same commit twice");
+}
+
+#[test]
+fn an_unanswered_check_gives_one_line_and_never_holds_the_launch() {
+    let sandbox = sandbox();
+    select_tj_agents(&sandbox);
+    let upstream = Upstream::serve(String::new());
+    let (output, reached) = launch_checking(&sandbox, &upstream, "offline");
+    assert!(
+        reached < Duration::from_secs(60),
+        "the agent waited {reached:?} for GitHub: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(stderr.matches("could not check for tj-agents updates").count(), 1, "{stderr}");
+    assert!(update_state(&sandbox, "claude.checked").exists(), "a failed check is retried at once");
+}
+
+#[test]
+fn a_held_lock_or_a_project_without_tj_agents_makes_no_request() {
+    let sandbox = sandbox();
+    select_tj_agents(&sandbox);
+    let upstream = Upstream::unchanged();
+    std::fs::create_dir_all(update_state(&sandbox, "")).unwrap();
+    std::fs::write(update_state(&sandbox, "claude.lock"), "").unwrap();
+    launch_checking(&sandbox, &upstream, "locked");
+    assert_eq!(upstream.requests().len(), 0, "checked while another launch held the lock");
+    std::fs::remove_file(update_state(&sandbox, "claude.lock")).unwrap();
+    std::fs::write(sandbox.worktree.join(".agents").join("plugins.json"), r#"{"plugins":["agent@agents"]}"#).unwrap();
+    launch_checking(&sandbox, &upstream, "unselected");
+    assert_eq!(upstream.requests().len(), 0, "checked a project that selects no tj-agents plugins");
+}
