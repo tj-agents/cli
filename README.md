@@ -1,12 +1,15 @@
 # tj
 
-Fast shell tools for agentic programming, on Windows and Linux. `tj` provides two everyday commands, plus
-`tj run`, the root process of every agent tab:
+Fast shell tools for agentic programming, on Windows and Linux. `tj` is the deterministic OS and terminal
+mechanics layer of [tj-agents](https://github.com/tj-agents): judgement lives in skills, `tj` does the
+parts the hosts themselves don't cover, with the same behaviour from Claude Code and Codex. `tj` provides
+two everyday commands, plus `tj run`, the root process of every agent tab:
 
 | Command | What it does |
 | --- | --- |
 | `cr` | Search your Claude Code or Codex sessions by **anything said in them**, preview how each one ended, and press Enter to resume it in the folder it was started from. |
 | `f` | Fuzzy-jump to a project folder. `f core` goes straight to the best match; plain `f` opens a picker. |
+| `cd` / `cdi` | Use [zoxide](https://github.com/ajeetdsouza/zoxide) to jump to a previously visited directory by name, or choose one interactively with `cdi`. |
 | `run` | Run an agent in its tab and close its work item out once it is finished: agent stopped, worktree removed, card Done, tab closed. |
 | `message` | Send another Claude or Codex session a message, addressed by its tab title, with the same behaviour from either host. |
 
@@ -27,7 +30,7 @@ updates so the console-to-tab association can be verified.
 
 ## Install
 
-You need Python 3.12 or newer, [fzf](https://github.com/junegunn/fzf) 0.54 or newer, and either a Rust
+You need Python 3.12 or newer, [zoxide](https://github.com/ajeetdsouza/zoxide), and either a Rust
 toolchain (to build from this checkout) or the [GitHub CLI](https://cli.github.com) (to download a verified
 prebuilt release).
 
@@ -52,16 +55,9 @@ for everything else, so re-running it after a `git pull` is how you upgrade. It:
 
 1. builds `tj` and `tj_hook` (or downloads the latest verified release) and puts them in `~/.local/bin` on Linux or
    `%LOCALAPPDATA%\Programs\tj` on Windows, adding that folder to your user PATH on Windows;
-2. checks for fzf. On Windows it installs fzf with winget if it's missing; on Linux it tells you
-   the package to install;
-3. installs [Handy](https://github.com/cjpais/Handy) for voice dictation on desktop machines:
-   Windows uses winget; Linux desktops use a SHA-256-verified upstream package through APT or DNF,
-   with GitHub CLI and sudo required for a non-root installation. Other Linux distributions need Handy
-   installed with `handy` on PATH before setup. CI and Linux sessions without a display report this step
-   as not applicable; for SSH or WSL terminal use, run setup on the desktop host;
-4. installs [worktrunk](https://github.com/max-sixty/worktrunk) 0.81.0 as `git-wt` next to `tj`, from a
-   SHA-256-pinned release archive. `tj run` removes worktrees with it;
-5. adds one marked block to each shell startup file it finds (bash, zsh, fish, PowerShell):
+2. checks for zoxide. On Windows it installs it with winget when missing; on Linux it tells you
+   the package to install (`pkexec pacman -S --needed zoxide` on Arch);
+3. adds one marked block to each shell startup file it finds (bash, zsh, fish, PowerShell):
 
    ```bash
    # >>> tj-agents/cli >>>
@@ -69,17 +65,57 @@ for everything else, so re-running it after a `git pull` is how you upgrade. It:
    # <<< tj-agents/cli <<<
    ```
 
+`tj init` owns zoxide initialization for Bash, Zsh, Fish and PowerShell, using `--cmd cd`.
+Keep only the tj-agents block in your shell profile; remove separate `zoxide init` lines.
+Normal `cd path` still works; after visiting a directory, `cd name` can find it from elsewhere and
+`cdi name` opens an interactive picker. `f` searches the projects tree, including directories you have
+never visited. Uninstall removes the CLI wiring and binaries, leaving zoxide and its history installed.
+
 | | Linux | Windows |
 | --- | --- | --- |
 | Check what's set up, change nothing | `linux/install.sh --check` | `windows\install.ps1 -Check` |
 | Remove CLI binaries and shell wiring | `linux/install.sh --uninstall` | `windows\install.ps1 -Uninstall` |
 
+[fzf](https://github.com/junegunn/fzf) 0.75.0,
+[worktrunk](https://github.com/max-sixty/worktrunk) 0.81.0, installed as `git-wt` next to `tj` for `tj run` to
+remove worktrees with, and [Handy](https://github.com/cjpais/Handy) are installed and kept current by
+[Agent](https://github.com/tj-agents/agent#install)'s install and refresh, through `tj_cli.fzf_install`,
+`tj_cli.worktrunk_install` and `tj_cli.handy_install` at the `tj-cli` revision Agent pins.
+The CLI shell installers own native binaries, shell wiring and zoxide. Agent owns the additional tools listed above.
+
+The managed installers below each write a JSON receipt in the tj bin directory. The shared format records `schema: 1`,
+`version`, `hashes` (installed file path to SHA-256), `identity` and `archive_digest`. Native receipts also
+record the immutable source revision; Handy records its absolute desktop application path.
+Unreceipted or changed installations need installation again. The `pending` functions return a reason
+string for drift, or `None` when current, using files only:
+
+| API | Receipt under the tj bin directory |
+| --- | --- |
+| `tj_cli.fzf_install.pending(bin_dir: Path) -> str \| None` | `.tj-fzf.json` |
+| `tj_cli.worktrunk_install.pending(bin_dir: Path) -> str \| None` | `.tj-worktrunk.json` |
+| `tj_cli.handy_install.pending(bin_dir: Path) -> str \| None` | `.tj-handy.json` |
+| `tj_cli.native_install.pending(bin_dir: Path, *, revision: str \| None = None) -> str \| None` | `.tj-native.json` |
+
+The installers' `--bin-dir` defaults to `TJ_BIN_DIR`, otherwise
+`~/.local/bin` on Linux or `%LOCALAPPDATA%\Programs\tj` on Windows. Pass Agent's pinned CLI revision
+to native `pending` to check revision drift too.
+The existing native `pending_native` checks runtime compatibility by invoking `tj_hook`; refresh stale
+checks should use `pending`. Agent's receipt watch registration is a separate integration change.
+
 ### Voice dictation in Claude and Codex
 
-Handy is a desktop prerequisite provisioned by the existing installer. A clone alone does not install
-software. Setup checks for Handy on each run, installs it only when missing, and fails if installation
-fails. Check mode reports a missing application without installing or downloading anything. CLI uninstall
-preserves Handy and its models, as it preserves the shared fzf prerequisite.
+Handy is a desktop prerequisite provisioned by Agent's install and refresh. They check for Handy on each
+run, install or upgrade it to the pinned 0.10.0 when its receipt is missing or stale, and fail if installation
+fails: Windows uses winget; Linux desktops use a
+SHA-256-verified upstream package through APT or DNF, with GitHub CLI and sudo required for a non-root
+installation. Automatic Linux setup requires one of those package managers. CI and Linux sessions
+without a display report the step as not applicable; for SSH or WSL terminal use, install on the desktop
+host. Install `--check` reports a missing or stale installation without installing or downloading anything.
+`python -m tj_cli.handy_install --no-escalate` never calls sudo or starts a Windows installation that
+could prompt for elevation. A required privileged Linux installation or Windows desktop setup fails
+with one line; an intact current installation remains a no-op. The installer entry point decides whether
+Handy applies to its environment. Handy's `pending(bin_dir)` always checks the supplied directory;
+callers decide whether to skip the desktop prerequisite in CI or headless sessions.
 
 Open Handy once, download a speech model, select your microphone and hold-to-talk shortcut, and enable
 launch at login in Handy's settings. Use `Shift+Insert` as the paste method for Windows terminals, or the
@@ -150,9 +186,11 @@ differ, so only those are split into `linux/` and `windows/`.
 ## `tj run`: the agent tab's root process
 
 ```text
-tj run --host claude|codex --title T --cwd WORKTREE --launch-id U [--item REF] [--parent HOST:ID] -- <agent argv>
+tj run [--host claude|codex] [--title T] [--cwd WORKTREE] [--launch-id U] [--item REF] [--parent HOST:ID] -- <agent argv>
 tj done              last step of work with no PR: close out after about 10 idle minutes
-tj done --cancel     new input arrived; withdraw that (a no-op outside tj run)
+tj done --cancel     new input arrived; withdraw that and the idle mark (a no-op outside tj run)
+tj idle --background N|unknown   the turn ended with N background tasks in flight (a no-op outside tj run)
+tj restart [--reason R]  restart this tab's agent in place once it is idle, resuming the same conversation
 tj closeout [REF]    close an item's sessions; with no REF, sweep tabs closed by hand or crashed wrappers
 ```
 
@@ -161,6 +199,29 @@ opens one. It starts the agent as its child: in a Job Object on Windows, or in i
 group on Linux, where the agent also dies with the wrapper. It registers the launch with `agent-store
 launch` and exports `TJ_RUN_PID`, `TJ_RUN_STARTED_AT`, `TJ_RUN_LAUNCH_ID` and `AGENT_CLI_TAB_TITLE` to the agent.
 
+Only the agent's command line is required, so a shell function can run a typed `claude` or `codex` under it:
+the host defaults to the executable's name, the folder to the current one, the title to the repository or
+worktree folder's name (suffixed `-2`, `-3`… while an open launch holds it) and the launch id to a random one.
+The executable must be the native `claude` or `codex`, not an npm `.cmd` shim.
+
+Before each start or restart, `tj run` invokes Agent's `tj-prepare` with the host, working directory
+and host arguments. Agent reconciles the repository's selected plugins and its standards index before
+the host reads native instructions. Missing preparation or a preparation failure prints a warning and
+the session still starts. Install Agent to provide `tj-prepare`.
+
+`tj restart`, run inside the session (Agent's stale-plugin hook does), asks the wrapper to restart the agent
+so it loads the plugins installed since it started. The agent is idle from its `Stop` hook's `tj idle` until
+the next prompt's `tj done --cancel`, so a permission prompt or question, which comes before `Stop`, is never
+idle. The wrapper restarts only once the idle mark is 30 s old and reports no background work: background
+shells, subagents, watches or timers, or `unknown`, leave the request pending, and the next session start
+loads the new plugins anyway. A prompt typed but not sent within those 30 s is lost. It stops the agent the
+way closeout does, and starts it again in the same tab with the same environment as `claude --resume <id>`
+or `codex resume <id>`, keeping the original options and dropping the prompt and any earlier session choice. The id is the session `agent-store show
+--launch-id` binds to the launch; the launch row is kept, and the resumed session re-registers against it.
+With no bound session the agent keeps running and the wrapper says so once. A resume that fails to start, or
+exits with an error, leaves the tab open with the reason. `tj restart` fails outside `tj run`, and for a
+`--reason` this tab already restarted for, so a restart that did not help is not repeated.
+
 It closes out when any of these happens:
 
 - every PR for the item has merged, according to `tj item prs` (checked every two minutes). A PR that closed
@@ -168,20 +229,19 @@ It closes out when any of these happens:
 - `tj done` was run and no new input has cancelled it for about 10 minutes;
 - `agent-store` marks the launch or its session `closing`, which is what `tj closeout REF` does.
 
-Before stopping anything, it proves that closeout loses nothing: the worktree must be clean, it must have no
-commits off the default branch unless the PRs merged, and worktrunk's `pre-remove` hooks must pass. If any of
-these fails, the session stays open and the wrapper prints the reason. Closeout then:
+Before stopping anything, it checks every linked worktree recorded for the exact launch and native session, including roots created after launch and in other repositories. Each root must be registered, clean and integrated into its freshly fetched default branch; a merged item PR alone cannot authorize deletion. Worktrunk supplies the content checks for squash and rebase merges. Another session with live or unknown process ownership keeps the worktree open.
+
+After stopping its own agent process tree, the wrapper repeats those checks and refuses changed ownership or content. Each worktree and branch must disappear before its ownership record is released. The item becomes Done and the launch closes only after all owned roots are removed. Primary checkouts remain. A missing or unrecorded ownership root requires recovery; cleanup never guesses ownership from a neighbouring folder or adopts legacy location metadata.
 
 1. asks the agent to exit: a console break or SIGINT for Claude, a Ctrl+C keypress for Codex (through
    `tmux send-keys` on Linux);
 2. kills what is left after 10 s and waits until no process of the tree remains;
-3. runs `git-wt remove --foreground`, but only on a linked worktree, never a primary checkout;
+3. runs `git-wt remove --foreground` for each owned linked worktree;
 4. runs `tj item progress REF --state Done` and `agent-store end`;
 5. exits 0, so Windows Terminal (`closeOnExit` default) or tmux closes the tab.
 
 Helpers run hidden through `tj_hook` on Windows, and in their own session on Linux, so they never touch the
-agent's console. If the agent exits by itself, the wrapper ends the launch, keeps the worktree and exits
-with the agent's code.
+agent's console. If the agent exits by itself, the wrapper checks delivery once more and cleans up when a closeout trigger is ready. Otherwise it ends the launch and keeps the unfinished worktrees. It preserves the agent's exit code. `tj closeout` also inspects ended launches whose cleanup has not completed.
 
 ## `tj message` and `tj subscribe`: messaging between sessions
 
@@ -218,7 +278,7 @@ the subscription expired. A Claude child reports to a Codex parent with `tj mess
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `TJ_F_ROOT` | `~/projects`, then `~/source/repos` | where `f` searches |
-| `TJ_CACHE_DIR` | OS cache folder + `/tj` | where `cr` keeps its index, `tj done` its marks and each Claude relay its endpoint |
+| `TJ_CACHE_DIR` | OS cache folder + `/tj` | where `cr` keeps its index, `tj done`, `tj idle` and `tj restart` their marks and each Claude relay its endpoint |
 | `TJ_BIN_DIR` | `~/.local/bin` / `%LOCALAPPDATA%\Programs\tj` | where the installer puts `tj` and `tj_hook` |
 | `CLAUDE_CONFIG_DIR` | `~/.claude` | Claude Code's config folder, as Claude Code itself reads it |
 | `CODEX_HOME` | `~/.codex` | Codex's config folder, as Codex itself reads it |
@@ -280,9 +340,7 @@ subprocess checks must enforce the shared path.
 
 The repository also owns the `tj-cli` Python distribution under `packages/tj-cli/`.
 Its regular package groups reusable mechanics by capability. `tj_cli.paths` exposes literal executable-search
-PATH operations; `tj_cli.processes` holds exact process identities; `tj_cli.close` and `tj_cli.closeout` expose
-explicit terminal and worktree operations for Agent. Agent supplies its lifecycle guards to `close` and
-`closeout`, which run them immediately before terminal and worktree mutation. Agent and Personal consume the
+PATH operations; `tj_cli.processes` holds exact process identities. Agent and Personal consume the
 public API:
 
 ```python
@@ -322,7 +380,7 @@ run changes anything. A successful current `main` commit automatically publishes
 | `src/bin/tj_hook.rs` | the windowless executable entry point |
 | `src/process.rs` and `src/process/` | native command execution and Windows process containment |
 | `packages/tj-cli/src/tj_cli/process/` | the Python API for the native launcher |
-| `src/run/` | `tj run`, `tj done` and `tj closeout` |
+| `src/run/` | `tj run`, `tj done`, `tj idle`, `tj restart` and `tj closeout` |
 | `src/message.rs`, `src/bridge.rs`, `src/subscribe.rs` | `tj message`, the Claude session relay and `tj subscribe` |
 | `src/process/agent.rs` and `src/process/agent/` | the agent's job or process group, per-host stop, tree kill |
 | `src/f.rs` | folder walk, match scoring, picker |

@@ -8,11 +8,10 @@ use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 use tj_cli::process::agent;
 
-use crate::paths;
+use crate::{host::Host, paths};
 
 const SOCKET: &str = "CLAUDE_CODE_MESSAGING_SOCKET";
 const TOKEN: &str = "CLAUDE_CODE_MESSAGING_TOKEN";
-const SESSION: &str = "CLAUDE_CODE_SESSION_ID";
 
 fn env(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|value| !value.is_empty())
@@ -66,7 +65,7 @@ pub fn post(session: &str, text: &str) -> Result<()> {
 }
 
 pub fn run() -> Result<ExitCode> {
-    if [SOCKET, TOKEN, SESSION].iter().any(|name| env(name).is_none()) {
+    if [SOCKET, TOKEN].iter().any(|name| env(name).is_none()) || Host::Claude.session_id().is_none() {
         return Ok(ExitCode::SUCCESS);
     }
     serve()
@@ -99,17 +98,17 @@ fn owned_by_me(path: &PathBuf) -> bool {
 }
 
 fn serve() -> Result<ExitCode> {
-    let session = env(SESSION).with_context(|| format!("{SESSION} is not set"))?;
+    let session = Host::Claude.session_id().context("CLAUDE_CODE_SESSION_ID is not set")?;
     let path = endpoint(&session)?;
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
     let secret = secret()?;
     let record = json!({"port": listener.local_addr()?.port(), "secret": secret, "pid": std::process::id()});
     write_private(&path, &record.to_string())?;
     if let Some(pid) = env("CLAUDE_PID").and_then(|pid| pid.parse::<u32>().ok()) {
-        let born = agent::started_at(pid);
+        let born = agent::started_at(pid)?.context("Claude parent process is gone")?;
         let path = path.clone();
         std::thread::spawn(move || {
-            while agent::started_at(pid) == born {
+            while agent::started_at(pid).is_ok_and(|started| started == Some(born)) {
                 std::thread::sleep(Duration::from_secs(5));
             }
             if owned_by_me(&path) {
