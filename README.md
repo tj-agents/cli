@@ -204,6 +204,11 @@ the host defaults to the executable's name, the folder to the current one, the t
 worktree folder's name (suffixed `-2`, `-3`… while an open launch holds it) and the launch id to a random one.
 The executable must be the native `claude` or `codex`, not an npm `.cmd` shim.
 
+Before each start or restart, `tj run` invokes Agent's `tj-prepare` with the host, working directory
+and host arguments. Agent reconciles the repository's selected plugins and its standards index before
+the host reads native instructions. Missing preparation or a preparation failure prints a warning and
+the session still starts. Install Agent to provide `tj-prepare`.
+
 `tj restart`, run inside the session (Agent's stale-plugin hook does), asks the wrapper to restart the agent
 so it loads the plugins installed since it started. The agent is idle from its `Stop` hook's `tj idle` until
 the next prompt's `tj done --cancel`, so a permission prompt or question, which comes before `Stop`, is never
