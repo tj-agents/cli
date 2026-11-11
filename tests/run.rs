@@ -600,6 +600,7 @@ fn the_launch_is_recorded_before_the_agent_starts() {
 #[test]
 fn repository_preparation_finishes_before_the_agent_starts() {
     let sandbox = sandbox();
+    select_tj_agents_checked(&sandbox);
     let mut arguments = run_arguments(&sandbox, "prepared", "codex", "exit", "10");
     arguments.truncate(arguments.iter().position(|argument| argument == "--").unwrap() + 1);
     let preparation_log = sandbox.stubs.join("tj-prepare.log");
@@ -622,12 +623,22 @@ fn repository_preparation_finishes_before_the_agent_starts() {
 #[test]
 fn repository_preparation_failure_warns_and_still_starts_the_agent() {
     let sandbox = sandbox();
+    select_tj_agents_checked(&sandbox);
     std::fs::write(sandbox.stubs.join("prepare-failure"), "failed").unwrap();
     let child = start(&sandbox, "prepare-failed", "claude", "exit", "10");
     let output = finish(child, Duration::from_secs(30));
     assert_eq!(output.status.code(), Some(3));
     assert!(String::from_utf8_lossy(&output.stderr).contains("standards preparation failed"));
     assert!(log(&sandbox, "dummy.log").contains("agent prepare-failed"));
+}
+
+#[test]
+fn a_repository_without_tj_agents_starts_the_agent_without_preparation() {
+    let sandbox = sandbox();
+    let child = start(&sandbox, "unprepared", "claude", "exit", "10");
+    let output = finish(child, Duration::from_secs(30));
+    assert_eq!(output.status.code(), Some(3), "{}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(log(&sandbox, "stubs/tj-prepare.log"), "", "prepared a repository that selects no tj-agents plugins");
 }
 
 #[test]
@@ -1214,6 +1225,15 @@ fn select_tj_agents(sandbox: &Sandbox) {
     let folder = sandbox.worktree.join(".agents");
     std::fs::create_dir_all(&folder).unwrap();
     std::fs::write(folder.join("plugins.json"), r#"{"plugins":["agent@tj-agents"]}"#).unwrap();
+}
+
+/// Selects tj-agents with this minute's update check already done, so the launch makes no request.
+fn select_tj_agents_checked(sandbox: &Sandbox) {
+    select_tj_agents(sandbox);
+    std::fs::create_dir_all(update_state(sandbox, "")).unwrap();
+    for host in ["claude", "codex"] {
+        std::fs::write(update_state(sandbox, &format!("{host}.checked")), "").unwrap();
+    }
 }
 
 fn launch_checking(sandbox: &Sandbox, upstream: &Upstream, launch: &str) -> (Output, Duration) {
