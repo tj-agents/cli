@@ -4,7 +4,7 @@ use serde_json::Value;
 use tj_cli::process::agent;
 
 use super::gate::Activity;
-use super::{Reload, ReloadError};
+use super::{ApplyError, Update};
 use crate::paths;
 
 const COMMAND: &str = "/reload-plugins";
@@ -34,7 +34,7 @@ fn shells(pid: u32) -> u32 {
     u32::try_from(images.iter().filter(|image| shell(image)).count()).unwrap_or(u32::MAX)
 }
 
-impl Reload for Claude {
+impl Update for Claude {
     fn activity(&self, agent: u32) -> Activity {
         let Ok(home) = paths::claude_home() else { return Activity::Busy };
         let Ok(record) = std::fs::read_to_string(home.join("sessions").join(format!("{agent}.json"))) else {
@@ -43,10 +43,10 @@ impl Reload for Claude {
         activity(&record, SystemTime::now(), shells(agent))
     }
 
-    fn reload(&self) -> Result<(), ReloadError> {
-        agent::type_text(COMMAND).map_err(ReloadError::Typing)?;
+    fn apply(&self) -> Result<(), ApplyError> {
+        agent::type_text(COMMAND).map_err(ApplyError::Typing)?;
         std::thread::sleep(Duration::from_millis(300));
-        agent::press_enter().map_err(ReloadError::Typing)
+        agent::press_enter().map_err(ApplyError::Typing)
     }
 }
 
@@ -55,7 +55,7 @@ mod tests {
     use std::time::{Duration, UNIX_EPOCH};
 
     use super::activity;
-    use crate::run::reload::gate::Activity;
+    use crate::run::update::gate::Activity;
 
     #[test]
     fn only_an_idle_status_counts_and_its_age_comes_from_claude() {

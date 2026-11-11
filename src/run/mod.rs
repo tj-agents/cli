@@ -1,7 +1,7 @@
 pub mod closeout;
-mod owner;
-pub mod reload;
+pub mod owner;
 pub(crate) mod store;
+pub mod update;
 
 use std::collections::HashSet;
 use std::ffi::{OsStr, OsString};
@@ -67,7 +67,7 @@ pub struct Args {
     #[arg(long, hide = true, default_value_t = 30)]
     restart_grace_seconds: u64,
     #[arg(long, hide = true, default_value_t = 2)]
-    reload_grace_seconds: u64,
+    plugin_grace_seconds: u64,
     #[arg(long, hide = true, default_value_t = 2)]
     input_idle_seconds: u64,
     /// Continues this launch in a replaced tj binary: the launch, its marks and its conversation already exist.
@@ -283,7 +283,7 @@ fn successor_arguments(args: &Args, launch: &Launch, agent: Vec<OsString>) -> Ve
         ("--idle-seconds", args.idle_seconds),
         ("--grace-seconds", args.grace_seconds),
         ("--restart-grace-seconds", args.restart_grace_seconds),
-        ("--reload-grace-seconds", args.reload_grace_seconds),
+        ("--plugin-grace-seconds", args.plugin_grace_seconds),
         ("--input-idle-seconds", args.input_idle_seconds),
     ];
     for (name, value) in seconds {
@@ -315,7 +315,7 @@ fn restart(agent: &mut Agent, watch: &mut Watch, args: &Args, exe: &Path) -> Res
     eprintln!("\r\ntj run: tj was updated; resuming {}:{session} in the new version\r", host.name());
     stop(agent, host, Duration::from_secs(args.grace_seconds))?;
     let resume = host.resume(&args.agent, &session);
-    reload::successor::hand_over(exe, &successor_arguments(args, &watch.launch, resume)).map(Some)
+    update::successor::hand_over(exe, &successor_arguments(args, &watch.launch, resume)).map(Some)
 }
 
 fn wait_for_enter() {
@@ -351,12 +351,12 @@ pub fn run(args: Args) -> Result<ExitCode> {
         .with_context(|| format!("could not start {}", args.agent[0].to_string_lossy()))?;
     let poll = Duration::from_secs(args.poll_seconds);
     let grace = Duration::from_secs(args.grace_seconds);
-    let graces = reload::gate::Graces {
-        reload: Duration::from_secs(args.reload_grace_seconds),
+    let graces = update::gate::Graces {
+        plugins: Duration::from_secs(args.plugin_grace_seconds),
         restart: Duration::from_secs(args.restart_grace_seconds),
         input: Duration::from_secs(args.input_idle_seconds),
     };
-    let mut updates = reload::Updates::new(exe, reload::published()?);
+    let mut watcher = update::Watcher::new(exe, update::published()?);
     let mut watch = Watch {
         launch,
         marks,
@@ -403,17 +403,17 @@ pub fn run(args: Args) -> Result<ExitCode> {
                 }
             }
         }
-        let host = reload::host(watch.launch.host);
-        match reload::due(&mut updates, &watch.marks, host, agent.pid(), graces) {
-            Some(reload::gate::Apply::Reload) => {
-                let revision = updates.revision();
-                match host.reload() {
-                    Ok(()) => updates.applied(revision),
-                    Err(error) => watch.report(format!("could not reload {}: {error}", watch.launch.host.name())),
+        let host = update::host(watch.launch.host);
+        match update::due(&mut watcher, host, agent.pid(), graces) {
+            Some(update::gate::Apply::Plugins) => {
+                let revision = watcher.revision();
+                match host.apply() {
+                    Ok(()) => watcher.applied(revision),
+                    Err(error) => watch.report(format!("could not update {}: {error}", watch.launch.host.name())),
                 }
             }
-            Some(reload::gate::Apply::Restart) => {
-                let exe = updates.exe().to_path_buf();
+            Some(update::gate::Apply::Binary) => {
+                let exe = watcher.exe().to_path_buf();
                 if let Some(code) = restart(&mut agent, &mut watch, &args, &exe)? {
                     return Ok(code);
                 }

@@ -189,8 +189,6 @@ differ, so only those are split into `linux/` and `windows/`.
 tj run [--host claude|codex] [--title T] [--cwd WORKTREE] [--launch-id U] [--item REF] [--parent HOST:ID] -- <agent argv>
 tj done              the session's last step: close out after about 10 idle minutes
 tj done --cancel     new input arrived; withdraw that (a no-op outside tj run)
-tj reload --revision R   publish installed plugins; every tab reloads them in place once idle
-tj refresh           update plugins and the machine install, then apply them to this tab now
 tj closeout [REF]    close an item's sessions; with no REF, sweep tabs closed by hand or crashed wrappers
 ```
 
@@ -209,26 +207,26 @@ and host arguments. Agent reconciles the repository's selected plugins and its s
 the host reads native instructions. Missing preparation or a preparation failure prints a warning and
 the session still starts. Install Agent to provide `tj-prepare`.
 
-Only the tab's own agent speaks for it. `tj done` and the tab part of `tj refresh` act only when
+Only the tab's own agent speaks for it. `tj done` acts only when
 the caller descends from the wrapper through its agent, with no second copy of that agent in between; a tab,
 shell or agent started from inside the session inherits `TJ_RUN_*` but is ignored. `tj launch` prints the
 launch the caller belongs to, for Agent's `SessionStart` binding.
 
-Updates reach running tabs without a restart. `tj reload --revision R`, which Agent's plugin update runs once,
-replaces `<cache>/published`; every wrapper checks it and its own executable on each half-second poll and
-applies a new revision in place:
+Running tabs apply updates by themselves. Agent's `tj plugins update` ends with a hidden
+`tj update --revision R`, which replaces `<cache>/published`; every wrapper checks it and its own executable
+on each half-second poll and applies each new revision once, in place:
 
 - Claude: once Claude's own record for the agent process, `<claude home>/sessions/<pid>.json`, has said
   `idle` for 2 s and the keyboard and mouse have been idle 2 s (Windows; Linux has only Claude's status), the
   wrapper types `/reload-plugins` and Enter into the shared console (`WriteConsoleInputW`, or `tmux
   send-keys`). Claude reports a running turn, tool or `!` command as busy, so none is typed into. Claude has no
-  other way to reload a running interactive session. Text typed but not sent is invisible to the wrapper; the
+  other way to load plugins into a running interactive session. Text typed but not sent is invisible to the wrapper; the
   command is appended to it.
-- Codex: the wrapper asks the shared app-server for `config/batchWrite` with `reloadUserConfig`, which reloads
+- Codex: the wrapper asks the shared app-server for `config/batchWrite` with `reloadUserConfig`, which loads
   plugins, skills, hooks and `config.toml` into every loaded thread. The TUI's own `$` and `@` completion
   lists stay as they were until it restarts.
 
-A replaced `tj` executable restarts the agent once the new file has settled and runs, Claude has been idle
+An updated `tj` executable restarts the agent once the new file has settled and runs, Claude has been idle
 30 s with no shell running under it (a background task), and input has been idle 30 s. The wrapper stops the agent the way closeout does
 and hands the tab to the new binary, which starts the agent again as `claude --resume <id>` or `codex resume
 <id>`, keeping the original options and dropping the prompt and any earlier session choice. Linux replaces the
@@ -236,11 +234,7 @@ process in place; Windows keeps the old wrapper as the tab's root, waiting for i
 closes when its first process exits. The launch row, its marks and the conversation are kept. The id is the
 session `agent-store show --launch-id` binds to the launch; with none bound the agent keeps running and the
 wrapper says so once. A resume that exits with an error leaves the tab open with the reason. Codex exposes no
-turn state to the wrapper, so a Codex tab takes a new `tj` on `tj refresh` or its next start.
-
-`tj refresh`, from any shell or typed as `! tj refresh` in either host, runs `tj plugins update` for each
-installed host and `tj install`, then applies the result to its own tab at once, reloading in place or,
-when `tj` itself changed, restarting into the new binary.
+turn state to the wrapper, so a Codex tab takes an updated `tj` at its next start.
 
 It closes out only when one of these happens:
 
@@ -302,7 +296,7 @@ the subscription expired. A Claude child reports to a Codex parent with `tj mess
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `TJ_F_ROOT` | `~/projects`, then `~/source/repos` | where `f` searches |
-| `TJ_CACHE_DIR` | OS cache folder + `/tj` | where `cr` keeps its index, `tj done` and `tj refresh` their marks, `tj reload` the published revision and each Claude relay its endpoint |
+| `TJ_CACHE_DIR` | OS cache folder + `/tj` | where `cr` keeps its index, `tj done` its marks, `tj update` the published revision and each Claude relay its endpoint |
 | `TJ_BIN_DIR` | `~/.local/bin` / `%LOCALAPPDATA%\Programs\tj` | where the installer puts `tj` and `tj_hook` |
 | `CLAUDE_CONFIG_DIR` | `~/.claude` | Claude Code's config folder, as Claude Code itself reads it |
 | `CODEX_HOME` | `~/.codex` | Codex's config folder, as Codex itself reads it |
@@ -404,7 +398,7 @@ run changes anything. A successful current `main` commit automatically publishes
 | `src/bin/tj_hook.rs` | the windowless executable entry point |
 | `src/process.rs` and `src/process/` | native command execution and Windows process containment |
 | `packages/tj-cli/src/tj_cli/process/` | the Python API for the native launcher |
-| `src/run/` | `tj run`, `tj done`, `tj reload`, `tj refresh` and `tj closeout` |
+| `src/run/` | `tj run`, `tj done`, `tj update` and `tj closeout` |
 | `src/message.rs`, `src/bridge.rs`, `src/subscribe.rs` | `tj message`, the Claude session relay and `tj subscribe` |
 | `src/process/agent.rs` and `src/process/agent/` | the agent's job or process group, per-host stop, tree kill |
 | `src/f.rs` | folder walk, match scoring, picker |

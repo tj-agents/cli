@@ -278,7 +278,7 @@ fn set_status(sandbox: &Sandbox, status: &str) {
 
 fn publish(sandbox: &Sandbox, revision: &str) {
     let output = Command::new(env!("CARGO_BIN_EXE_tj"))
-        .args(["reload", "--revision", revision])
+        .args(["update", "--revision", revision])
         .env("TJ_CACHE_DIR", sandbox.root.join("cache"))
         .output()
         .unwrap();
@@ -789,7 +789,7 @@ fn fake_codex(sandbox: &Sandbox) -> PathBuf {
 }
 
 #[test]
-fn only_the_tabs_own_agent_can_mark_it_idle_or_done() {
+fn only_the_tabs_own_agent_can_mark_it_done() {
     let sandbox = sandbox();
     let mut child = start(&sandbox, "owned", "claude", "signal", "10");
     wait_for_log(&sandbox, "wrapper ");
@@ -824,10 +824,10 @@ fn only_the_tabs_own_agent_can_mark_it_idle_or_done() {
 
 #[cfg(windows)]
 #[test]
-fn a_published_revision_reloads_an_idle_claude_in_place_once() {
+fn a_published_plugin_update_is_applied_to_an_idle_claude_in_place_once() {
     let sandbox = sandbox();
     set_reply(&sandbox, "agent-store-show.json", BOUND);
-    let child = spawn(&sandbox, &with_prompt(&sandbox, "reload", "claude", "keys"), &sandbox.root);
+    let child = spawn(&sandbox, &with_prompt(&sandbox, "plugins", "claude", "keys"), &sandbox.root);
     wait_for_log(&sandbox, "raw");
     set_status(&sandbox, "busy");
     publish(&sandbox, "plugins b");
@@ -839,33 +839,14 @@ fn a_published_revision_reloads_an_idle_claude_in_place_once() {
     std::thread::sleep(Duration::from_secs(4));
     let agent = log(&sandbox, "dummy.log");
     assert_eq!(agent.matches("typed /reload-plugins").count(), 1, "{agent}");
-    assert_eq!(agent.matches("agent reload Test tab").count(), 1, "the agent restarted: {agent}");
+    assert_eq!(agent.matches("agent plugins Test tab").count(), 1, "the agent restarted: {agent}");
     set_reply(&sandbox, "agent-store-show.json", CLOSING);
     let output = finish(child, Duration::from_secs(60));
-    assert_closed_out(&sandbox, &output, "reload");
-}
-
-#[cfg(windows)]
-#[test]
-fn refresh_updates_and_reloads_this_tab_without_waiting_for_idle() {
-    let sandbox = sandbox();
-    stub(&sandbox.stubs, "tj-plugins", "updated");
-    stub(&sandbox.stubs, "tj-install", "installed");
-    set_reply(&sandbox, "agent-store-show.json", BOUND);
-    let child = spawn(&sandbox, &with_prompt(&sandbox, "refresh", "claude", "keys"), &sandbox.root);
-    wait_for_log(&sandbox, "raw");
-    let (code, stderr) = in_agent(&sandbox, &["refresh"]);
-    assert_eq!(code, 0, "{stderr}");
-    assert!(log(&sandbox, "stubs/tj-plugins.log").contains("update --host codex"));
-    assert!(sandbox.stubs.join("tj-install.log").is_file(), "tj refresh skipped the machine install");
-    wait_for_log(&sandbox, "typed /reload-plugins");
-    set_reply(&sandbox, "agent-store-show.json", CLOSING);
-    let output = finish(child, Duration::from_secs(60));
-    assert_closed_out(&sandbox, &output, "refresh");
+    assert_closed_out(&sandbox, &output, "plugins");
 }
 
 #[test]
-fn a_published_revision_reloads_codex_through_its_app_server() {
+fn a_published_plugin_update_is_applied_to_codex_through_its_app_server() {
     let sandbox = sandbox();
     let codex = fake_codex(&sandbox);
     set_reply(&sandbox, "agent-store-show.json", BOUND);
@@ -888,7 +869,7 @@ fn a_published_revision_reloads_codex_through_its_app_server() {
     let child = command.spawn().unwrap();
     wait_for_log(&sandbox, if keys { "raw" } else { "agent " });
     publish(&sandbox, "plugins b");
-    wait_until("the Codex app-server was never asked to reload", || {
+    wait_until("the Codex app-server was never asked to take the update", || {
         std::fs::read_to_string(&codex).unwrap_or_default().contains(r#""reloadUserConfig": true"#)
     });
     let agent = log(&sandbox, "dummy.log");
