@@ -191,7 +191,6 @@ differ, so only those are split into `linux/` and `windows/`.
 ```text
 tj run [--host claude|codex] [--title T] [--cwd WORKTREE] [--launch-id U] [--item REF] [--parent HOST:ID] -- <agent argv>
 tj done              the session's last step: close out after about 10 idle minutes
-tj done --cancel     new input arrived; withdraw that (a no-op outside tj run)
 tj closeout [REF]    close an item's sessions; with no REF, sweep tabs closed by hand or crashed wrappers
 ```
 
@@ -209,10 +208,20 @@ the host defaults to the executable's name, the folder to the current one, the t
 worktree folder's name (suffixed `-2`, `-3`… while an open launch holds it) and the launch id to a random one.
 The executable must be the native `claude` or `codex`, not an npm `.cmd` shim.
 
-Before each start, `tj run` invokes Agent's `tj-prepare` with the host, working directory
-and host arguments. Agent reconciles the repository's selected plugins and its standards index before
-the host reads native instructions. Missing preparation or a preparation failure prints a warning and
-the session still starts. Install Agent to provide `tj-prepare`.
+In a repository whose `.agents/plugins.json` selects a `@tj-agents` plugin, `tj run` invokes Agent's
+`tj-prepare` before each start with the host, working directory and host arguments. Agent reconciles the
+repository's selected plugins and its standards index before the host reads native instructions. Missing
+preparation or a preparation failure prints a warning and the session still starts. Install Agent to provide
+`tj-prepare`.
+
+Such a launch also checks, once and alongside `tj-prepare`, whether `tj-agents/marketplace` moved past the
+commit this host last converged to: one conditional `GET` of its `main` commit with `If-None-Match` set to the
+first line of `<cache>/published/<host>`, with a 1 s timeout. At most one launch per host checks a minute
+(`<cache>/update/<host>.lock` and `<host>.checked`), within GitHub's 60 unauthenticated requests an hour. A
+`304` costs nothing more. A `200` starts `tj-plugins update --host H` in the background, logging to
+`<cache>/update/<host>.log`, and the launch goes on; it publishes when done, and the update reaches open tabs
+as below. One commit is installed at most once every 10 minutes, so a failed install, which publishes nothing,
+is retried by a later launch. Any other answer or no answer prints one line and the launch goes on.
 
 Only the tab's own agent speaks for it. `tj done` acts only when
 the caller descends from the wrapper through its agent, with no second copy of that agent in between; a tab,
@@ -220,7 +229,7 @@ shell or agent started from inside the session inherits `TJ_RUN_*` but is ignore
 launch the caller belongs to, for Agent's `SessionStart` binding.
 
 Running tabs apply updates by themselves. Agent's `tj plugins update` ends with a hidden
-`tj update --host H --revision R`, which replaces `<cache>/published/<host>`; every wrapper of that host checks
+`tj update --host H --revision <marketplace commit>`, which replaces `<cache>/published/<host>`; every wrapper of that host checks
 it and its own executable on each half-second poll and applies each publish once, in place:
 
 - Claude: once Claude's own record for the agent process, `<claude home>/sessions/<pid>.json`, has said
@@ -241,11 +250,15 @@ process in place; Windows keeps the old wrapper as the tab's root, waiting for i
 closes when its first process exits. The launch row, its marks and the conversation are kept. The id is the
 session `agent-store show --launch-id` binds to the launch; with none bound the agent keeps running and the
 wrapper says so once. A resume that exits with an error leaves the tab open with the reason. Codex exposes no
-turn state to the wrapper, so a Codex tab takes an updated `tj` at its next start.
+turn state to the update check, so a Codex tab takes an updated `tj` at its next start.
 
 It closes out only when one of these happens:
 
-- `tj done` was run and no prompt, or Claude tool use, has cancelled it for about 10 minutes;
+- `tj done` was run, the turn that ran it ended, and the agent has stayed idle for about 10 minutes since with no
+  shell running under it. The wrapper reads each turn from the host itself, never from hooks: Claude's
+  `<claude home>/sessions/<pid>.json` and the Codex thread's rollout under `<codex home>/sessions`. A turn started
+  after `tj done`, by a prompt, a queued message or a finished background task, withdraws it, and an unreadable
+  record never closes. While `tj done` stands, the tab applies no update;
 - `agent-store` marks the launch or its session `closing`, which is what `tj closeout REF` does.
 
 A merged PR never stops a session: an item can be merged before its session starts or while it still has
@@ -266,7 +279,7 @@ After stopping its own agent process tree, the wrapper repeats those checks and 
 5. exits 0, so Windows Terminal (`closeOnExit` default) or tmux closes the tab.
 
 Helpers run hidden through `tj_hook` on Windows, and in their own session on Linux, so they never touch the
-agent's console. If the agent exits by itself, nothing is left running, so the wrapper also cleans up when every PR for the item has merged. Otherwise it ends the launch and keeps the unfinished worktrees. It preserves the agent's exit code. `tj closeout` also inspects ended launches whose cleanup has not completed.
+agent's console. If the agent exits by itself, nothing is left running, so the wrapper also cleans up when `tj done` still stands or every PR for the item has merged. Otherwise it ends the launch and keeps the unfinished worktrees. It preserves the agent's exit code. `tj closeout` also inspects ended launches whose cleanup has not completed.
 
 ## `tj message` and `tj subscribe`: messaging between sessions
 
@@ -303,7 +316,7 @@ the subscription expired. A Claude child reports to a Codex parent with `tj mess
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `TJ_F_ROOT` | `~/projects`, then `~/source/repos` | where `f` searches |
-| `TJ_CACHE_DIR` | OS cache folder + `/tj` | where `cr` keeps its index, `tj done` its marks, `tj update` the published updates and each Claude relay its endpoint |
+| `TJ_CACHE_DIR` | OS cache folder + `/tj` | where `cr` keeps its index, `tj done` its marks, `tj update` the published updates, `tj run` its update check and each Claude relay its endpoint |
 | `TJ_BIN_DIR` | `~/.local/bin` / `%LOCALAPPDATA%\Programs\tj` | where the installer puts `tj` and `tj_hook` |
 | `CLAUDE_CONFIG_DIR` | `~/.claude` | Claude Code's config folder, as Claude Code itself reads it |
 | `CODEX_HOME` | `~/.codex` | Codex's config folder, as Codex itself reads it |
