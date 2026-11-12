@@ -1,12 +1,16 @@
 pub mod closeout;
-pub mod restart;
+pub mod owner;
 pub(crate) mod store;
+mod tj_agents;
+mod turn;
+pub mod update;
 
 use std::collections::HashSet;
 use std::ffi::{OsStr, OsString};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
+use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result, bail};
@@ -68,6 +72,15 @@ pub struct Args {
     grace_seconds: u64,
     #[arg(long, hide = true, default_value_t = 30)]
     restart_grace_seconds: u64,
+    #[arg(long, hide = true, default_value_t = 2)]
+    plugin_grace_seconds: u64,
+    #[arg(long, hide = true, default_value_t = 2)]
+    input_idle_seconds: u64,
+    #[arg(long, hide = true, default_value = update::upstream::MARKETPLACE)]
+    update_url: String,
+    /// Continues this launch in a replaced tj binary: the launch, its marks and its conversation already exist.
+    #[arg(long, hide = true)]
+    successor: bool,
     /// The agent's command line.
     #[arg(last = true, required = true)]
     agent: Vec<OsString>,
@@ -239,13 +252,16 @@ enum Trigger {
 
 struct Watch {
     launch: Launch,
-    environment: [(&'static str, String); 4],
     marks: PathBuf,
     poll: Duration,
     idle: Duration,
     next_poll: Instant,
     reported: HashSet<String>,
     asked: bool,
+    mark: Option<SystemTime>,
+    pinned: Option<turn::Turn>,
+    rollout: Option<PathBuf>,
+    next_lookup: Instant,
 }
 
 impl Watch {
@@ -256,14 +272,43 @@ impl Watch {
         }
     }
 
-    fn done(&self) -> bool {
-        self.marks
-            .join("done")
-            .metadata()
-            .and_then(|meta| meta.modified())
-            .ok()
-            .and_then(|marked| SystemTime::now().duration_since(marked).ok())
-            .is_some_and(|idle| idle >= self.idle)
+    fn marked(&self) -> Option<SystemTime> {
+        self.marks.join("done").metadata().and_then(|meta| meta.modified()).ok()
+    }
+
+    fn turn(&mut self, agent: u32) -> (Option<turn::Turn>, u32) {
+        match self.launch.host {
+            Host::Claude => (turn::claude(agent), turn::shells(agent)),
+            Host::Codex => {
+                if self.rollout.is_none() && Instant::now() >= self.next_lookup {
+                    self.next_lookup = Instant::now() + Duration::from_secs(10);
+                    self.rollout =
+                        store::bound_session(&self.launch.id).ok().flatten().and_then(|thread| turn::rollout(&thread));
+                }
+                (self.rollout.as_deref().and_then(turn::codex), turn::shells(agent))
+            }
+        }
+    }
+
+    fn done(&mut self, agent: u32) -> bool {
+        let marked = self.marked();
+        if marked != self.mark {
+            self.mark = marked;
+            self.pinned = None;
+        }
+        let Some(marked) = marked else { return false };
+        let (turn, background) = self.turn(agent);
+        match turn::judge(marked, SystemTime::now(), turn, &mut self.pinned, background, self.idle) {
+            turn::Done::Due => true,
+            turn::Done::Waiting => false,
+            turn::Done::Withdrawn => {
+                let _ = std::fs::remove_file(self.marks.join("done"));
+                self.report(
+                    "a turn started after `tj done`, which withdrew it; the agent runs it again when finished".into(),
+                );
+                false
+            }
+        }
     }
 
     fn closing(&mut self) -> bool {
@@ -280,8 +325,8 @@ impl Watch {
         })
     }
 
-    fn trigger(&mut self) -> Option<Trigger> {
-        if self.done() {
+    fn trigger(&mut self, agent: u32) -> Option<Trigger> {
+        if self.done(agent) {
             return Some(Trigger::Done);
         }
         if Instant::now() < self.next_poll {
@@ -319,34 +364,51 @@ fn stop(agent: &mut Agent, host: Host, grace: Duration) -> Result<()> {
     agent.kill_tree(Duration::from_secs(30)).context("could not end the agent's processes")
 }
 
-enum Restarted {
-    Kept,
-    Resumed(Agent),
+fn successor_arguments(args: &Args, launch: &Launch, agent: Vec<OsString>) -> Vec<OsString> {
+    let mut arguments: Vec<OsString> =
+        ["run", "--host", launch.host.name(), "--title", &launch.title, "--cwd"].map(OsString::from).to_vec();
+    arguments.push(launch.cwd.clone().into_os_string());
+    if let Some(item) = &launch.item {
+        arguments.extend(["--item", item].map(OsString::from));
+    }
+    let seconds = [
+        ("--poll-seconds", args.poll_seconds),
+        ("--idle-seconds", args.idle_seconds),
+        ("--grace-seconds", args.grace_seconds),
+        ("--restart-grace-seconds", args.restart_grace_seconds),
+        ("--plugin-grace-seconds", args.plugin_grace_seconds),
+        ("--input-idle-seconds", args.input_idle_seconds),
+    ];
+    for (name, value) in seconds {
+        arguments.extend([OsString::from(name), OsString::from(value.to_string())]);
+    }
+    arguments.extend(["--launch-id", &launch.id, "--successor", "--"].map(OsString::from));
+    arguments.extend(agent);
+    arguments
 }
 
-fn restart(agent: &mut Agent, watch: &mut Watch, command: &[OsString], grace: Duration) -> Result<Restarted> {
+/// Stops the agent and hands the tab to the replaced tj binary, resuming the same conversation.
+fn restart(agent: &mut Agent, watch: &mut Watch, args: &Args, exe: &Path) -> Result<Option<ExitCode>> {
     let host = watch.launch.host;
     let session = match store::bound_session(&watch.launch.id) {
         Ok(Some(session)) => session,
         Ok(None) => {
             watch.report(format!(
-                "not restarting: no {} session is bound to launch {} yet",
+                "not updating tj: no {} session is bound to launch {} yet",
                 host.name(),
                 watch.launch.id
             ));
-            return Ok(Restarted::Kept);
+            return Ok(None);
         }
         Err(error) => {
-            watch.report(format!("not restarting: {error:#}"));
-            return Ok(Restarted::Kept);
+            watch.report(format!("not updating tj: {error:#}"));
+            return Ok(None);
         }
     };
-    eprintln!("\r\ntj run: restarting to resume {}:{session}\r", host.name());
-    stop(agent, host, grace)?;
-    prepare(&watch.launch, command);
-    let resumed = Agent::start(&host.resume(command, &session), &watch.launch.cwd, &watch.environment)
-        .with_context(|| format!("could not resume {}:{session}", host.name()))?;
-    Ok(Restarted::Resumed(resumed))
+    eprintln!("\r\ntj run: tj was updated; resuming {}:{session} in the new version\r", host.name());
+    stop(agent, host, Duration::from_secs(args.grace_seconds))?;
+    let resume = host.resume(&args.agent, &session);
+    update::successor::hand_over(exe, &successor_arguments(args, &watch.launch, resume)).map(Some)
 }
 
 fn wait_for_enter() {
@@ -358,12 +420,47 @@ fn rfc3339(time: SystemTime) -> String {
     chrono::DateTime::<chrono::Utc>::from(time).to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
 }
 
+static OPEN_RECORD: Mutex<()> = Mutex::new(());
+
+fn mark_open(launch_id: &str, open: bool) {
+    let _record = OPEN_RECORD.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Err(error) = store::set_open(launch_id, open) {
+        eprintln!("tj run: {error:#}");
+    }
+}
+
+/// Holds the record lock until the process exits, so no later write can mark the closed tab open again.
+fn mark_closed(launch_id: &str) {
+    std::mem::forget(OPEN_RECORD.lock().unwrap_or_else(PoisonError::into_inner));
+    let _ = store::set_open(launch_id, false);
+}
+
 pub fn run(args: Args) -> Result<ExitCode> {
     agent::prepare_wrapper().context("could not prepare the console")?;
     let launch = launch(&args)?;
     let prebound = prebound_session(&args, &launch)?;
+    let id = launch.id.clone();
+    let closed = launch.id.clone();
+    agent::on_tab_closed(Box::new(move || mark_closed(&closed)));
+    let result = supervise(&args, launch, prebound.as_ref());
+    if !agent::session_ending() {
+        mark_open(&id, false);
+    }
+    result
+}
+
+fn supervise(args: &Args, launch: Launch, prebound: Option<&PreboundSession>) -> Result<ExitCode> {
+    let exe = std::env::current_exe().context("could not locate the tj executable")?;
+    let selected = tj_agents::selected(&launch.cwd);
+    let upstream = if selected && !args.successor {
+        update::upstream::start(launch.host, &launch.cwd, args.update_url.clone())
+    } else {
+        None
+    };
     let marks = marks(&launch.id)?;
-    let _ = std::fs::remove_dir_all(&marks);
+    if !args.successor {
+        let _ = std::fs::remove_dir_all(&marks);
+    }
     let pid = std::process::id();
     let started_at = rfc3339(agent::started_at(pid)?.context("could not identify this wrapper process")?);
     let environment = [
@@ -372,26 +469,38 @@ pub fn run(args: Args) -> Result<ExitCode> {
         ("TJ_RUN_LAUNCH_ID", launch.id.clone()),
         ("AGENT_CLI_TAB_TITLE", launch.title.clone()),
     ];
-    if let Err(error) = record_launch(&launch, args.parent.as_deref(), pid, &started_at) {
-        if let Some(prebound) = &prebound {
-            end_not_started(&launch, prebound, pid, &started_at);
-            return Err(error);
+    if !args.successor {
+        if let Err(error) = record_launch(&launch, args.parent.as_deref(), pid, &started_at) {
+            if let Some(prebound) = prebound {
+                end_not_started(&launch, prebound, pid, &started_at);
+                return Err(error);
+            }
+            eprintln!("tj run: launch {} was not recorded: {error:#}", launch.id);
         }
-        eprintln!("tj run: launch {} was not recorded: {error:#}", launch.id);
     }
-    if let Some(prebound) = &prebound {
+    if let Some(prebound) = prebound {
         if let Err(error) = store::prebind(&launch, &prebound.handle, pid, &started_at) {
             end_not_started(&launch, prebound, pid, &started_at);
             return Err(error);
         }
     }
-    prepare(&launch, &args.agent);
+    mark_open(&launch.id, true);
+    if selected {
+        prepare(&launch, &args.agent);
+    }
+    match upstream.map(std::thread::JoinHandle::join) {
+        Some(Ok(Ok(Some(line)))) => eprintln!("tj run: {line}"),
+        Some(Ok(Err(error))) => {
+            eprintln!("tj run: could not check for tj-agents updates: {:#}", anyhow::Error::from(error));
+        }
+        _ => {}
+    }
     let mut agent = match Agent::start(&args.agent, &launch.cwd, &environment)
         .with_context(|| format!("could not start {}", args.agent[0].to_string_lossy()))
     {
         Ok(agent) => agent,
         Err(error) => {
-            if let Some(prebound) = &prebound {
+            if let Some(prebound) = prebound {
                 end_not_started(&launch, prebound, pid, &started_at);
             }
             return Err(error);
@@ -399,18 +508,26 @@ pub fn run(args: Args) -> Result<ExitCode> {
     };
     let poll = Duration::from_secs(args.poll_seconds);
     let grace = Duration::from_secs(args.grace_seconds);
-    let request = restart::Request::new(&marks, Duration::from_secs(args.restart_grace_seconds));
+    let graces = update::gate::Graces {
+        plugins: Duration::from_secs(args.plugin_grace_seconds),
+        restart: Duration::from_secs(args.restart_grace_seconds),
+        input: Duration::from_secs(args.input_idle_seconds),
+    };
+    let mut watcher = update::Watcher::new(exe, update::published(launch.host)?);
     let mut watch = Watch {
         launch,
-        environment,
         marks,
         poll,
         idle: Duration::from_secs(args.idle_seconds),
         next_poll: Instant::now() + poll,
         reported: HashSet::new(),
         asked: false,
+        mark: None,
+        pinned: None,
+        rollout: None,
+        next_lookup: Instant::now(),
     };
-    let mut resumed = false;
+    let resumed = args.successor;
     let removal = loop {
         if let Some(code) = agent.try_wait()? {
             agent.kill_tree(Duration::from_secs(30))?;
@@ -418,7 +535,7 @@ pub fn run(args: Args) -> Result<ExitCode> {
                 eprintln!("\r\ntj run: the resumed agent exited with code {code}\r");
                 wait_for_enter();
             }
-            let closing = watch.done() || watch.closing() || watch.delivered();
+            let closing = watch.marked().is_some() || watch.closing() || watch.delivered();
             let _ = std::fs::remove_dir_all(&watch.marks);
             if closing {
                 let result = closeout::owned_preflight(&watch.launch)
@@ -436,7 +553,7 @@ pub fn run(args: Args) -> Result<ExitCode> {
             }
             return Ok(ExitCode::from(u8::try_from(code).unwrap_or(1)));
         }
-        if let Some(trigger) = watch.trigger() {
+        if let Some(trigger) = watch.trigger(agent.pid()) {
             match closeout::owned_preflight(&watch.launch) {
                 Ok(removal) => break removal,
                 Err(reason) => {
@@ -447,24 +564,23 @@ pub fn run(args: Args) -> Result<ExitCode> {
                 }
             }
         }
-        if let Some(reason) = request.due() {
-            match restart(&mut agent, &mut watch, &args.agent, grace) {
-                Ok(Restarted::Kept) => {}
-                Ok(Restarted::Resumed(next)) => {
-                    agent = next;
-                    resumed = true;
-                    request.restarted(&reason);
-                }
-                Err(error) => {
-                    eprintln!("tj run: restart stopped: {error:#}");
-                    let _ = std::fs::remove_dir_all(&watch.marks);
-                    if let Err(error) = store::end(&watch.launch.id, "exited") {
-                        eprintln!("tj run: {error:#}");
-                    }
-                    wait_for_enter();
-                    return Ok(ExitCode::FAILURE);
+        let host = update::host(watch.launch.host);
+        let due = if watch.marked().is_some() { None } else { update::due(&mut watcher, host, agent.pid(), graces) };
+        match due {
+            Some(update::gate::Apply::Plugins) => {
+                let revision = watcher.revision();
+                match host.apply() {
+                    Ok(()) => watcher.applied(revision),
+                    Err(error) => watch.report(format!("could not update {}: {error}", watch.launch.host.name())),
                 }
             }
+            Some(update::gate::Apply::Binary) => {
+                let exe = watcher.exe().to_path_buf();
+                if let Some(code) = restart(&mut agent, &mut watch, args, &exe)? {
+                    return Ok(code);
+                }
+            }
+            None => {}
         }
         std::thread::sleep(Duration::from_millis(500));
     };
@@ -478,31 +594,15 @@ pub fn run(args: Args) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-#[derive(clap::Args)]
-pub struct DoneArgs {
-    /// Withdraw the mark and the idle mark, because new input arrived. A no-op outside `tj run`.
-    #[arg(long)]
-    cancel: bool,
-}
-
-pub fn done(args: DoneArgs) -> Result<ExitCode> {
-    let Some(launch_id) = launch_id() else {
-        if args.cancel {
-            return Ok(ExitCode::SUCCESS);
+pub fn done() -> Result<ExitCode> {
+    let Some(launch_id) = owner::launch() else {
+        if launch_id().is_some() {
+            bail!("tj done only works from the tab's own agent; this process inherited another tab's tj run");
         }
         bail!("tj done only works inside a tj run session (TJ_RUN_LAUNCH_ID is not set)");
     };
     let marks = marks(&launch_id)?;
     let marker = marks.join("done");
-    if args.cancel {
-        for mark in [marker, marks.join(restart::IDLE)] {
-            match std::fs::remove_file(&mark) {
-                Err(error) if error.kind() != std::io::ErrorKind::NotFound => return Err(error.into()),
-                _ => {}
-            }
-        }
-        return Ok(ExitCode::SUCCESS);
-    }
     std::fs::create_dir_all(marker.parent().context("marker has no folder")?)?;
     std::fs::write(&marker, rfc3339(SystemTime::now()))?;
     println!("Marked done: this session closes out once it has been idle for about 10 minutes. New input cancels.");
@@ -531,6 +631,10 @@ mod tests {
             idle_seconds: 600,
             grace_seconds: 10,
             restart_grace_seconds: 30,
+            plugin_grace_seconds: 2,
+            input_idle_seconds: 2,
+            update_url: String::new(),
+            successor: false,
             agent,
         }
     }
