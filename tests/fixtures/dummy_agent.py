@@ -24,6 +24,22 @@ def graceful(*_: object) -> None:
     sys.exit(0)
 
 
+SHELLS: list[subprocess.Popen[bytes]] = []
+
+
+def shell(start: bool) -> None:
+    """Leave a shell running under this agent, as a background task does, or end it."""
+    if start:
+        command = (
+            ["powershell", "-NoProfile", "-Command", "Start-Sleep 600"]
+            if WINDOWS
+            else ["sh", "-c", "sleep 600; true"]
+        )
+        SHELLS.append(subprocess.Popen(command))
+    while not start and SHELLS:
+        SHELLS.pop().kill()
+
+
 def run_commands() -> None:
     """Run the tj commands a test queued, as this agent's own descendant, each exactly once."""
     commands = Path(os.environ["DUMMY_LOG"]).with_name("commands")
@@ -33,8 +49,14 @@ def run_commands() -> None:
     done = int(ran.read_text(encoding="utf-8") or 0) if ran.exists() else 0
     lines = commands.read_text(encoding="utf-8").splitlines()
     for number, line in enumerate(lines[done:], start=done):
+        command = json.loads(line)
+        if command[0] == "shell":
+            shell(command[1] == "start")
+            ran.write_text(str(number + 1), encoding="utf-8")
+            note(f"ran {number} 0 ")
+            continue
         result = subprocess.run(
-            [os.environ["DUMMY_TJ"], *json.loads(line)], capture_output=True, text=True
+            [os.environ["DUMMY_TJ"], *command], capture_output=True, text=True
         )
         ran.write_text(str(number + 1), encoding="utf-8")
         note(f"ran {number} {result.returncode} {result.stderr.strip()}")

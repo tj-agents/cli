@@ -2,6 +2,7 @@ mod claude;
 mod codex;
 pub(crate) mod gate;
 pub(crate) mod successor;
+pub(crate) mod upstream;
 mod watch;
 
 use std::path::PathBuf;
