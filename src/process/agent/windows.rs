@@ -6,6 +6,8 @@ use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::path::Path;
 use std::process::Command;
 use std::ptr::{null, null_mut};
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use windows_sys::Win32::Foundation::{
@@ -13,20 +15,27 @@ use windows_sys::Win32::Foundation::{
 };
 use windows_sys::Win32::Storage::FileSystem::{CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING};
 use windows_sys::Win32::System::Console::{
-    CTRL_BREAK_EVENT, CTRL_C_EVENT, GenerateConsoleCtrlEvent, INPUT_RECORD, KEY_EVENT, LEFT_CTRL_PRESSED,
-    STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, SetConsoleCtrlHandler, WriteConsoleInputW,
+    CTRL_BREAK_EVENT, CTRL_C_EVENT, CTRL_CLOSE_EVENT, CTRL_LOGOFF_EVENT, CTRL_SHUTDOWN_EVENT, GenerateConsoleCtrlEvent,
+    INPUT_RECORD, KEY_EVENT, LEFT_CTRL_PRESSED, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+    SetConsoleCtrlHandler, WriteConsoleInputW,
+};
+use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+    CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
 };
 use windows_sys::Win32::System::JobObjects::{
     CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOBOBJECT_BASIC_ACCOUNTING_INFORMATION,
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectBasicAccountingInformation, JobObjectExtendedLimitInformation,
     QueryInformationJobObject, SetInformationJobObject, TerminateJobObject,
 };
+use windows_sys::Win32::System::SystemInformation::GetTickCount;
 use windows_sys::Win32::System::Threading::{
     CREATE_NEW_PROCESS_GROUP, CREATE_UNICODE_ENVIRONMENT, CreateProcessW, EXTENDED_STARTUPINFO_PRESENT,
     GetExitCodeProcess, GetProcessTimes, OpenProcess, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
     PROC_THREAD_ATTRIBUTE_JOB_LIST, PROCESS_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION, STARTF_USESTDHANDLES,
     STARTUPINFOEXW, UpdateProcThreadAttribute, WaitForSingleObject,
 };
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetLastInputInfo, LASTINPUTINFO, VK_RETURN};
+use windows_sys::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_SHUTTINGDOWN};
 
 use super::super::windows::{AttributeList, command_line, inherited_handle, is_batch, raw, wide};
 use super::Stop;
@@ -156,6 +165,10 @@ impl Agent {
         }
     }
 
+    pub fn pid(&self) -> u32 {
+        self.pid
+    }
+
     pub fn try_wait(&mut self) -> io::Result<Option<i32>> {
         if self.exit.is_none() && unsafe { WaitForSingleObject(self.process.as_raw_handle(), 0) } == WAIT_OBJECT_0 {
             let mut code = 0;
@@ -205,7 +218,21 @@ impl Agent {
     pub fn reclaim_terminal(&self) {}
 }
 
-fn press_ctrl_c() -> io::Result<()> {
+fn key(character: u16, virtual_key: u16, scan: u16, control: u32) -> [INPUT_RECORD; 2] {
+    let mut records: [INPUT_RECORD; 2] = unsafe { zeroed() };
+    for (record, down) in records.iter_mut().zip([1, 0]) {
+        record.EventType = KEY_EVENT as u16;
+        record.Event.KeyEvent.bKeyDown = down;
+        record.Event.KeyEvent.wRepeatCount = 1;
+        record.Event.KeyEvent.wVirtualKeyCode = virtual_key;
+        record.Event.KeyEvent.wVirtualScanCode = scan;
+        record.Event.KeyEvent.uChar.UnicodeChar = character;
+        record.Event.KeyEvent.dwControlKeyState = control;
+    }
+    records
+}
+
+fn write_input(records: &[INPUT_RECORD]) -> io::Result<()> {
     let name: Vec<u16> = OsStr::new("CONIN$").encode_wide().chain([0]).collect();
     unsafe {
         let input = CreateFileW(
@@ -221,31 +248,106 @@ fn press_ctrl_c() -> io::Result<()> {
             return Err(io::Error::last_os_error());
         }
         let input = OwnedHandle::from_raw_handle(input);
-        let mut records: [INPUT_RECORD; 2] = zeroed();
-        for (record, down) in records.iter_mut().zip([1, 0]) {
-            record.EventType = KEY_EVENT as u16;
-            record.Event.KeyEvent.bKeyDown = down;
-            record.Event.KeyEvent.wRepeatCount = 1;
-            record.Event.KeyEvent.wVirtualKeyCode = u16::from(b'C');
-            record.Event.KeyEvent.wVirtualScanCode = 0x2e;
-            record.Event.KeyEvent.uChar.UnicodeChar = 3;
-            record.Event.KeyEvent.dwControlKeyState = LEFT_CTRL_PRESSED;
-        }
+        let length = u32::try_from(records.len()).map_err(io::Error::other)?;
         let mut written = 0;
-        if WriteConsoleInputW(input.as_raw_handle(), records.as_ptr(), 2, &mut written) == 0 {
+        if WriteConsoleInputW(input.as_raw_handle(), records.as_ptr(), length, &mut written) == 0 {
             return Err(io::Error::last_os_error());
         }
     }
     Ok(())
 }
 
-unsafe extern "system" fn swallow(event: u32) -> i32 {
-    i32::from(event == CTRL_C_EVENT || event == CTRL_BREAK_EVENT)
+fn press_ctrl_c() -> io::Result<()> {
+    write_input(&key(3, u16::from(b'C'), 0x2e, LEFT_CTRL_PRESSED))
+}
+
+pub fn type_text(text: &str) -> io::Result<()> {
+    let records: Vec<INPUT_RECORD> = text.encode_utf16().flat_map(|unit| key(unit, 0, 0, 0)).collect();
+    write_input(&records)
+}
+
+pub fn press_enter() -> io::Result<()> {
+    write_input(&key(u16::from(b'\r'), VK_RETURN, 0x1c, 0))
+}
+
+pub fn input_idle() -> Option<Duration> {
+    let mut info = LASTINPUTINFO { cbSize: size_of::<LASTINPUTINFO>() as u32, dwTime: 0 };
+    if unsafe { GetLastInputInfo(&mut info) } == 0 {
+        return None;
+    }
+    Some(Duration::from_millis(u64::from(unsafe { GetTickCount() }.wrapping_sub(info.dwTime))))
+}
+
+pub fn processes() -> io::Result<std::collections::HashMap<u32, (u32, String)>> {
+    let mut parents = std::collections::HashMap::new();
+    unsafe {
+        let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if snapshot == INVALID_HANDLE_VALUE {
+            return Err(io::Error::last_os_error());
+        }
+        let snapshot = OwnedHandle::from_raw_handle(snapshot);
+        let mut entry: PROCESSENTRY32W = zeroed();
+        entry.dwSize = size_of::<PROCESSENTRY32W>() as u32;
+        let mut more = Process32FirstW(snapshot.as_raw_handle(), &mut entry) != 0;
+        while more {
+            let length = entry.szExeFile.iter().position(|unit| *unit == 0).unwrap_or(entry.szExeFile.len());
+            let image = String::from_utf16_lossy(&entry.szExeFile[..length]);
+            parents.insert(entry.th32ProcessID, (entry.th32ParentProcessID, image));
+            more = Process32NextW(snapshot.as_raw_handle(), &mut entry) != 0;
+        }
+    }
+    Ok(parents)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum Tab {
+    Closed,
+    SessionEnding,
+}
+
+/// A window closing while the session shuts down also sends CTRL_CLOSE, so only the shutdown flag tells it apart.
+fn tab(event: u32, shutting_down: bool) -> Option<Tab> {
+    match event {
+        CTRL_CLOSE_EVENT if !shutting_down => Some(Tab::Closed),
+        CTRL_CLOSE_EVENT | CTRL_LOGOFF_EVENT | CTRL_SHUTDOWN_EVENT => Some(Tab::SessionEnding),
+        _ => None,
+    }
+}
+
+static TAB_CLOSED: OnceLock<Box<dyn Fn() + Send + Sync>> = OnceLock::new();
+static SESSION_ENDING: AtomicBool = AtomicBool::new(false);
+
+fn shutting_down() -> bool {
+    unsafe { GetSystemMetrics(SM_SHUTTINGDOWN) != 0 }
+}
+
+unsafe extern "system" fn console_event(event: u32) -> i32 {
+    if event == CTRL_C_EVENT || event == CTRL_BREAK_EVENT {
+        return 1;
+    }
+    match tab(event, shutting_down()) {
+        Some(Tab::Closed) => {
+            if let Some(closed) = TAB_CLOSED.get() {
+                closed();
+            }
+        }
+        Some(Tab::SessionEnding) => SESSION_ENDING.store(true, Ordering::SeqCst),
+        None => {}
+    }
+    0
+}
+
+pub fn on_tab_closed(closed: Box<dyn Fn() + Send + Sync>) {
+    let _ = TAB_CLOSED.set(closed);
+}
+
+pub fn session_ending() -> bool {
+    SESSION_ENDING.load(Ordering::SeqCst) || shutting_down()
 }
 
 pub fn prepare_wrapper() -> io::Result<()> {
     unsafe {
-        if SetConsoleCtrlHandler(None, 0) == 0 || SetConsoleCtrlHandler(Some(swallow), 1) == 0 {
+        if SetConsoleCtrlHandler(None, 0) == 0 || SetConsoleCtrlHandler(Some(console_event), 1) == 0 {
             return Err(io::Error::last_os_error());
         }
     }
@@ -283,4 +385,25 @@ pub fn hidden(program: &str, hook: &Path) -> Command {
     let mut command = Command::new(hook);
     command.arg("--").arg(program);
     command
+}
+
+#[cfg(test)]
+mod tests {
+    use windows_sys::Win32::System::Console::{
+        CTRL_BREAK_EVENT, CTRL_C_EVENT, CTRL_CLOSE_EVENT, CTRL_LOGOFF_EVENT, CTRL_SHUTDOWN_EVENT,
+    };
+
+    use super::{Tab, tab};
+
+    #[test]
+    fn only_a_close_outside_shutdown_closes_the_tab() {
+        assert_eq!(tab(CTRL_CLOSE_EVENT, false), Some(Tab::Closed));
+        assert_eq!(tab(CTRL_CLOSE_EVENT, true), Some(Tab::SessionEnding));
+        for shutting_down in [false, true] {
+            assert_eq!(tab(CTRL_LOGOFF_EVENT, shutting_down), Some(Tab::SessionEnding));
+            assert_eq!(tab(CTRL_SHUTDOWN_EVENT, shutting_down), Some(Tab::SessionEnding));
+            assert_eq!(tab(CTRL_C_EVENT, shutting_down), None);
+            assert_eq!(tab(CTRL_BREAK_EVENT, shutting_down), None);
+        }
+    }
 }
