@@ -156,6 +156,12 @@ pub fn prepare_wrapper() -> io::Result<()> {
     }
 }
 
+pub fn on_tab_closed(_closed: Box<dyn Fn() + Send + Sync>) {}
+
+pub fn session_ending() -> bool {
+    false
+}
+
 pub fn started_at(pid: u32) -> io::Result<Option<SystemTime>> {
     let pid = libc::pid_t::try_from(pid).map_err(io::Error::other)?;
     let Some(fields) = stat_fields(pid)? else { return Ok(None) };

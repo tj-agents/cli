@@ -641,6 +641,18 @@ fn an_agent_that_exits_ends_the_launch_and_keeps_the_worktree() {
 }
 
 #[test]
+fn a_launch_is_open_while_its_agent_runs_and_closed_once_it_exits() {
+    let sandbox = sandbox();
+    let child = start(&sandbox, "tab", "claude", "exit", "10");
+    let output = finish(child, Duration::from_secs(60));
+    assert_eq!(output.status.code(), Some(3));
+    let store = log(&sandbox, "stubs/agent-store.log");
+    let opened = store.find("set-open --launch-id tab --open true").expect("the launch was never marked open");
+    let closed = store.find("set-open --launch-id tab --open false").expect("the launch was never marked closed");
+    assert!(opened < closed, "{store}");
+}
+
+#[test]
 fn an_agent_that_exits_after_delivery_cleans_its_owned_worktrees() {
     for host in ["claude", "codex"] {
         let sandbox = sandbox();

@@ -327,10 +327,25 @@ fn rfc3339(time: SystemTime) -> String {
     chrono::DateTime::<chrono::Utc>::from(time).to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
 }
 
+fn mark_open(launch_id: &str, open: bool) {
+    if let Err(error) = store::set_open(launch_id, open) {
+        eprintln!("tj run: {error:#}");
+    }
+}
+
 pub fn run(args: Args) -> Result<ExitCode> {
     agent::prepare_wrapper().context("could not prepare the console")?;
-    let exe = std::env::current_exe().context("could not locate the tj executable")?;
     let launch = launch(&args)?;
+    let id = launch.id.clone();
+    let result = supervise(&args, launch);
+    if !agent::session_ending() {
+        mark_open(&id, false);
+    }
+    result
+}
+
+fn supervise(args: &Args, launch: Launch) -> Result<ExitCode> {
+    let exe = std::env::current_exe().context("could not locate the tj executable")?;
     let marks = marks(&launch.id)?;
     if !args.successor {
         let _ = std::fs::remove_dir_all(&marks);
@@ -346,6 +361,11 @@ pub fn run(args: Args) -> Result<ExitCode> {
     if !args.successor {
         record_launch(&launch, args.parent.as_deref(), pid, &started_at);
     }
+    mark_open(&launch.id, true);
+    let closed = launch.id.clone();
+    agent::on_tab_closed(Box::new(move || {
+        let _ = store::set_open(&closed, false);
+    }));
     prepare(&launch, &args.agent);
     let mut agent = Agent::start(&args.agent, &launch.cwd, &environment)
         .with_context(|| format!("could not start {}", args.agent[0].to_string_lossy()))?;
@@ -414,7 +434,7 @@ pub fn run(args: Args) -> Result<ExitCode> {
             }
             Some(update::gate::Apply::Binary) => {
                 let exe = watcher.exe().to_path_buf();
-                if let Some(code) = restart(&mut agent, &mut watch, &args, &exe)? {
+                if let Some(code) = restart(&mut agent, &mut watch, args, &exe)? {
                     return Ok(code);
                 }
             }
