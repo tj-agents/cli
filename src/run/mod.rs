@@ -229,7 +229,7 @@ impl Watch {
                     self.rollout =
                         store::bound_session(&self.launch.id).ok().flatten().and_then(|thread| turn::rollout(&thread));
                 }
-                (self.rollout.as_deref().and_then(turn::codex), 0)
+                (self.rollout.as_deref().and_then(turn::codex), turn::shells(agent))
             }
         }
     }
