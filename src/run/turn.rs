@@ -7,7 +7,7 @@ use tj_cli::process::agent;
 
 use crate::paths;
 
-const SHELLS: &[&str] = &["bash", "sh", "zsh", "fish", "pwsh", "powershell"];
+const SHELLS: &[&str] = &["bash", "sh", "dash", "zsh", "fish", "pwsh", "powershell"];
 const TAIL: u64 = 64 * 1024;
 
 /// The host's latest turn as the host itself records it: waiting for input or not, and since when.

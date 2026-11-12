@@ -168,7 +168,7 @@ fn run_arguments(sandbox: &Sandbox, launch: &str, host: &str, mode: &str, grace:
 
 fn start(sandbox: &Sandbox, launch: &str, host: &str, mode: &str, grace: &str) -> Child {
     let child = spawn(sandbox, &run_arguments(sandbox, launch, host, mode, grace), &sandbox.root);
-    wait_for_log(sandbox, "agent ");
+    wait_for_log(sandbox, "pid ");
     child
 }
 
