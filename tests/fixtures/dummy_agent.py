@@ -33,7 +33,7 @@ def shell(start: bool) -> None:
         command = (
             ["powershell", "-NoProfile", "-Command", "Start-Sleep 600"]
             if WINDOWS
-            else ["sh", "-c", "sleep 600"]
+            else ["sh", "-c", "sleep 600; true"]
         )
         SHELLS.append(subprocess.Popen(command))
     while not start and SHELLS:
