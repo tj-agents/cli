@@ -200,6 +200,10 @@ opens one. It starts the agent as its child: in a Job Object on Windows, or in i
 group on Linux, where the agent also dies with the wrapper. It registers the launch with `agent-store
 launch` and exports `TJ_RUN_PID`, `TJ_RUN_STARTED_AT`, `TJ_RUN_LAUNCH_ID` and `AGENT_CLI_TAB_TITLE` to the agent.
 
+It marks the launch open (`agent-store set-open`) when it starts and closed when it exits or, on Windows, when
+the user closes the tab. A logoff, shutdown or crash leaves it open, so `tj recover --open` reopens exactly the
+tabs that were open. On Linux a closed tab hangs the wrapper up before it can record the close.
+
 Only the agent's command line is required, so a shell function can run a typed `claude` or `codex` under it:
 the host defaults to the executable's name, the folder to the current one, the title to the repository or
 worktree folder's name (suffixed `-2`, `-3`… while an open launch holds it) and the launch id to a random one.

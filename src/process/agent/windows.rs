@@ -6,6 +6,8 @@ use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::path::Path;
 use std::process::Command;
 use std::ptr::{null, null_mut};
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use windows_sys::Win32::Foundation::{
@@ -13,8 +15,9 @@ use windows_sys::Win32::Foundation::{
 };
 use windows_sys::Win32::Storage::FileSystem::{CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING};
 use windows_sys::Win32::System::Console::{
-    CTRL_BREAK_EVENT, CTRL_C_EVENT, GenerateConsoleCtrlEvent, INPUT_RECORD, KEY_EVENT, LEFT_CTRL_PRESSED,
-    STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, SetConsoleCtrlHandler, WriteConsoleInputW,
+    CTRL_BREAK_EVENT, CTRL_C_EVENT, CTRL_CLOSE_EVENT, CTRL_LOGOFF_EVENT, CTRL_SHUTDOWN_EVENT, GenerateConsoleCtrlEvent,
+    INPUT_RECORD, KEY_EVENT, LEFT_CTRL_PRESSED, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+    SetConsoleCtrlHandler, WriteConsoleInputW,
 };
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
@@ -32,6 +35,7 @@ use windows_sys::Win32::System::Threading::{
     STARTUPINFOEXW, UpdateProcThreadAttribute, WaitForSingleObject,
 };
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetLastInputInfo, LASTINPUTINFO, VK_RETURN};
+use windows_sys::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_SHUTTINGDOWN};
 
 use super::super::windows::{AttributeList, command_line, inherited_handle, is_batch, raw, wide};
 use super::Stop;
@@ -295,13 +299,55 @@ pub fn processes() -> io::Result<std::collections::HashMap<u32, (u32, String)>> 
     Ok(parents)
 }
 
-unsafe extern "system" fn swallow(event: u32) -> i32 {
-    i32::from(event == CTRL_C_EVENT || event == CTRL_BREAK_EVENT)
+#[derive(Debug, PartialEq, Eq)]
+enum Tab {
+    Closed,
+    SessionEnding,
+}
+
+/// A window closing while the session shuts down also sends CTRL_CLOSE, so only the shutdown flag tells it apart.
+fn tab(event: u32, shutting_down: bool) -> Option<Tab> {
+    match event {
+        CTRL_CLOSE_EVENT if !shutting_down => Some(Tab::Closed),
+        CTRL_CLOSE_EVENT | CTRL_LOGOFF_EVENT | CTRL_SHUTDOWN_EVENT => Some(Tab::SessionEnding),
+        _ => None,
+    }
+}
+
+static TAB_CLOSED: OnceLock<Box<dyn Fn() + Send + Sync>> = OnceLock::new();
+static SESSION_ENDING: AtomicBool = AtomicBool::new(false);
+
+fn shutting_down() -> bool {
+    unsafe { GetSystemMetrics(SM_SHUTTINGDOWN) != 0 }
+}
+
+unsafe extern "system" fn console_event(event: u32) -> i32 {
+    if event == CTRL_C_EVENT || event == CTRL_BREAK_EVENT {
+        return 1;
+    }
+    match tab(event, shutting_down()) {
+        Some(Tab::Closed) => {
+            if let Some(closed) = TAB_CLOSED.get() {
+                closed();
+            }
+        }
+        Some(Tab::SessionEnding) => SESSION_ENDING.store(true, Ordering::SeqCst),
+        None => {}
+    }
+    0
+}
+
+pub fn on_tab_closed(closed: Box<dyn Fn() + Send + Sync>) {
+    let _ = TAB_CLOSED.set(closed);
+}
+
+pub fn session_ending() -> bool {
+    SESSION_ENDING.load(Ordering::SeqCst) || shutting_down()
 }
 
 pub fn prepare_wrapper() -> io::Result<()> {
     unsafe {
-        if SetConsoleCtrlHandler(None, 0) == 0 || SetConsoleCtrlHandler(Some(swallow), 1) == 0 {
+        if SetConsoleCtrlHandler(None, 0) == 0 || SetConsoleCtrlHandler(Some(console_event), 1) == 0 {
             return Err(io::Error::last_os_error());
         }
     }
@@ -339,4 +385,25 @@ pub fn hidden(program: &str, hook: &Path) -> Command {
     let mut command = Command::new(hook);
     command.arg("--").arg(program);
     command
+}
+
+#[cfg(test)]
+mod tests {
+    use windows_sys::Win32::System::Console::{
+        CTRL_BREAK_EVENT, CTRL_C_EVENT, CTRL_CLOSE_EVENT, CTRL_LOGOFF_EVENT, CTRL_SHUTDOWN_EVENT,
+    };
+
+    use super::{Tab, tab};
+
+    #[test]
+    fn only_a_close_outside_shutdown_closes_the_tab() {
+        assert_eq!(tab(CTRL_CLOSE_EVENT, false), Some(Tab::Closed));
+        assert_eq!(tab(CTRL_CLOSE_EVENT, true), Some(Tab::SessionEnding));
+        for shutting_down in [false, true] {
+            assert_eq!(tab(CTRL_LOGOFF_EVENT, shutting_down), Some(Tab::SessionEnding));
+            assert_eq!(tab(CTRL_SHUTDOWN_EVENT, shutting_down), Some(Tab::SessionEnding));
+            assert_eq!(tab(CTRL_C_EVENT, shutting_down), None);
+            assert_eq!(tab(CTRL_BREAK_EVENT, shutting_down), None);
+        }
+    }
 }
