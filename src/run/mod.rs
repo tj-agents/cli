@@ -8,6 +8,7 @@ use std::ffi::{OsStr, OsString};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
+use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result, bail};
@@ -327,10 +328,36 @@ fn rfc3339(time: SystemTime) -> String {
     chrono::DateTime::<chrono::Utc>::from(time).to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
 }
 
+static OPEN_RECORD: Mutex<()> = Mutex::new(());
+
+fn mark_open(launch_id: &str, open: bool) {
+    let _record = OPEN_RECORD.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Err(error) = store::set_open(launch_id, open) {
+        eprintln!("tj run: {error:#}");
+    }
+}
+
+/// Holds the record lock until the process exits, so no later write can mark the closed tab open again.
+fn mark_closed(launch_id: &str) {
+    std::mem::forget(OPEN_RECORD.lock().unwrap_or_else(PoisonError::into_inner));
+    let _ = store::set_open(launch_id, false);
+}
+
 pub fn run(args: Args) -> Result<ExitCode> {
     agent::prepare_wrapper().context("could not prepare the console")?;
-    let exe = std::env::current_exe().context("could not locate the tj executable")?;
     let launch = launch(&args)?;
+    let id = launch.id.clone();
+    let closed = launch.id.clone();
+    agent::on_tab_closed(Box::new(move || mark_closed(&closed)));
+    let result = supervise(&args, launch);
+    if !agent::session_ending() {
+        mark_open(&id, false);
+    }
+    result
+}
+
+fn supervise(args: &Args, launch: Launch) -> Result<ExitCode> {
+    let exe = std::env::current_exe().context("could not locate the tj executable")?;
     let marks = marks(&launch.id)?;
     if !args.successor {
         let _ = std::fs::remove_dir_all(&marks);
@@ -346,6 +373,7 @@ pub fn run(args: Args) -> Result<ExitCode> {
     if !args.successor {
         record_launch(&launch, args.parent.as_deref(), pid, &started_at);
     }
+    mark_open(&launch.id, true);
     prepare(&launch, &args.agent);
     let mut agent = Agent::start(&args.agent, &launch.cwd, &environment)
         .with_context(|| format!("could not start {}", args.agent[0].to_string_lossy()))?;
@@ -414,7 +442,7 @@ pub fn run(args: Args) -> Result<ExitCode> {
             }
             Some(update::gate::Apply::Binary) => {
                 let exe = watcher.exe().to_path_buf();
-                if let Some(code) = restart(&mut agent, &mut watch, &args, &exe)? {
+                if let Some(code) = restart(&mut agent, &mut watch, args, &exe)? {
                     return Ok(code);
                 }
             }

@@ -62,6 +62,17 @@ pub fn prepare_wrapper() -> io::Result<()> {
     os::prepare_wrapper()
 }
 
+/// Runs `closed` when the user closes the wrapper's tab, but not when the OS session is logging off or shutting
+/// down. Windows only; elsewhere the tab's hangup ends the wrapper unrecorded.
+pub fn on_tab_closed(closed: Box<dyn Fn() + Send + Sync>) {
+    os::on_tab_closed(closed);
+}
+
+/// Whether the OS session is logging off or shutting down, which ends the tab without the user closing it.
+pub fn session_ending() -> bool {
+    os::session_ending()
+}
+
 /// When a still-running process started, for telling a live wrapper from a reused pid.
 pub fn started_at(pid: u32) -> io::Result<Option<SystemTime>> {
     os::started_at(pid)
