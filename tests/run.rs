@@ -121,6 +121,7 @@ fn environment(sandbox: &Sandbox) -> Vec<(&'static str, std::ffi::OsString)> {
         ("DUMMY_LOG", sandbox.log.clone().into_os_string()),
         ("DUMMY_TJ", std::ffi::OsString::from(env!("CARGO_BIN_EXE_tj"))),
         ("CLAUDE_CONFIG_DIR", sandbox.root.join("claude").into_os_string()),
+        ("CODEX_HOME", sandbox.root.join("codex").into_os_string()),
         ("HOME", home.clone()),
         ("APPDATA", home.clone()),
         ("XDG_CONFIG_HOME", home),
@@ -167,7 +168,7 @@ fn run_arguments(sandbox: &Sandbox, launch: &str, host: &str, mode: &str, grace:
 
 fn start(sandbox: &Sandbox, launch: &str, host: &str, mode: &str, grace: &str) -> Child {
     let child = spawn(sandbox, &run_arguments(sandbox, launch, host, mode, grace), &sandbox.root);
-    wait_for_log(sandbox, "agent ");
+    wait_for_log(sandbox, "pid ");
     child
 }
 
@@ -240,14 +241,15 @@ fn in_agent(sandbox: &Sandbox, arguments: &[&str]) -> (i32, String) {
     }
 }
 
-fn done(sandbox: &Sandbox, cancel: bool) {
-    let arguments: &[&str] = if cancel { &["done", "--cancel"] } else { &["done"] };
-    let (code, stderr) = in_agent(sandbox, arguments);
+/// The agent's last step, as a host runs it: `tj done` inside a turn, which then ends.
+fn done(sandbox: &Sandbox) {
+    let (code, stderr) = in_agent(sandbox, &["done"]);
     assert_eq!(code, 0, "tj done: {stderr}");
+    set_turn(sandbox, true);
 }
 
 fn refused(sandbox: &Sandbox, child: &mut Child, launch: &str) {
-    done(sandbox, false);
+    done(sandbox);
     let mark = sandbox.root.join("cache").join("run").join(launch).join("done");
     let deadline = Instant::now() + Duration::from_secs(30);
     while mark.exists() {
@@ -274,6 +276,21 @@ fn set_status(sandbox: &Sandbox, status: &str) {
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis();
     let record = serde_json::json!({"pid": pid.parse::<u32>().unwrap(), "status": status, "statusUpdatedAt": now});
     std::fs::write(sessions.join(format!("{pid}.json")), record.to_string()).unwrap();
+}
+
+/// Starts or ends a turn the way each host records it: Claude's status record and the Codex thread's rollout.
+fn set_turn(sandbox: &Sandbox, idle: bool) {
+    set_status(sandbox, if idle { "idle" } else { "busy" });
+    let folder = sandbox.root.join("codex").join("sessions").join("2026").join("11").join("11");
+    std::fs::create_dir_all(&folder).unwrap();
+    let event = serde_json::json!({
+        "timestamp": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        "type": "event_msg",
+        "payload": {"type": if idle { "task_complete" } else { "task_started" }},
+    });
+    let rollout = folder.join("rollout-2026-11-11T00-00-00-sess-1.jsonl");
+    let mut file = std::fs::OpenOptions::new().create(true).append(true).open(rollout).unwrap();
+    writeln!(file, "{event}").unwrap();
 }
 
 fn publish(sandbox: &Sandbox, host: &str, revision: &str) {
@@ -396,7 +413,7 @@ fn a_merge_mid_session_asks_the_agent_once_and_only_its_done_closes_out() {
     let asked = log(&sandbox, "stubs/codex.log");
     assert_eq!(asked.lines().count(), 1, "{asked}");
     assert!(asked.contains("tj done"), "{asked}");
-    done(&sandbox, false);
+    done(&sandbox);
     let output = finish(child, Duration::from_secs(60));
     assert_closed_out(&sandbox, &output, "merged-during");
 }
@@ -427,7 +444,7 @@ fn closes_out_the_worktree_bound_after_launch() {
             }
         });
         set_reply(&sandbox, "agent-store-show.json", &binding.to_string());
-        done(&sandbox, false);
+        done(&sandbox);
         let output = finish(child, Duration::from_secs(60));
         assert_closed_out(&sandbox, &output, &launch);
         let store = log(&sandbox, "stubs/agent-store.log");
@@ -463,7 +480,7 @@ fn an_unrelated_worktree_binding_does_not_stop_or_clean_the_agent() {
         binding["data"]["session"]["host"] = serde_json::json!("claude");
         binding["data"]["session"]["worktree"] = serde_json::json!(sandbox.worktree);
         set_reply(&sandbox, "agent-store-show.json", &binding.to_string());
-        done(&sandbox, false);
+        done(&sandbox);
         let output = finish(child, Duration::from_secs(60));
         assert_closed_out(&sandbox, &output, launch);
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -524,23 +541,90 @@ fn an_orphaned_launch_cleans_its_bound_worktree_when_the_launch_directory_is_gon
 fn closes_out_after_done_and_idle() {
     let sandbox = sandbox();
     let child = start(&sandbox, "idle", "claude", "signal", "10");
-    done(&sandbox, false);
+    done(&sandbox);
     let output = finish(child, Duration::from_secs(60));
     assert_closed_out(&sandbox, &output, "idle");
     assert!(log(&sandbox, "dummy.log").contains("graceful"), "the agent was not stopped gracefully");
     assert!(git(&sandbox.primary, &["branch", "--list", "Feature/1"]).is_empty(), "the merged branch is still there");
 }
 
+fn start_host(sandbox: &Sandbox, launch: &str, host: &str) -> Child {
+    let keys = cfg!(windows) && host == "codex";
+    let child = start(sandbox, launch, host, if keys { "keys" } else { "signal" }, "10");
+    wait_for_log(sandbox, if keys { "raw" } else { "agent " });
+    child
+}
+
 #[test]
-fn new_input_cancels_done_and_mark_closing_still_closes() {
+fn a_turn_started_after_done_withdraws_it_and_mark_closing_still_closes() {
+    for host in ["claude", "codex"] {
+        let sandbox = sandbox();
+        let launch = format!("withdrawn-{host}");
+        let mut child = start_host(&sandbox, &launch, host);
+        assert_eq!(in_agent(&sandbox, &["done"]).0, 0);
+        set_turn(&sandbox, false);
+        let mark = sandbox.root.join("cache").join("run").join(&launch).join("done");
+        wait_until("the new turn never withdrew tj done", || !mark.exists());
+        set_turn(&sandbox, true);
+        still_running(&mut child, Duration::from_secs(5));
+        assert!(!log(&sandbox, "dummy.log").contains("graceful"), "the agent was stopped");
+        set_reply(&sandbox, "agent-store-show.json", CLOSING);
+        let output = finish(child, Duration::from_secs(60));
+        assert_closed_out(&sandbox, &output, &launch);
+    }
+}
+
+#[test]
+fn done_waits_for_the_turn_that_ran_it_to_end_however_long_it_takes() {
+    for host in ["claude", "codex"] {
+        let sandbox = sandbox();
+        let launch = format!("running-{host}");
+        let mut child = start_host(&sandbox, &launch, host);
+        set_turn(&sandbox, false);
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(in_agent(&sandbox, &["done"]).0, 0);
+        still_running(&mut child, Duration::from_secs(5));
+        assert!(sandbox.root.join("cache").join("run").join(&launch).join("done").exists());
+        set_turn(&sandbox, true);
+        let output = finish(child, Duration::from_secs(60));
+        assert_closed_out(&sandbox, &output, &launch);
+    }
+}
+
+#[test]
+fn a_shell_left_running_under_the_agent_keeps_done_waiting() {
+    for host in ["claude", "codex"] {
+        let sandbox = sandbox();
+        let launch = format!("shell-{host}");
+        let mut child = start_host(&sandbox, &launch, host);
+        assert_eq!(in_agent(&sandbox, &["shell", "start"]).0, 0);
+        done(&sandbox);
+        still_running(&mut child, Duration::from_secs(6));
+        assert!(sandbox.root.join("cache").join("run").join(&launch).join("done").exists());
+        assert_eq!(in_agent(&sandbox, &["shell", "stop"]).0, 0);
+        let output = finish(child, Duration::from_secs(60));
+        assert_closed_out(&sandbox, &output, &launch);
+    }
+}
+
+#[test]
+fn an_agent_that_exits_after_done_closes_out_without_waiting() {
     let sandbox = sandbox();
-    let mut child = start(&sandbox, "cancel", "claude", "signal", "10");
-    done(&sandbox, false);
-    done(&sandbox, true);
-    still_running(&mut child, Duration::from_secs(5));
-    set_reply(&sandbox, "agent-store-show.json", CLOSING);
+    let child = start(&sandbox, "done-exit", "claude", "signal", "10");
+    set_turn(&sandbox, false);
+    std::thread::sleep(Duration::from_millis(50));
+    assert_eq!(in_agent(&sandbox, &["done"]).0, 0);
+    let pid = log(&sandbox, "dummy.log").lines().rev().find_map(|line| line.strip_prefix("pid ")).unwrap().to_owned();
+    let mut kill = if cfg!(windows) { Command::new("taskkill") } else { Command::new("kill") };
+    if cfg!(windows) {
+        kill.args(["/PID", pid.as_str(), "/F"]);
+    } else {
+        kill.arg(&pid);
+    }
+    assert!(kill.output().unwrap().status.success());
     let output = finish(child, Duration::from_secs(60));
-    assert_closed_out(&sandbox, &output, "cancel");
+    assert!(!sandbox.worktree.exists(), "stderr: {}", String::from_utf8_lossy(&output.stderr));
+    assert!(log(&sandbox, "stubs/agent-store.log").contains("end --launch-id done-exit --reason closed"));
 }
 
 #[test]
@@ -556,7 +640,7 @@ fn unmerged_commits_keep_the_session_open_until_delivered() {
     git(&sandbox.primary, &["merge", "--squash", "Feature/1"]);
     git(&sandbox.primary, &["commit", "-q", "-m", "squash work"]);
     git(&sandbox.primary, &["push", "-q", "origin", "main"]);
-    done(&sandbox, false);
+    done(&sandbox);
     let output = finish(child, Duration::from_secs(60));
     assert!(String::from_utf8_lossy(&output.stderr).contains("worktree has unmerged commits"));
     assert_eq!(output.status.code(), Some(0));
@@ -567,7 +651,7 @@ fn unmerged_commits_keep_the_session_open_until_delivered() {
 fn an_agent_ignoring_the_stop_is_killed_with_its_tree() {
     let sandbox = sandbox();
     let child = start(&sandbox, "stubborn", "claude", "stubborn", "2");
-    done(&sandbox, false);
+    done(&sandbox);
     let output = finish(child, Duration::from_secs(60));
     assert_closed_out(&sandbox, &output, "stubborn");
     assert!(!log(&sandbox, "dummy.log").contains("graceful"));
@@ -600,6 +684,7 @@ fn the_launch_is_recorded_before_the_agent_starts() {
 #[test]
 fn repository_preparation_finishes_before_the_agent_starts() {
     let sandbox = sandbox();
+    select_tj_agents_checked(&sandbox);
     let mut arguments = run_arguments(&sandbox, "prepared", "codex", "exit", "10");
     arguments.truncate(arguments.iter().position(|argument| argument == "--").unwrap() + 1);
     let preparation_log = sandbox.stubs.join("tj-prepare.log");
@@ -622,12 +707,22 @@ fn repository_preparation_finishes_before_the_agent_starts() {
 #[test]
 fn repository_preparation_failure_warns_and_still_starts_the_agent() {
     let sandbox = sandbox();
+    select_tj_agents_checked(&sandbox);
     std::fs::write(sandbox.stubs.join("prepare-failure"), "failed").unwrap();
     let child = start(&sandbox, "prepare-failed", "claude", "exit", "10");
     let output = finish(child, Duration::from_secs(30));
     assert_eq!(output.status.code(), Some(3));
     assert!(String::from_utf8_lossy(&output.stderr).contains("standards preparation failed"));
     assert!(log(&sandbox, "dummy.log").contains("agent prepare-failed"));
+}
+
+#[test]
+fn a_repository_without_tj_agents_starts_the_agent_without_preparation() {
+    let sandbox = sandbox();
+    let child = start(&sandbox, "unprepared", "claude", "exit", "10");
+    let output = finish(child, Duration::from_secs(30));
+    assert_eq!(output.status.code(), Some(3), "{}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(log(&sandbox, "stubs/tj-prepare.log"), "", "prepared a repository that selects no tj-agents plugins");
 }
 
 #[test]
@@ -679,7 +774,7 @@ fn codex_is_stopped_with_a_ctrl_c_keypress() {
     let sandbox = sandbox();
     let child = start(&sandbox, "codex", "codex", "keys", "10");
     wait_for_log(&sandbox, "raw");
-    done(&sandbox, false);
+    done(&sandbox);
     let output = finish(child, Duration::from_secs(60));
     assert_closed_out(&sandbox, &output, "codex");
     assert!(log(&sandbox, "dummy.log").contains("graceful"), "the keypress did not reach the agent");
@@ -724,7 +819,7 @@ fn tmux_pane_closes_after_codex_is_stopped_with_a_keypress() {
     }
     assert!(tmux.arg(script).status().unwrap().success());
     wait_for_log(&sandbox, "raw");
-    done(&sandbox, false);
+    done(&sandbox);
     let deadline = Instant::now() + Duration::from_secs(60);
     while Command::new("tmux").arg("-S").arg(&socket).args(["has-session", "-t", "run"]).status().unwrap().success() {
         if Instant::now() > deadline {
@@ -754,7 +849,7 @@ processes:
 }
 
 #[test]
-fn done_outside_tj_run_fails_but_cancel_is_a_no_op() {
+fn done_outside_tj_run_fails() {
     let run = |arguments: &[&str]| {
         let mut output = Command::new(env!("CARGO_BIN_EXE_tj"))
             .args(arguments)
@@ -768,7 +863,6 @@ fn done_outside_tj_run_fails_but_cancel_is_a_no_op() {
     };
     let (succeeded, stderr) = run(&["done"]);
     assert!(!succeeded && stderr.contains("only works inside a tj run session"));
-    assert!(run(&["done", "--cancel"]).0);
 }
 
 fn with_prompt(sandbox: &Sandbox, launch: &str, host: &str, mode: &str) -> Vec<String> {
@@ -823,11 +917,8 @@ fn only_the_tabs_own_agent_can_mark_it_done() {
     assert!(!mark.exists(), "a process outside the tab marked it done");
     assert!(foreign(&["launch"]).stdout.is_empty());
     assert_eq!(in_agent(&sandbox, &["launch"]).0, 0);
-    done(&sandbox, false);
-    assert!(foreign(&["done", "--cancel"]).status.success());
-    assert!(mark.exists(), "a process outside the tab cancelled its done mark");
-    done(&sandbox, true);
-    assert!(!mark.exists());
+    assert_eq!(in_agent(&sandbox, &["done"]).0, 0);
+    assert!(mark.exists());
     still_running(&mut child, Duration::from_secs(1));
     set_reply(&sandbox, "agent-store-show.json", CLOSING);
     let output = finish(child, Duration::from_secs(60));
@@ -1005,7 +1096,7 @@ fn closes_out_all_owned_worktrees_across_repositories() {
         claim(&sandbox, &launch, host, &[sandbox.worktree.clone(), extra.clone(), other.worktree.clone()]);
         let child = spawn(&sandbox, &arguments, &sandbox.root);
         wait_for_log(&sandbox, if keys { "raw" } else { "agent " });
-        done(&sandbox, false);
+        done(&sandbox);
         let output = finish(child, Duration::from_secs(120));
         assert_closed_out(&sandbox, &output, &launch);
         assert!(!extra.exists());
@@ -1030,7 +1121,7 @@ fn one_dirty_owned_worktree_keeps_every_worktree_and_the_agent_open() {
     assert!(!log(&sandbox, "stubs/agent-store.log").contains("release-worktree"));
     assert!(!log(&sandbox, "stubs/tj-item.log").contains("--state Done"));
     std::fs::remove_file(extra.join("unfinished.txt")).unwrap();
-    done(&sandbox, false);
+    done(&sandbox);
     let output = finish(child, Duration::from_secs(120));
     assert_closed_out(&sandbox, &output, "dirty-collection");
     assert!(!extra.exists());
@@ -1056,7 +1147,7 @@ fn another_live_session_blocks_closeout_even_when_its_metadata_says_ended() {
     refused(&sandbox, &mut child, "live-owner");
     assert!(sandbox.worktree.exists());
     set_store_list(&sandbox.stubs, "sessions", serde_json::json!([]));
-    done(&sandbox, false);
+    done(&sandbox);
     let output = finish(child, Duration::from_secs(60));
     assert_closed_out(&sandbox, &output, "live-owner");
     assert!(String::from_utf8_lossy(&output.stderr).contains("another session may still be using"));
@@ -1067,7 +1158,7 @@ fn release_failure_keeps_the_claim_and_never_marks_done() {
     let sandbox = sandbox();
     set_reply(&sandbox, "agent-store-release-worktree.json", r#"{"ok":false,"error":{"message":"storage failed"}}"#);
     let child = start(&sandbox, "failed-release", "claude", "signal", "2");
-    done(&sandbox, false);
+    done(&sandbox);
     let output = finish(child, Duration::from_secs(60));
     assert_eq!(output.status.code(), Some(1));
     assert!(!sandbox.worktree.exists());
@@ -1109,7 +1200,7 @@ fn tracker_and_launch_finalization_failures_can_be_retried_after_all_releases() 
         set_reply(&sandbox, failed, r#"{"ok":false,"error":{"message":"finalization failed"}}"#);
         let launch = format!("finalize-{stage}");
         let child = start(&sandbox, &launch, "claude", "signal", "2");
-        done(&sandbox, false);
+        done(&sandbox);
         let output = finish(child, Duration::from_secs(60));
         assert_eq!(output.status.code(), Some(1), "{}", String::from_utf8_lossy(&output.stderr));
         assert!(!sandbox.worktree.exists());
@@ -1142,7 +1233,7 @@ fn changes_written_during_shutdown_are_kept_and_never_marked_done() {
     )
     .unwrap();
     let child = start(&sandbox, "shutdown-change", "claude", "signal", "2");
-    done(&sandbox, false);
+    done(&sandbox);
     let output = finish(child, Duration::from_secs(60));
     assert_eq!(output.status.code(), Some(1));
     assert_eq!(std::fs::read_to_string(sandbox.worktree.join("unfinished.txt")).unwrap(), "unfinished");
@@ -1158,8 +1249,153 @@ fn an_unclaimed_linked_worktree_requires_recovery_before_closing() {
     refused(&sandbox, &mut child, "unclaimed");
     assert!(sandbox.worktree.exists());
     claim(&sandbox, "unclaimed", "claude", std::slice::from_ref(&sandbox.worktree));
-    done(&sandbox, false);
+    done(&sandbox);
     let output = finish(child, Duration::from_secs(60));
     assert_closed_out(&sandbox, &output, "unclaimed");
     assert!(String::from_utf8_lossy(&output.stderr).contains("no recorded ownership; recovery required"));
+}
+
+const MARKETPLACE_SHA: &str = "3f0578aa4000485aa25477e36592978fa5fa750f";
+const UPSTREAM_SHA: &str = "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678";
+
+struct Upstream {
+    url: String,
+    requests: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+impl Upstream {
+    /// Answers every request with `reply`, or holds the connection open without answering when it is empty.
+    fn serve(reply: String) -> Self {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/repos/tj-agents/marketplace/commits/main", listener.local_addr().unwrap());
+        let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = requests.clone();
+        std::thread::spawn(move || {
+            for mut stream in listener.incoming().map_while(Result::ok) {
+                let mut request = Vec::new();
+                let mut byte = [0u8; 1];
+                while !request.ends_with(b"\r\n\r\n") && stream.read(&mut byte).is_ok_and(|read| read == 1) {
+                    request.push(byte[0]);
+                }
+                seen.lock().unwrap().push(String::from_utf8_lossy(&request).to_lowercase());
+                if reply.is_empty() {
+                    std::thread::sleep(Duration::from_secs(120));
+                } else {
+                    let _ = stream.write_all(reply.as_bytes());
+                }
+            }
+        });
+        Self { url, requests }
+    }
+
+    fn unchanged() -> Self {
+        Self::serve("HTTP/1.1 304 Not Modified\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_owned())
+    }
+
+    fn changed() -> Self {
+        Self::serve(format!("HTTP/1.1 200 OK\r\nContent-Length: 40\r\nConnection: close\r\n\r\n{UPSTREAM_SHA}"))
+    }
+
+    fn requests(&self) -> Vec<String> {
+        self.requests.lock().unwrap().clone()
+    }
+}
+
+fn select_tj_agents(sandbox: &Sandbox) {
+    let folder = sandbox.worktree.join(".agents");
+    std::fs::create_dir_all(&folder).unwrap();
+    std::fs::write(folder.join("plugins.json"), r#"{"plugins":["agent@tj-agents"]}"#).unwrap();
+}
+
+/// Selects tj-agents with this minute's update check already done, so the launch makes no request.
+fn select_tj_agents_checked(sandbox: &Sandbox) {
+    select_tj_agents(sandbox);
+    std::fs::create_dir_all(update_state(sandbox, "")).unwrap();
+    for host in ["claude", "codex"] {
+        std::fs::write(update_state(sandbox, &format!("{host}.checked")), "").unwrap();
+    }
+}
+
+fn launch_checking(sandbox: &Sandbox, upstream: &Upstream, launch: &str) -> (Output, Duration) {
+    let mut arguments = run_arguments(sandbox, launch, "claude", "exit", "10");
+    let separator = arguments.iter().position(|argument| argument == "--").unwrap();
+    arguments.splice(separator..separator, ["--update-url".to_owned(), upstream.url.clone()]);
+    let started = Instant::now();
+    let child = spawn(sandbox, &arguments, &sandbox.root);
+    wait_for_log(sandbox, &format!("agent {launch}"));
+    let reached = started.elapsed();
+    (finish(child, Duration::from_secs(60)), reached)
+}
+
+fn update_state(sandbox: &Sandbox, file: &str) -> PathBuf {
+    sandbox.root.join("cache").join("update").join(file)
+}
+
+#[test]
+fn an_unchanged_marketplace_costs_one_conditional_request_a_minute_and_installs_nothing() {
+    let sandbox = sandbox();
+    select_tj_agents(&sandbox);
+    publish(&sandbox, "claude", MARKETPLACE_SHA);
+    let upstream = Upstream::unchanged();
+    let (output, _) = launch_checking(&sandbox, &upstream, "unchanged");
+    assert!(
+        !String::from_utf8_lossy(&output.stderr).contains("tj-agents"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let requests = upstream.requests();
+    assert_eq!(requests.len(), 1);
+    assert!(requests[0].contains(&format!("if-none-match: \"{MARKETPLACE_SHA}\"")), "{}", requests[0]);
+    assert!(requests[0].contains("accept: application/vnd.github.sha"), "{}", requests[0]);
+    launch_checking(&sandbox, &upstream, "again");
+    assert_eq!(upstream.requests().len(), 1, "checked again within a minute");
+    assert_eq!(log(&sandbox, "stubs/tj-plugins.log"), "");
+}
+
+#[test]
+fn a_changed_marketplace_installs_in_the_background_once_per_commit() {
+    let sandbox = sandbox();
+    select_tj_agents(&sandbox);
+    stub(&sandbox.stubs, "tj-plugins", "updated");
+    let upstream = Upstream::changed();
+    let (output, _) = launch_checking(&sandbox, &upstream, "changed");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("updating claude plugins in the background"), "{stderr}");
+    wait_until("tj-plugins never ran", || log(&sandbox, "stubs/tj-plugins.log").contains("update --host claude"));
+    assert!(!upstream.requests()[0].contains("if-none-match"), "{}", upstream.requests()[0]);
+    std::fs::remove_file(update_state(&sandbox, "claude.checked")).unwrap();
+    launch_checking(&sandbox, &upstream, "retry");
+    assert_eq!(upstream.requests().len(), 2);
+    assert_eq!(log(&sandbox, "stubs/tj-plugins.log").lines().count(), 1, "installed the same commit twice");
+}
+
+#[test]
+fn an_unanswered_check_gives_one_line_and_never_holds_the_launch() {
+    let sandbox = sandbox();
+    select_tj_agents(&sandbox);
+    let upstream = Upstream::serve(String::new());
+    let (output, reached) = launch_checking(&sandbox, &upstream, "offline");
+    assert!(
+        reached < Duration::from_secs(60),
+        "the agent waited {reached:?} for GitHub: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(stderr.matches("could not check for tj-agents updates").count(), 1, "{stderr}");
+    assert!(update_state(&sandbox, "claude.checked").exists(), "a failed check is retried at once");
+}
+
+#[test]
+fn a_held_lock_or_a_project_without_tj_agents_makes_no_request() {
+    let sandbox = sandbox();
+    select_tj_agents(&sandbox);
+    let upstream = Upstream::unchanged();
+    std::fs::create_dir_all(update_state(&sandbox, "")).unwrap();
+    std::fs::write(update_state(&sandbox, "claude.lock"), "").unwrap();
+    launch_checking(&sandbox, &upstream, "locked");
+    assert_eq!(upstream.requests().len(), 0, "checked while another launch held the lock");
+    std::fs::remove_file(update_state(&sandbox, "claude.lock")).unwrap();
+    std::fs::write(sandbox.worktree.join(".agents").join("plugins.json"), r#"{"plugins":["agent@agents"]}"#).unwrap();
+    launch_checking(&sandbox, &upstream, "unselected");
+    assert_eq!(upstream.requests().len(), 0, "checked a project that selects no tj-agents plugins");
 }
