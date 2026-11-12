@@ -191,7 +191,6 @@ differ, so only those are split into `linux/` and `windows/`.
 ```text
 tj run [--host claude|codex] [--title T] [--cwd WORKTREE] [--launch-id U] [--item REF] [--parent HOST:ID] -- <agent argv>
 tj done              the session's last step: close out after about 10 idle minutes
-tj done --cancel     new input arrived; withdraw that (a no-op outside tj run)
 tj closeout [REF]    close an item's sessions; with no REF, sweep tabs closed by hand or crashed wrappers
 ```
 
@@ -247,11 +246,15 @@ process in place; Windows keeps the old wrapper as the tab's root, waiting for i
 closes when its first process exits. The launch row, its marks and the conversation are kept. The id is the
 session `agent-store show --launch-id` binds to the launch; with none bound the agent keeps running and the
 wrapper says so once. A resume that exits with an error leaves the tab open with the reason. Codex exposes no
-turn state to the wrapper, so a Codex tab takes an updated `tj` at its next start.
+turn state to the update check, so a Codex tab takes an updated `tj` at its next start.
 
 It closes out only when one of these happens:
 
-- `tj done` was run and no prompt, or Claude tool use, has cancelled it for about 10 minutes;
+- `tj done` was run, the turn that ran it ended, and the agent has stayed idle for about 10 minutes since with no
+  shell running under it. The wrapper reads each turn from the host itself, never from hooks: Claude's
+  `<claude home>/sessions/<pid>.json` and the Codex thread's rollout under `<codex home>/sessions`. A turn started
+  after `tj done`, by a prompt, a queued message or a finished background task, withdraws it, and an unreadable
+  record never closes. While `tj done` stands, the tab applies no update;
 - `agent-store` marks the launch or its session `closing`, which is what `tj closeout REF` does.
 
 A merged PR never stops a session: an item can be merged before its session starts or while it still has
@@ -272,7 +275,7 @@ After stopping its own agent process tree, the wrapper repeats those checks and 
 5. exits 0, so Windows Terminal (`closeOnExit` default) or tmux closes the tab.
 
 Helpers run hidden through `tj_hook` on Windows, and in their own session on Linux, so they never touch the
-agent's console. If the agent exits by itself, nothing is left running, so the wrapper also cleans up when every PR for the item has merged. Otherwise it ends the launch and keeps the unfinished worktrees. It preserves the agent's exit code. `tj closeout` also inspects ended launches whose cleanup has not completed.
+agent's console. If the agent exits by itself, nothing is left running, so the wrapper also cleans up when `tj done` still stands or every PR for the item has merged. Otherwise it ends the launch and keeps the unfinished worktrees. It preserves the agent's exit code. `tj closeout` also inspects ended launches whose cleanup has not completed.
 
 ## `tj message` and `tj subscribe`: messaging between sessions
 
