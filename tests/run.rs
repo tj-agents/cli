@@ -556,6 +556,15 @@ fn start_host(sandbox: &Sandbox, launch: &str, host: &str) -> Child {
 }
 
 #[test]
+fn codex_closes_out_after_done_and_idle() {
+    let sandbox = sandbox();
+    let child = start_host(&sandbox, "idle", "codex");
+    done(&sandbox);
+    let output = finish(child, Duration::from_secs(60));
+    assert_closed_out(&sandbox, &output, "idle");
+}
+
+#[test]
 fn a_turn_started_after_done_withdraws_it_and_mark_closing_still_closes() {
     for host in ["claude", "codex"] {
         let sandbox = sandbox();
@@ -1051,16 +1060,15 @@ fn launch_prints_nothing_outside_tj_run() {
     assert!(output.status.success() && output.stdout.is_empty());
 }
 
-#[test]
-fn a_shell_started_session_needs_only_the_agent_command() {
+fn shell_started_session_needs_only_the_agent_command(host: &str) {
     let sandbox = sandbox();
     set_reply(
         &sandbox,
         "agent-store-launches.json",
-        r#"{"ok":true,"data":{"launches":[{"launch_id":"x","host":"claude","title":"Feature-1","worktree":"w","state":"active","wrapper":{"pid":1,"started_at":"2026-01-01T00:00:00Z"}}]}}"#,
+        &serde_json::json!({"ok": true, "data": {"launches": [{"launch_id": "x", "host": host, "title": "Feature-1", "worktree": "w", "state": "active", "wrapper": {"pid": 1, "started_at": "2026-01-01T00:00:00Z"}}]}}).to_string(),
     );
     let fixture = fixture().to_string_lossy().into_owned();
-    let arguments = ["run", "--host", "claude", "--", python(), &fixture, "exit"].map(str::to_owned);
+    let arguments = ["run", "--host", host, "--", python(), &fixture, "exit"].map(str::to_owned);
     let output = finish(spawn(&sandbox, &arguments, &sandbox.worktree), Duration::from_secs(60));
     assert_eq!(output.status.code(), Some(3), "stderr: {}", String::from_utf8_lossy(&output.stderr));
     let agent = log(&sandbox, "dummy.log");
@@ -1072,13 +1080,23 @@ fn a_shell_started_session_needs_only_the_agent_command() {
     assert_eq!(std::fs::canonicalize(cwd).unwrap(), std::fs::canonicalize(&sandbox.worktree).unwrap());
     assert!(
         log(&sandbox, "stubs/agent-store.log")
-            .contains(&format!("launch --launch-id {id} --host claude --title Feature-1-2"))
+            .contains(&format!("launch --launch-id {id} --host {host} --title Feature-1-2"))
     );
 
     let unknown = ["run", "--", python(), &fixture, "exit"].map(str::to_owned);
     let output = finish(spawn(&sandbox, &unknown, &sandbox.worktree), Duration::from_secs(60));
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("pass --host"));
+}
+
+#[test]
+fn a_shell_started_session_needs_only_the_agent_command() {
+    shell_started_session_needs_only_the_agent_command("claude");
+}
+
+#[test]
+fn a_shell_started_codex_session_needs_only_the_agent_command() {
+    shell_started_session_needs_only_the_agent_command("codex");
 }
 
 #[test]
@@ -1349,24 +1367,24 @@ fn an_unchanged_marketplace_costs_one_conditional_request_a_minute_and_installs_
     assert!(requests[0].contains("accept: application/vnd.github.sha"), "{}", requests[0]);
     launch_checking(&sandbox, &upstream, "again");
     assert_eq!(upstream.requests().len(), 1, "checked again within a minute");
-    assert_eq!(log(&sandbox, "stubs/tj-plugins.log"), "");
+    assert_eq!(log(&sandbox, "stubs/tj-install.log"), "");
 }
 
 #[test]
 fn a_changed_marketplace_installs_in_the_background_once_per_commit() {
     let sandbox = sandbox();
     select_tj_agents(&sandbox);
-    stub(&sandbox.stubs, "tj-plugins", "updated");
+    stub(&sandbox.stubs, "tj-install", "installed");
     let upstream = Upstream::changed();
     let (output, _) = launch_checking(&sandbox, &upstream, "changed");
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("updating claude plugins in the background"), "{stderr}");
-    wait_until("tj-plugins never ran", || log(&sandbox, "stubs/tj-plugins.log").contains("update --host claude"));
+    assert!(stderr.contains("running tj install in the background"), "{stderr}");
+    wait_until("tj install never ran", || log(&sandbox, "stubs/tj-install.log").lines().count() == 1);
     assert!(!upstream.requests()[0].contains("if-none-match"), "{}", upstream.requests()[0]);
     std::fs::remove_file(update_state(&sandbox, "claude.checked")).unwrap();
     launch_checking(&sandbox, &upstream, "retry");
     assert_eq!(upstream.requests().len(), 2);
-    assert_eq!(log(&sandbox, "stubs/tj-plugins.log").lines().count(), 1, "installed the same commit twice");
+    assert_eq!(log(&sandbox, "stubs/tj-install.log").lines().count(), 1, "installed the same commit twice");
 }
 
 #[test]

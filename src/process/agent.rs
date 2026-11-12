@@ -14,6 +14,11 @@ use unix as os;
 #[cfg(windows)]
 use windows as os;
 
+/// Session identities a wrapper can inherit from the agent that launched its tab. The launched host sets its own;
+/// an inherited one would make the new session look like two sessions at once.
+pub(crate) const INHERITED_SESSION: [&str; 4] =
+    ["CLAUDECODE", "CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID", "CODEX_SESSION_ID"];
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Stop {
     Signal,

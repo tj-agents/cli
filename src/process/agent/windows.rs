@@ -49,9 +49,14 @@ pub struct Agent {
     exit: Option<i32>,
 }
 
-fn environment_block(additions: &[(&str, String)]) -> Vec<u16> {
-    let mut variables: Vec<(OsString, OsString)> = std::env::vars_os()
+fn environment_block(
+    inherited: impl IntoIterator<Item = (OsString, OsString)>,
+    additions: &[(&str, String)],
+) -> Vec<u16> {
+    let mut variables: Vec<(OsString, OsString)> = inherited
+        .into_iter()
         .filter(|(name, _)| !additions.iter().any(|(added, _)| name.eq_ignore_ascii_case(added)))
+        .filter(|(name, _)| !super::INHERITED_SESSION.iter().any(|inherited| name.eq_ignore_ascii_case(inherited)))
         .chain(additions.iter().map(|(name, value)| (OsString::from(name), OsString::from(value))))
         .collect();
     variables.sort_by_key(|(name, _)| name.to_string_lossy().to_uppercase());
@@ -80,7 +85,7 @@ impl Agent {
         let executable = wide(executable.as_os_str())?;
         let mut command = command_line(argv)?;
         let directory = wide(cwd.as_os_str())?;
-        let mut environment = environment_block(env);
+        let mut environment = environment_block(std::env::vars_os(), env);
         let stdin = inherited_handle(STD_INPUT_HANDLE)?;
         let stdout = inherited_handle(STD_OUTPUT_HANDLE)?;
         let stderr = inherited_handle(STD_ERROR_HANDLE)?;
@@ -393,7 +398,17 @@ mod tests {
         CTRL_BREAK_EVENT, CTRL_C_EVENT, CTRL_CLOSE_EVENT, CTRL_LOGOFF_EVENT, CTRL_SHUTDOWN_EVENT,
     };
 
-    use super::{Tab, tab};
+    use std::ffi::OsString;
+
+    use super::{Tab, environment_block, tab};
+
+    #[test]
+    fn a_launched_agent_never_inherits_another_session_identity() {
+        let inherited = [("CODEX_THREAD_ID", "parent"), ("ClaudeCode", "1"), ("PATH", "bin")]
+            .map(|(name, value)| (OsString::from(name), OsString::from(value)));
+        let block = String::from_utf16(&environment_block(inherited, &[("TJ_RUN_PID", "7".to_owned())])).unwrap();
+        assert_eq!(block, "PATH=bin TJ_RUN_PID=7  ");
+    }
 
     #[test]
     fn only_a_close_outside_shutdown_closes_the_tab() {

@@ -23,6 +23,9 @@ fn terminal() -> bool {
 impl Agent {
     pub fn start(argv: &[OsString], cwd: &Path, env: &[(&str, String)]) -> io::Result<Self> {
         let mut command = Command::new(&argv[0]);
+        for inherited in super::INHERITED_SESSION {
+            command.env_remove(inherited);
+        }
         command.args(&argv[1..]).current_dir(cwd).envs(env.iter().map(|(name, value)| (name, value)));
         let foreground = terminal();
         unsafe {
