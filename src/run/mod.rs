@@ -2,6 +2,7 @@ pub mod closeout;
 pub mod owner;
 pub(crate) mod store;
 mod tj_agents;
+mod turn;
 pub mod update;
 
 use std::collections::HashSet;
@@ -201,6 +202,9 @@ struct Watch {
     next_poll: Instant,
     reported: HashSet<String>,
     asked: bool,
+    mark: Option<SystemTime>,
+    pinned: Option<turn::Turn>,
+    rollout: Option<PathBuf>,
 }
 
 impl Watch {
@@ -211,14 +215,42 @@ impl Watch {
         }
     }
 
-    fn done(&self) -> bool {
-        self.marks
-            .join("done")
-            .metadata()
-            .and_then(|meta| meta.modified())
-            .ok()
-            .and_then(|marked| SystemTime::now().duration_since(marked).ok())
-            .is_some_and(|idle| idle >= self.idle)
+    fn marked(&self) -> Option<SystemTime> {
+        self.marks.join("done").metadata().and_then(|meta| meta.modified()).ok()
+    }
+
+    fn turn(&mut self, agent: u32) -> (Option<turn::Turn>, u32) {
+        match self.launch.host {
+            Host::Claude => (turn::claude(agent), turn::shells(agent)),
+            Host::Codex => {
+                if self.rollout.is_none() {
+                    self.rollout =
+                        store::bound_session(&self.launch.id).ok().flatten().and_then(|thread| turn::rollout(&thread));
+                }
+                (self.rollout.as_deref().and_then(turn::codex), 0)
+            }
+        }
+    }
+
+    fn done(&mut self, agent: u32) -> bool {
+        let marked = self.marked();
+        if marked != self.mark {
+            self.mark = marked;
+            self.pinned = None;
+        }
+        let Some(marked) = marked else { return false };
+        let (turn, background) = self.turn(agent);
+        match turn::judge(marked, SystemTime::now(), turn, &mut self.pinned, background, self.idle) {
+            turn::Done::Due => true,
+            turn::Done::Waiting => false,
+            turn::Done::Withdrawn => {
+                let _ = std::fs::remove_file(self.marks.join("done"));
+                self.report(
+                    "a turn started after `tj done`, which withdrew it; the agent runs it again when finished".into(),
+                );
+                false
+            }
+        }
     }
 
     fn closing(&mut self) -> bool {
@@ -235,8 +267,8 @@ impl Watch {
         })
     }
 
-    fn trigger(&mut self) -> Option<Trigger> {
-        if self.done() {
+    fn trigger(&mut self, agent: u32) -> Option<Trigger> {
+        if self.done(agent) {
             return Some(Trigger::Done);
         }
         if Instant::now() < self.next_poll {
@@ -383,6 +415,9 @@ pub fn run(args: Args) -> Result<ExitCode> {
         next_poll: Instant::now() + poll,
         reported: HashSet::new(),
         asked: false,
+        mark: None,
+        pinned: None,
+        rollout: None,
     };
     let resumed = args.successor;
     let removal = loop {
@@ -392,7 +427,7 @@ pub fn run(args: Args) -> Result<ExitCode> {
                 eprintln!("\r\ntj run: the resumed agent exited with code {code}\r");
                 wait_for_enter();
             }
-            let closing = watch.done() || watch.closing() || watch.delivered();
+            let closing = watch.marked().is_some() || watch.closing() || watch.delivered();
             let _ = std::fs::remove_dir_all(&watch.marks);
             if closing {
                 let result = closeout::owned_preflight(&watch.launch)
@@ -410,7 +445,7 @@ pub fn run(args: Args) -> Result<ExitCode> {
             }
             return Ok(ExitCode::from(u8::try_from(code).unwrap_or(1)));
         }
-        if let Some(trigger) = watch.trigger() {
+        if let Some(trigger) = watch.trigger(agent.pid()) {
             match closeout::owned_preflight(&watch.launch) {
                 Ok(removal) => break removal,
                 Err(reason) => {
@@ -422,7 +457,8 @@ pub fn run(args: Args) -> Result<ExitCode> {
             }
         }
         let host = update::host(watch.launch.host);
-        match update::due(&mut watcher, host, agent.pid(), graces) {
+        let due = if watch.marked().is_some() { None } else { update::due(&mut watcher, host, agent.pid(), graces) };
+        match due {
             Some(update::gate::Apply::Plugins) => {
                 let revision = watcher.revision();
                 match host.apply() {
@@ -450,18 +486,8 @@ pub fn run(args: Args) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-#[derive(clap::Args)]
-pub struct DoneArgs {
-    /// Withdraw the mark, because new input arrived. A no-op outside `tj run`.
-    #[arg(long)]
-    cancel: bool,
-}
-
-pub fn done(args: DoneArgs) -> Result<ExitCode> {
+pub fn done() -> Result<ExitCode> {
     let Some(launch_id) = owner::launch() else {
-        if args.cancel {
-            return Ok(ExitCode::SUCCESS);
-        }
         if launch_id().is_some() {
             bail!("tj done only works from the tab's own agent; this process inherited another tab's tj run");
         }
@@ -469,12 +495,6 @@ pub fn done(args: DoneArgs) -> Result<ExitCode> {
     };
     let marks = marks(&launch_id)?;
     let marker = marks.join("done");
-    if args.cancel {
-        match std::fs::remove_file(&marker) {
-            Err(error) if error.kind() != std::io::ErrorKind::NotFound => return Err(error.into()),
-            _ => return Ok(ExitCode::SUCCESS),
-        }
-    }
     std::fs::create_dir_all(marker.parent().context("marker has no folder")?)?;
     std::fs::write(&marker, rfc3339(SystemTime::now()))?;
     println!("Marked done: this session closes out once it has been idle for about 10 minutes. New input cancels.");
