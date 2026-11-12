@@ -592,6 +592,22 @@ fn done_waits_for_the_turn_that_ran_it_to_end_however_long_it_takes() {
 }
 
 #[test]
+fn a_shell_left_running_under_the_agent_keeps_done_waiting() {
+    for host in ["claude", "codex"] {
+        let sandbox = sandbox();
+        let launch = format!("shell-{host}");
+        let mut child = start_host(&sandbox, &launch, host);
+        assert_eq!(in_agent(&sandbox, &["shell", "start"]).0, 0);
+        done(&sandbox);
+        still_running(&mut child, Duration::from_secs(6));
+        assert!(sandbox.root.join("cache").join("run").join(&launch).join("done").exists());
+        assert_eq!(in_agent(&sandbox, &["shell", "stop"]).0, 0);
+        let output = finish(child, Duration::from_secs(60));
+        assert_closed_out(&sandbox, &output, &launch);
+    }
+}
+
+#[test]
 fn an_agent_that_exits_after_done_closes_out_without_waiting() {
     let sandbox = sandbox();
     let child = start(&sandbox, "done-exit", "claude", "signal", "10");
