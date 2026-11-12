@@ -205,6 +205,7 @@ struct Watch {
     mark: Option<SystemTime>,
     pinned: Option<turn::Turn>,
     rollout: Option<PathBuf>,
+    next_lookup: Instant,
 }
 
 impl Watch {
@@ -223,7 +224,8 @@ impl Watch {
         match self.launch.host {
             Host::Claude => (turn::claude(agent), turn::shells(agent)),
             Host::Codex => {
-                if self.rollout.is_none() {
+                if self.rollout.is_none() && Instant::now() >= self.next_lookup {
+                    self.next_lookup = Instant::now() + Duration::from_secs(10);
                     self.rollout =
                         store::bound_session(&self.launch.id).ok().flatten().and_then(|thread| turn::rollout(&thread));
                 }
@@ -418,6 +420,7 @@ pub fn run(args: Args) -> Result<ExitCode> {
         mark: None,
         pinned: None,
         rollout: None,
+        next_lookup: Instant::now(),
     };
     let resumed = args.successor;
     let removal = loop {
