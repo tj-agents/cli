@@ -497,12 +497,62 @@ def _alive(pid: int) -> bool:
 
 def _wait_for_record(path: Path) -> dict[str, object]:
     deadline = time.monotonic() + 30
+    unavailable: OSError | None = None
     while time.monotonic() < deadline:
-        if path.is_file():
-            record: dict[str, object] = json.loads(path.read_text(encoding="utf-8"))
+        try:
+            contents = path.read_text(encoding="utf-8")
+        except (FileNotFoundError, PermissionError) as error:
+            unavailable = error
+        else:
+            record: dict[str, object] = json.loads(contents)
             return record
         time.sleep(0.01)
-    pytest.fail(f"background process did not write {path}")
+    pytest.fail(f"background record unavailable at {path}: {unavailable}")
+
+
+@pytest.mark.parametrize("failure", [FileNotFoundError, PermissionError])
+def test_wait_for_record_retries_unavailable_report(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: type[OSError]
+) -> None:
+    report = tmp_path / "child.json"
+    attempts = 0
+
+    def read(path: Path, *, encoding: str) -> str:
+        nonlocal attempts
+        assert path == report and encoding == "utf-8"
+        attempts += 1
+        if attempts == 1:
+            raise failure("report unavailable")
+        return '{"pid": 123}'
+
+    monkeypatch.setattr(Path, "read_text", read)
+    monkeypatch.setattr(time, "sleep", lambda _seconds: None)
+    assert _wait_for_record(report) == {"pid": 123}
+    assert attempts == 2
+
+
+def test_wait_for_record_reports_persistent_access_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ticks = iter([0.0, 1.0, 31.0])
+
+    def read(_path: Path, *, encoding: str) -> str:
+        raise PermissionError("report remains locked")
+
+    monkeypatch.setattr(Path, "read_text", read)
+    monkeypatch.setattr(time, "monotonic", lambda: next(ticks))
+    monkeypatch.setattr(time, "sleep", lambda _seconds: None)
+    with pytest.raises(pytest.fail.Exception, match="report remains locked"):
+        _wait_for_record(tmp_path / "child.json")
+
+
+def test_wait_for_record_rejects_invalid_published_json(
+    tmp_path: Path,
+) -> None:
+    report = tmp_path / "child.json"
+    report.write_text("invalid", encoding="utf-8")
+    with pytest.raises(json.JSONDecodeError, match="Expecting value"):
+        _wait_for_record(report)
 
 
 def _wait_for_exit(pid: int) -> None:
