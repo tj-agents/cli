@@ -27,7 +27,7 @@ pub(crate) enum CheckError {
     Status(u16),
     #[error("GitHub sent no commit")]
     Commit,
-    #[error("could not start tj-plugins")]
+    #[error("could not start tj-install")]
     Spawn(#[source] std::io::Error),
 }
 
@@ -110,11 +110,10 @@ fn request(url: &str, etag: Option<&str>) -> Result<Answer, CheckError> {
     }
 }
 
-fn spawn(host: Host, cwd: &Path, log: &Path) -> Result<(), CheckError> {
+fn spawn(cwd: &Path, log: &Path) -> Result<(), CheckError> {
     let log = OpenOptions::new().create(true).append(true).open(log).map_err(CheckError::Spawn)?;
     let errors = log.try_clone().map_err(CheckError::Spawn)?;
-    let mut child = crate::run::hidden("tj-plugins")
-        .args(["update", "--host", host.name()])
+    let mut child = crate::run::hidden("tj-install")
         .current_dir(cwd)
         .stdin(Stdio::null())
         .stdout(log)
@@ -125,7 +124,7 @@ fn spawn(host: Host, cwd: &Path, log: &Path) -> Result<(), CheckError> {
     Ok(())
 }
 
-fn check(state: &State, host: Host, cwd: &Path, url: &str) -> Result<Option<String>, CheckError> {
+fn check(state: &State, cwd: &Path, url: &str) -> Result<Option<String>, CheckError> {
     let now = SystemTime::now();
     if modified(&state.checked).is_some_and(|at| recent(at, now, CHECKED_FOR)) {
         return Ok(None);
@@ -141,9 +140,9 @@ fn check(state: &State, host: Host, cwd: &Path, url: &str) -> Result<Option<Stri
     let previous = fs::read_to_string(&state.started).unwrap_or_default();
     let started = modified(&state.started).map(|at| (previous.trim(), at));
     let Some(sha) = install(answer, started, now) else { return Ok(None) };
-    spawn(host, cwd, &state.log)?;
+    spawn(cwd, &state.log)?;
     let _ = fs::write(&state.started, &sha);
-    Ok(Some(format!("tj-agents changed upstream; updating {} plugins in the background", host.name())))
+    Ok(Some("tj-agents changed upstream; running tj install in the background".to_owned()))
 }
 
 /// Checks once, off the launch's critical path, whether tj-agents moved past what this host last installed, and
@@ -151,7 +150,7 @@ fn check(state: &State, host: Host, cwd: &Path, url: &str) -> Result<Option<Stri
 pub(crate) fn start(host: Host, cwd: &Path, url: String) -> Option<JoinHandle<Result<Option<String>, CheckError>>> {
     let state = State::new(&paths::cache_dir().ok()?, host);
     let cwd = cwd.to_path_buf();
-    Some(std::thread::spawn(move || check(&state, host, &cwd, &url)))
+    Some(std::thread::spawn(move || check(&state, &cwd, &url)))
 }
 
 #[cfg(test)]
