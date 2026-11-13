@@ -73,6 +73,9 @@ def prebound_reply(
     )
     if configuration_data.get("foreign_native") is True and native is not None:
         native["native_id"] = "123e4567-e89b-12d3-a456-426614174001"
+    if arguments[:1] != ["--launch-id"]:
+        # Like agent-store, `show <handle>` returns only the session row.
+        return {"ok": True, "data": Data(session=native)}
     return {"ok": True, "data": Data(launch=launch, session=native)}
 
 
