@@ -1,12 +1,25 @@
 use std::io::{BufRead, BufReader, Write};
-use std::process::{Child, ChildStdin, Stdio};
+use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 
-use crate::message;
+/// A host CLI run without a console window, so a detached caller never flashes one.
+pub(crate) fn host_command(program: &str) -> Result<Command> {
+    let executable = which::which(program).with_context(|| format!("`{program}` is not on PATH"))?;
+    let command = Command::new(executable);
+    #[cfg(windows)]
+    let command = {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        let mut command = command;
+        command.creation_flags(CREATE_NO_WINDOW);
+        command
+    };
+    Ok(command)
+}
 
 /// A connection to the shared Codex app-server through `codex app-server proxy`.
 pub(crate) struct Server {
@@ -18,7 +31,7 @@ pub(crate) struct Server {
 
 impl Server {
     pub(crate) fn connect() -> Result<Self> {
-        let mut child = message::host_command("codex")?
+        let mut child = host_command("codex")?
             .args(["app-server", "proxy"])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -71,11 +84,6 @@ impl Server {
             }
             return Ok(reply["result"].clone());
         }
-    }
-
-    pub(crate) fn loaded(&mut self, thread: &str) -> Result<bool> {
-        let result = self.request("thread/loaded/list", json!({}))?;
-        Ok(result["data"].as_array().is_some_and(|ids| ids.iter().any(|id| id.as_str() == Some(thread))))
     }
 }
 
