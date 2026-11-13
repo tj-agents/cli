@@ -189,7 +189,7 @@ differ, so only those are split into `linux/` and `windows/`.
 ## `tj run`: the agent tab's root process
 
 ```text
-tj run [--host claude|codex] [--title T] [--cwd WORKTREE] [--launch-id U] [--item REF] [--parent HOST:ID] -- <agent argv>
+tj run [--host claude|codex] [--title T] [--cwd WORKTREE] [--launch-id U] [--item REF] [--parent HOST:ID] [--session codex:UUID] -- <agent argv>
 tj done              the session's last step: close out after about 10 idle minutes
 tj closeout [REF]    close an item's sessions; with no REF, sweep tabs closed by hand or crashed wrappers
 ```
@@ -207,6 +207,11 @@ Only the agent's command line is required, so a shell function can run a typed `
 the host defaults to the executable's name, the folder to the current one, the title to the repository or
 worktree folder's name (suffixed `-2`, `-3`… while an open launch holds it) and the launch id to a random one.
 The executable must be the native `claude` or `codex`, not an npm `.cmd` shim.
+
+`--session codex:UUID` binds a pre-created Codex thread before the native process starts. It requires an
+explicit `--host codex` and an absolute native command in the exact form
+`codex --cd WORKTREE resume UUID [-- PROMPT]`. The delimiter is required when a prompt is supplied, so
+prompt text beginning with a hyphen remains literal.
 
 In a repository whose `.agents/plugins.json` selects a `@tj-agents` plugin, `tj run` invokes Agent's
 `tj-prepare` before each start with the host, working directory and host arguments. Agent reconciles the
