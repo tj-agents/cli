@@ -1,3 +1,4 @@
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::{ExitCode, Stdio};
 use std::time::Duration;
@@ -7,7 +8,7 @@ use serde_json::Value;
 
 use super::{Launch, hidden, store};
 use crate::host::Host;
-use crate::{bridge, message, paths};
+use crate::{app_server, bridge, paths};
 
 mod journal;
 
@@ -46,6 +47,18 @@ pub fn delivered(launch: &Launch) -> Result<bool> {
     Ok(reply["all_merged"] == Value::Bool(true))
 }
 
+fn queue(thread: &str, text: &str) -> Result<()> {
+    let output = app_server::host_command("codex")?
+        .args([OsStr::new("queue"), "--thread".as_ref(), thread.as_ref(), "--message".as_ref(), text.as_ref()])
+        .stdin(Stdio::null())
+        .output()
+        .context("could not run codex queue")?;
+    if !output.status.success() {
+        bail!("codex queue: {}", String::from_utf8_lossy(&output.stderr).trim());
+    }
+    Ok(())
+}
+
 pub fn ask(launch: &Launch, item: &str) -> Result<()> {
     let session = store::bound_session(&launch.id)?
         .with_context(|| format!("no {} session is bound to launch {} yet", launch.host.name(), launch.id))?;
@@ -56,7 +69,7 @@ pub fn ask(launch: &Launch, item: &str) -> Result<()> {
     );
     match launch.host {
         Host::Claude => bridge::post(&session, &text),
-        Host::Codex => message::queue(&session, &text),
+        Host::Codex => queue(&session, &text),
     }
 }
 
