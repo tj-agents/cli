@@ -4,7 +4,7 @@ use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 
 use crate::feed::{self, Feed};
-use crate::{host::Host, run::store};
+use crate::{bridge, host::Host, run::store};
 
 #[derive(clap::Args)]
 pub(crate) struct Args {
@@ -69,17 +69,37 @@ fn resolve(target: &str) -> Result<Session> {
     }
 }
 
+/// The line a Claude session sees in its inbox: who sent it and how to reply, then the text.
+fn inbox_text(from: Option<&str>, name: Option<&str>, text: &str) -> String {
+    match from {
+        Some(handle) => {
+            let name = name.unwrap_or(handle);
+            format!("[tj message from {name}; reply with: tj message {handle} \"<text>\"] {text}")
+        }
+        None => format!("[tj message from a terminal] {text}"),
+    }
+}
+
+/// A Claude target gets it in its native inbox through its session relay; a Codex target, which has no native
+/// messaging, gets it in its feed.
 pub(crate) fn run(args: &Args) -> Result<ExitCode> {
     let target = resolve(&args.target)?;
-    if Host::from_name(&target.host).is_none() {
-        bail!("{} runs on {}, which tj message cannot reach", target.name(), target.host);
-    }
     let from = Host::current().and_then(Host::handle);
     let name = env("AGENT_CLI_TAB_TITLE").or_else(|| from.clone());
-    let at = chrono::Local::now().format("%Y-%m-%d %H:%M").to_string();
-    Feed::new(&feed::folder()?, &target.handle())?
-        .post(&json!({"at": at, "from": from, "name": name, "text": &args.text}))?;
-    println!("posted to {}'s feed; it reads it when it runs tj feed", target.name());
+    match Host::from_name(&target.host) {
+        Some(Host::Claude) => {
+            bridge::post(&target.id, &inbox_text(from.as_deref(), name.as_deref(), &args.text))
+                .with_context(|| format!("could not reach {}", target.name()))?;
+            println!("delivered to {}'s inbox", target.name());
+        }
+        Some(Host::Codex) => {
+            let at = chrono::Local::now().format("%Y-%m-%d %H:%M").to_string();
+            Feed::new(&feed::folder()?, &target.handle())?
+                .post(&json!({"at": at, "from": from, "name": name, "text": &args.text}))?;
+            println!("posted to {}'s feed; it reads it when it runs tj feed", target.name());
+        }
+        None => bail!("{} runs on {}, which tj message cannot reach", target.name(), target.host),
+    }
     Ok(ExitCode::SUCCESS)
 }
 
