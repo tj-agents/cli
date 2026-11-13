@@ -6,16 +6,10 @@ use anyhow::{Context, Result, bail};
 use serde_json::Value;
 
 use super::{Launch, hidden, store};
-use crate::paths;
+use crate::host::Host;
+use crate::{bridge, message, paths};
 
 mod journal;
-
-#[derive(Debug, PartialEq, Eq)]
-pub enum Prs {
-    AllMerged,
-    ClosedUnmerged(Vec<String>),
-    Pending,
-}
 
 fn repository(launch: &Launch) -> Result<PathBuf> {
     if launch.cwd.is_dir() {
@@ -37,8 +31,8 @@ fn repository(launch: &Launch) -> Result<PathBuf> {
     bail!("launch directory is gone and no owned repository is available")
 }
 
-pub fn prs(launch: &Launch) -> Result<Prs> {
-    let Some(item) = &launch.item else { return Ok(Prs::Pending) };
+pub fn delivered(launch: &Launch) -> Result<bool> {
+    let Some(item) = &launch.item else { return Ok(false) };
     let output = hidden("tj-item")
         .args(["prs", item])
         .current_dir(repository(launch)?)
@@ -49,16 +43,21 @@ pub fn prs(launch: &Launch) -> Result<Prs> {
         bail!("tj item prs {item}: {}", String::from_utf8_lossy(&output.stderr).trim());
     }
     let reply: Value = serde_json::from_slice(&output.stdout).context("tj item prs printed no JSON")?;
-    if reply["all_merged"] == Value::Bool(true) {
-        return Ok(Prs::AllMerged);
+    Ok(reply["all_merged"] == Value::Bool(true))
+}
+
+pub fn ask(launch: &Launch, item: &str) -> Result<()> {
+    let session = store::bound_session(&launch.id)?
+        .with_context(|| format!("no {} session is bound to launch {} yet", launch.host.name(), launch.id))?;
+    let text = format!(
+        "[tj run] Every PR linked to {item} has merged. If this session has nothing left to do, with no open \
+         question, child session or follow-up, run `tj done` as your final step so this tab closes and its \
+         worktree is removed. Otherwise carry on and do not run it."
+    );
+    match launch.host {
+        Host::Claude => bridge::post(&session, &text),
+        Host::Codex => message::queue(&session, &text),
     }
-    let prs = reply["prs"].as_array().map(Vec::as_slice).unwrap_or_default();
-    let state = |pr: &Value| pr["state"].as_str().unwrap_or_default().to_owned();
-    if !prs.is_empty() && prs.iter().all(|pr| state(pr) != "open") {
-        let closed = prs.iter().filter(|pr| state(pr) == "closed");
-        return Ok(Prs::ClosedUnmerged(closed.filter_map(|pr| pr["url"].as_str().map(str::to_owned)).collect()));
-    }
-    Ok(Prs::Pending)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -365,14 +364,15 @@ pub fn run(args: Args) -> Result<ExitCode> {
             }
         }
         let launch = &row.launch;
-        let delivered = match prs(launch) {
-            Ok(prs) => prs == Prs::AllMerged,
-            Err(error) => {
+        let started = !matches!(journal::read(launch), Ok(None));
+        let swept = args.item.is_some()
+            || row.closing
+            || started
+            || delivered(launch).unwrap_or_else(|error| {
                 eprintln!("{}: {error:#}", launch.id);
                 false
-            }
-        };
-        if args.item.is_none() && !row.closing && !delivered {
+            });
+        if !swept {
             continue;
         }
         let result = owned_preflight(launch).map_err(anyhow::Error::msg).and_then(|plan| finish(launch, plan));
