@@ -43,11 +43,11 @@ enum Command {
     Launch,
     /// Close out a work item's sessions, or sweep launches whose tab is gone
     Closeout(run::closeout::Args),
-    /// Post a message to another Claude or Codex session's feed, addressed by its tab title
+    /// Message another session by its tab title: a Claude session's native inbox, or a Codex session's feed
     Message(message::Args),
-    /// Read this session's unread feed messages, optionally waiting for the next one
+    /// Read this Codex session's unread feed messages, optionally waiting for the next one
     Feed(feed::Args),
-    /// Relays `tj run`'s close-out notice into this Claude session until it exits (run by the async `SessionStart` hook)
+    /// Relays `tj message` and `tj run`'s close-out notice into this Claude session until it exits (run by the async `SessionStart` hook)
     #[command(hide = true)]
     Bridge,
     /// Draws cr's preview pane (run by fzf, not by hand)

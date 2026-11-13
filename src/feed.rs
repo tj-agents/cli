@@ -1,5 +1,5 @@
-//! Each session's feed: what other sessions post for it with `tj message`. Nothing reaches the session's
-//! conversation until it runs `tj feed` itself.
+//! A Codex session's feed: what other sessions post for it with `tj message`, since Codex has no native
+//! messaging. Nothing reaches the session's conversation until it runs `tj feed` itself.
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use serde_json::Value;
 
 use crate::{host::Host, paths};
@@ -157,9 +157,11 @@ fn show(message: &Value) {
 }
 
 pub(crate) fn run(args: &Args) -> Result<ExitCode> {
-    let me = Host::current()
-        .and_then(Host::handle)
-        .context("tj feed reads the calling session's own feed; run it from a Claude or Codex session")?;
+    let host = Host::current().context("tj feed reads the calling Codex session's own feed; run it from Codex")?;
+    if host == Host::Claude {
+        bail!("a Claude session receives tj message in its own inbox, so it has no feed; tj feed is for Codex");
+    }
+    let me = host.handle().context("tj feed needs CODEX_THREAD_ID to find this session's feed")?;
     let feed = Feed::new(&folder()?, &me)?;
     let deadline = Instant::now().checked_add(Duration::from_secs(args.timeout));
     loop {
