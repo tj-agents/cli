@@ -289,34 +289,36 @@ agent's console. If the agent exits by itself, nothing is left running, so the w
 ## `tj message` and `tj feed`: messaging between sessions
 
 ```text
-tj message <title|host:id> <text>   post to another session's feed; nothing enters its conversation
-tj feed                             show this session's unread messages, once, with how to reply
-tj feed --wait [--timeout <secs>]   block until a message arrives (default 12 hours); exit 1 if none did
+tj message <title|host:id> <text>   message another session: a Claude session's inbox, a Codex session's feed
+tj feed                             in a Codex session: show its unread messages, once, with how to reply
+tj feed --wait [--timeout <secs>]   in a Codex session: block until a message arrives (default 12 hours); exit 1 if none did
 ```
 
 The target is looked up with `agent-store sessions --title` (or `agent-store show` for a handle) and must be
 exactly one session that has not ended. The caller is the Claude session when `CLAUDECODE=1`, otherwise the
 Codex thread in `CODEX_THREAD_ID`; a message from neither is shown as from a terminal.
 
-Each session's feed is `<cache>/feed/<host>-<id>.jsonl`, one JSON message per line appended in a single write,
-with `<host>-<id>.read` holding the byte offset already shown. On Unix the folder and feeds are readable only
-by you. A line that is not JSON, such as one torn by a killed sender, is reported and passed over. A message reaches the receiver only when it runs
-`tj feed`; nothing is injected into its conversation. A parent waiting on a child runs `tj feed --wait` as a
-background command, so the child's final message returns through the parent's own task notification.
-
-Each Claude session also gets a relay from the cli plugin's async `SessionStart` hook, `tj bridge`, which lives
-until the session exits. It carries only `tj run`'s close-out notice, which must interrupt so the tab can close.
-It listens on a loopback port and records the port and a random secret in `<cache>/bridge/<session-id>.json`,
-readable only by you. It posts the notice to `CLAUDE_CODE_MESSAGING_SOCKET` with an auth line holding
+A Claude target receives the message natively. Each Claude session gets a relay from the cli plugin's async
+`SessionStart` hook, `tj bridge`, which lives until the session exits. It listens on a loopback port and records
+the port and a random secret in `<cache>/bridge/<session-id>.json`, readable only by you. `tj message` hands the
+text to that relay, which posts it to `CLAUDE_CODE_MESSAGING_SOCKET` with an auth line holding
 `CLAUDE_CODE_MESSAGING_TOKEN`, so the session verifies it as its own child's message and starts a turn even in
-`bypassPermissions` mode. A Codex session receives the same notice through `codex queue`.
+`bypassPermissions` mode. The text opens with who sent it and the `tj message` command to reply. A Claude
+session without a relay is an error; nothing is stored for it. `tj run`'s close-out notice uses the same relay.
+
+A Codex target has no native messaging, so the message goes to its feed, `<cache>/feed/codex-<id>.jsonl`: one
+JSON message per line appended in a single write, with `codex-<id>.read` holding the byte offset already shown.
+On Unix the folder and feeds are readable only by you. A line that is not JSON, such as one torn by a killed
+sender, is reported and passed over. The Codex session reads it with `tj feed`; a Codex parent waiting on a child
+runs `tj feed --wait` as a background command, so the child's message returns through its own task notification.
+`tj feed` refuses in a Claude session. `tj run`'s close-out notice reaches a Codex session through `codex queue`.
 
 ## Configuration
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `TJ_F_ROOT` | `~/projects`, then `~/source/repos` | where `f` searches |
-| `TJ_CACHE_DIR` | OS cache folder + `/tj` | where `cr` keeps its index, `tj done` its marks, `tj update` the published updates, `tj run` its update check, each session its feed and each Claude relay its endpoint |
+| `TJ_CACHE_DIR` | OS cache folder + `/tj` | where `cr` keeps its index, `tj done` its marks, `tj update` the published updates, `tj run` its update check, each Codex session its feed and each Claude relay its endpoint |
 | `TJ_BIN_DIR` | `~/.local/bin` / `%LOCALAPPDATA%\Programs\tj` | where the installer puts `tj` and `tj_hook` |
 | `CLAUDE_CONFIG_DIR` | `~/.claude` | Claude Code's config folder, as Claude Code itself reads it |
 | `CODEX_HOME` | `~/.codex` | Codex's config folder, as Codex itself reads it |
