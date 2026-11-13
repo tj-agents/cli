@@ -58,6 +58,13 @@ def isolated_desktop(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setenv("TJ_BIN_DIR", str(tmp_path / "bin"))
     monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "local data"))
     monkeypatch.setenv("ProgramFiles", str(tmp_path / "program files"))
+    monkeypatch.setenv("SYSTEMROOT", str(tmp_path / "windows"))
+
+
+def _system_library(name: str) -> None:
+    library = Path(os.environ["SYSTEMROOT"]) / "System32" / name
+    library.parent.mkdir(parents=True, exist_ok=True)
+    library.write_bytes(b"runtime")
 
 
 def _windows_installation(entries: dict[tuple[int, int], str] | None = None) -> Path:
@@ -101,6 +108,8 @@ def test_registered_windows_custom_location_is_recognized(
     hive: int,
     view: int,
 ) -> None:
+    for library in RUNTIMES.values():
+        _system_library(library)
     directory = tmp_path / "custom apps é" / "voice"
     directory.mkdir(parents=True)
     executable = directory / "handy.exe"
@@ -119,11 +128,23 @@ def test_registered_windows_custom_location_is_recognized(
     assert handy_install.main(["--check"]) == 1
 
 
+RUNTIMES = {
+    "KhronosGroup.VulkanRT": "vulkan-1.dll",
+    "Microsoft.VCRedist.2015+.x64": "vcruntime140.dll",
+}
+
+
+@pytest.mark.parametrize(
+    "present", [(), ("vulkan-1.dll",), ("vcruntime140.dll",), tuple(RUNTIMES.values())]
+)
 def test_windows_installs_once_and_verifies_the_result(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
+    present: tuple[str, ...],
     windows_registry: dict[tuple[int, int], str],
 ) -> None:
+    for library in present:
+        _system_library(library)
     commands: list[list[str]] = []
     monkeypatch.setattr(
         shutil, "which", lambda name: "winget.exe" if name == "winget" else None
@@ -131,24 +152,59 @@ def test_windows_installs_once_and_verifies_the_result(
 
     def run(arguments: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
         commands.append(arguments)
-        _windows_installation(windows_registry)
+        if arguments[3] in RUNTIMES:
+            _system_library(RUNTIMES[arguments[3]])
+        else:
+            _windows_installation(windows_registry)
         return subprocess.CompletedProcess(arguments, 0, "", "")
 
     monkeypatch.setattr(subprocess, "run", run)
     assert handy_install.main([]) == 0
     assert handy_install.main([]) == 0
-    assert len(commands) == 1
-    assert commands[0][:5] == [
-        "winget.exe",
-        "install",
-        "--id",
-        "cjpais.Handy",
-        "--exact",
+    missing = [
+        package for package, library in RUNTIMES.items() if library not in present
     ]
-    assert commands[0][commands[0].index("--scope") + 1] == "user"
+    assert [arguments[3] for arguments in commands] == [*missing, "cjpais.Handy"]
+    assert all("--scope" not in arguments for arguments in commands[:-1])
+    handy = commands[-1]
+    assert handy[:5] == ["winget.exe", "install", "--id", "cjpais.Handy", "--exact"]
+    assert handy[handy.index("--scope") + 1] == "user"
+    assert handy[handy.index("--version") + 1] == handy_install.VERSION
+    assert "--force" in handy
+    assert all("--skip-dependencies" in arguments for arguments in commands)
     output = capsys.readouterr().out
     assert "installed  Handy" in output
     assert "ok         Handy" in output
+
+
+@pytest.mark.parametrize(("package", "library"), RUNTIMES.items())
+def test_windows_ineffective_runtime_install_stops_before_handy_or_receipt(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    windows_registry: dict[tuple[int, int], str],
+    package: str,
+    library: str,
+) -> None:
+    for other in RUNTIMES.values():
+        if other != library:
+            _system_library(other)
+    _windows_installation(windows_registry)
+    commands: list[list[str]] = []
+    monkeypatch.setattr(
+        shutil, "which", lambda name: "winget.exe" if name == "winget" else None
+    )
+
+    def run(arguments: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        commands.append(arguments)
+        return subprocess.CompletedProcess(arguments, 0, "", "")
+
+    monkeypatch.setattr(subprocess, "run", run)
+    assert handy_install.main([]) == 1
+    assert [arguments[3] for arguments in commands] == [package]
+    assert not (Path(os.environ["TJ_BIN_DIR"]) / handy_install.RECEIPT).exists()
+    output = capsys.readouterr()
+    assert package in output.err and library in output.err
+    assert "installed  Handy" not in output.out
 
 
 def test_windows_missing_winget_is_actionable(
@@ -164,6 +220,8 @@ def test_windows_failed_or_ineffective_install_is_not_success(
     capsys: pytest.CaptureFixture[str],
     failure: bool,
 ) -> None:
+    for library in RUNTIMES.values():
+        _system_library(library)
     monkeypatch.setattr(
         shutil, "which", lambda name: "winget.exe" if name == "winget" else None
     )
@@ -415,6 +473,8 @@ def test_windows_reinstalls_the_pin_for_version_drift(
     version: str,
     windows_registry: dict[tuple[int, int], str],
 ) -> None:
+    for library in RUNTIMES.values():
+        _system_library(library)
     executable = _windows_installation(windows_registry)
     _receipt(executable, version)
     commands: list[list[str]] = []
@@ -480,6 +540,8 @@ def test_windows_receipts_registered_pin_instead_of_older_path_copy(
     tmp_path: Path,
     windows_registry: dict[tuple[int, int], str],
 ) -> None:
+    for library in RUNTIMES.values():
+        _system_library(library)
     shadow = tmp_path / "portable" / "handy.exe"
     shadow.parent.mkdir()
     shadow.write_bytes(b"old portable version")
@@ -505,6 +567,8 @@ def test_windows_receipts_registered_pin_instead_of_older_path_copy(
 def test_windows_installer_success_without_pinned_registration_is_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    for library in RUNTIMES.values():
+        _system_library(library)
     executable = _windows_installation()
     monkeypatch.setattr(
         shutil,
