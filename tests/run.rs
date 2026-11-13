@@ -8,6 +8,7 @@ const BOUND: &str =
     r#"{"ok":true,"data":{"launch":{"state":"active"},"session":{"native_id":"sess-1","state":"active"}}}"#;
 const CLOSING: &str =
     r#"{"ok":true,"data":{"launch":{"state":"closing"},"session":{"native_id":"sess-1","state":"active"}}}"#;
+const PREBOUND: &str = "123e4567-e89b-12d3-a456-426614174000";
 const MERGED: &str = r#"{"prs":[{"url":"u","state":"merged"}],"all_merged":true}"#;
 
 struct Sandbox {
@@ -164,6 +165,54 @@ fn run_arguments(sandbox: &Sandbox, launch: &str, host: &str, mode: &str, grace:
     ]
     .map(str::to_owned)
     .to_vec()
+}
+
+fn native_codex(sandbox: &Sandbox) -> PathBuf {
+    let directory = sandbox.root.join("native");
+    std::fs::create_dir(&directory).unwrap();
+    let name = if cfg!(windows) { "codex.exe" } else { "codex" };
+    let executable = directory.join(name);
+    std::fs::copy(std::env::current_exe().unwrap(), &executable).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    executable
+}
+
+fn prebound_arguments(sandbox: &Sandbox, launch: &str) -> Vec<String> {
+    prebound_arguments_with_prompt(sandbox, launch, "Prompt")
+}
+
+fn prebound_arguments_with_prompt(sandbox: &Sandbox, launch: &str, prompt: &str) -> Vec<String> {
+    let mut arguments = run_arguments(sandbox, launch, "codex", "exit", "10");
+    let separator = arguments.iter().position(|argument| argument == "--").unwrap();
+    arguments.splice(
+        separator..,
+        [
+            "--session".to_owned(),
+            format!("codex:{PREBOUND}"),
+            "--".to_owned(),
+            native_codex(sandbox).to_string_lossy().into_owned(),
+            "--cd".to_owned(),
+            sandbox.worktree.to_string_lossy().into_owned(),
+            "resume".to_owned(),
+            PREBOUND.to_owned(),
+            "--".to_owned(),
+            prompt.to_owned(),
+        ],
+    );
+    arguments
+}
+
+fn prebind(sandbox: &Sandbox, foreign_native: bool) {
+    std::fs::write(
+        sandbox.stubs.join("agent-store-prebind.json"),
+        serde_json::json!({"session": PREBOUND, "foreign_native": foreign_native}).to_string(),
+    )
+    .unwrap();
 }
 
 fn start(sandbox: &Sandbox, launch: &str, host: &str, mode: &str, grace: &str) -> Child {
@@ -723,6 +772,65 @@ fn repository_preparation_failure_warns_and_still_starts_the_agent() {
     assert_eq!(output.status.code(), Some(3));
     assert!(String::from_utf8_lossy(&output.stderr).contains("standards preparation failed"));
     assert!(log(&sandbox, "dummy.log").contains("agent prepare-failed"));
+}
+
+#[test]
+fn a_prebound_native_codex_session_registers_and_verifies_before_spawning() {
+    let sandbox = sandbox();
+    prebind(&sandbox, false);
+    let output =
+        finish(spawn(&sandbox, &prebound_arguments(&sandbox, "prebound"), &sandbox.root), Duration::from_secs(30));
+    assert!(!output.status.success());
+    let store = log(&sandbox, "stubs/agent-store.log");
+    assert!(store.contains(&format!(
+        "register --session codex:{PREBOUND} --cwd {} --launch-id prebound",
+        sandbox.worktree.display()
+    )));
+    assert!(store.matches("show ").count() >= 4, "{store}");
+    assert!(store.contains("end --launch-id prebound --reason exited"), "{store}");
+    assert!(!store.contains("--reason not_started"), "{store}");
+}
+
+#[test]
+fn a_delimited_option_shaped_prompt_is_registered_before_spawning() {
+    let sandbox = sandbox();
+    prebind(&sandbox, false);
+    let output = finish(
+        spawn(&sandbox, &prebound_arguments_with_prompt(&sandbox, "option-prompt", "--model=other"), &sandbox.root),
+        Duration::from_secs(30),
+    );
+    assert!(!output.status.success());
+    let store = log(&sandbox, "stubs/agent-store.log");
+    assert!(store.contains(&format!("register --session codex:{PREBOUND}")), "{store}");
+    assert!(store.contains("end --launch-id option-prompt --reason exited"), "{store}");
+    assert!(!store.contains("--reason not_started"), "{store}");
+}
+
+#[test]
+fn a_prebind_registration_failure_ends_only_the_verified_launch() {
+    let sandbox = sandbox();
+    prebind(&sandbox, false);
+    set_reply(&sandbox, "agent-store-register.json", r#"{"ok":false,"error":{"message":"storage failed"}}"#);
+    let output =
+        finish(spawn(&sandbox, &prebound_arguments(&sandbox, "not-started"), &sandbox.root), Duration::from_secs(30));
+    assert!(!output.status.success());
+    let store = log(&sandbox, "stubs/agent-store.log");
+    assert!(store.contains("launch --launch-id not-started --host codex"), "{store}");
+    assert!(store.contains("register --session codex:"), "{store}");
+    assert_eq!(store.matches("end --launch-id not-started --reason not_started").count(), 1, "{store}");
+    assert!(!store.contains("--reason exited"), "{store}");
+}
+
+#[test]
+fn a_malformed_reciprocal_binding_never_ends_or_spawns_the_native_session() {
+    let sandbox = sandbox();
+    prebind(&sandbox, true);
+    let output =
+        finish(spawn(&sandbox, &prebound_arguments(&sandbox, "foreign"), &sandbox.root), Duration::from_secs(30));
+    assert!(!output.status.success());
+    let store = log(&sandbox, "stubs/agent-store.log");
+    assert!(store.contains("register --session codex:"), "{store}");
+    assert!(!store.contains("end --launch-id foreign"), "{store}");
 }
 
 #[test]
