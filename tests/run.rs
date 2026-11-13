@@ -1475,24 +1475,24 @@ fn an_unchanged_marketplace_costs_one_conditional_request_a_minute_and_installs_
     assert!(requests[0].contains("accept: application/vnd.github.sha"), "{}", requests[0]);
     launch_checking(&sandbox, &upstream, "again");
     assert_eq!(upstream.requests().len(), 1, "checked again within a minute");
-    assert_eq!(log(&sandbox, "stubs/tj-install.log"), "");
+    assert_eq!(log(&sandbox, "stubs/tj-plugins.log"), "");
 }
 
 #[test]
 fn a_changed_marketplace_installs_in_the_background_once_per_commit() {
     let sandbox = sandbox();
     select_tj_agents(&sandbox);
-    stub(&sandbox.stubs, "tj-install", "installed");
+    stub(&sandbox.stubs, "tj-plugins", "updated");
     let upstream = Upstream::changed();
     let (output, _) = launch_checking(&sandbox, &upstream, "changed");
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("running tj install in the background"), "{stderr}");
-    wait_until("tj install never ran", || log(&sandbox, "stubs/tj-install.log").lines().count() == 1);
+    assert!(stderr.contains("updating claude plugins in the background"), "{stderr}");
+    wait_until("tj-plugins never ran", || log(&sandbox, "stubs/tj-plugins.log").contains("update --host claude"));
     assert!(!upstream.requests()[0].contains("if-none-match"), "{}", upstream.requests()[0]);
     std::fs::remove_file(update_state(&sandbox, "claude.checked")).unwrap();
     launch_checking(&sandbox, &upstream, "retry");
     assert_eq!(upstream.requests().len(), 2);
-    assert_eq!(log(&sandbox, "stubs/tj-install.log").lines().count(), 1, "installed the same commit twice");
+    assert_eq!(log(&sandbox, "stubs/tj-plugins.log").lines().count(), 1, "installed the same commit twice");
 }
 
 #[test]
