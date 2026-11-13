@@ -181,6 +181,10 @@ mod tests {
             resume(Host::Codex, &["codex", "--cd", "d", "--model", "m", "Do it"]),
             ["codex", "--cd", "d", "--model", "m", "resume", "id"]
         );
+        assert_eq!(
+            resume(Host::Codex, &["codex", "--cd", "d", "resume", "old", "--", "--model=other"]),
+            ["codex", "--cd", "d", "resume", "id"]
+        );
         assert_eq!(resume(Host::Codex, &["codex"]), ["codex", "resume", "id"]);
     }
 }
