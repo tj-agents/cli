@@ -138,6 +138,10 @@ pub fn end(launch_id: &str, reason: &str) -> Result<()> {
     call(&["end", "--launch-id", launch_id, "--reason", reason]).map(drop)
 }
 
+pub fn set_open(launch_id: &str, open: bool) -> Result<()> {
+    call(&["set-open", "--launch-id", launch_id, "--open", if open { "true" } else { "false" }]).map(drop)
+}
+
 pub fn mark_closing(item: &str) -> Result<()> {
     call(&["mark-closing", "--item", item]).map(drop)
 }

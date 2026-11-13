@@ -1,9 +1,8 @@
 use std::ffi::{OsStr, OsString};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::ExitCode;
-use std::time::{Duration, SystemTime};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 
 use crate::host::Host;
 
@@ -73,7 +72,7 @@ impl Host {
     }
 
     /// The original command line pointed at `session`: its options kept, its prompt and session choice dropped.
-    pub(super) fn resume(self, agent: &[OsString], session: &str) -> Vec<OsString> {
+    pub(crate) fn resume(self, agent: &[OsString], session: &str) -> Vec<OsString> {
         let mut kept = vec![agent[0].clone()];
         let mut arguments = agent[1..].iter().peekable();
         while let Some(argument) = arguments.next() {
@@ -105,82 +104,23 @@ impl Host {
     }
 }
 
-pub(super) const IDLE: &str = "idle";
-const REQUEST: &str = "restart";
-const RESTARTED: &str = "restarted";
-
-pub(super) struct Request {
-    folder: PathBuf,
-    grace: Duration,
-}
-
-impl Request {
-    pub(super) fn new(folder: &Path, grace: Duration) -> Self {
-        Self { folder: folder.to_path_buf(), grace }
+/// Runs `arguments` with the replaced executable in this tab. Linux replaces this process, keeping its pid; Windows
+/// Terminal closes the tab when its root process exits, so the root waits for its successor instead.
+pub(crate) fn hand_over(exe: &Path, arguments: &[OsString]) -> Result<ExitCode> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        let error = std::process::Command::new(exe).args(arguments).exec();
+        Err(error).with_context(|| format!("could not run {}", exe.display()))
     }
-
-    /// The pending request's reason, once the agent has sat idle with no background work for the grace.
-    pub(super) fn due(&self) -> Option<String> {
-        let reason = std::fs::read_to_string(self.folder.join(REQUEST)).ok()?;
-        let idle = self.folder.join(IDLE);
-        let background = std::fs::read_to_string(&idle).ok()?;
-        let since = idle.metadata().and_then(|meta| meta.modified()).ok()?;
-        let waited = SystemTime::now().duration_since(since).ok()?;
-        if background.trim().parse::<u32>() != Ok(0) || waited < self.grace {
-            return None;
-        }
-        let _ = std::fs::remove_file(self.folder.join(REQUEST));
-        let _ = std::fs::remove_file(&idle);
-        Some(reason)
+    #[cfg(windows)]
+    {
+        let status = std::process::Command::new(exe)
+            .args(arguments)
+            .status()
+            .with_context(|| format!("could not run {}", exe.display()))?;
+        Ok(ExitCode::from(status.code().map_or(1, |code| u8::try_from(code).unwrap_or(1))))
     }
-
-    pub(super) fn restarted(&self, reason: &str) {
-        let _ = std::fs::write(self.folder.join(RESTARTED), reason);
-    }
-}
-
-#[derive(clap::Args)]
-pub struct Args {
-    /// What the restart is for, such as the plugin build to load. A reason this tab already restarted for is refused.
-    #[arg(long, default_value = "")]
-    reason: String,
-}
-
-pub fn run(args: Args) -> Result<ExitCode> {
-    let Some(launch_id) = super::launch_id() else {
-        bail!("tj restart only works inside a tj run session (TJ_RUN_LAUNCH_ID is not set)");
-    };
-    let folder = super::marks(&launch_id)?;
-    if std::fs::read_to_string(folder.join(RESTARTED)).is_ok_and(|done| done == args.reason) {
-        bail!("this tab already restarted for {:?}; restarting again would not change it", args.reason);
-    }
-    std::fs::create_dir_all(&folder).context("could not create the restart request's folder")?;
-    std::fs::write(folder.join(REQUEST), &args.reason).context("could not record the restart request")?;
-    println!("Restart requested: tj run resumes this conversation in a fresh process once the agent is idle.");
-    Ok(ExitCode::SUCCESS)
-}
-
-fn background(text: &str) -> Result<String, String> {
-    if text == "unknown" || text.parse::<u32>().is_ok() {
-        return Ok(text.to_owned());
-    }
-    Err(format!("{text:?} is neither a count nor `unknown`"))
-}
-
-#[derive(clap::Args)]
-pub struct IdleArgs {
-    /// Background work the host still has in flight (shells, subagents, watches, timers), or `unknown`.
-    /// Only 0 lets a requested restart happen.
-    #[arg(long, value_parser = background)]
-    background: String,
-}
-
-pub fn idle(args: IdleArgs) -> Result<ExitCode> {
-    let Some(launch_id) = super::launch_id() else { return Ok(ExitCode::SUCCESS) };
-    let folder = super::marks(&launch_id)?;
-    std::fs::create_dir_all(&folder).context("could not create the idle mark's folder")?;
-    std::fs::write(folder.join(IDLE), args.background).context("could not record the idle mark")?;
-    Ok(ExitCode::SUCCESS)
 }
 
 #[cfg(test)]

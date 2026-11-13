@@ -30,6 +30,10 @@ impl Agent {
         os::Agent::start(argv, cwd, env).map(Self)
     }
 
+    pub fn pid(&self) -> u32 {
+        self.0.pid()
+    }
+
     pub fn try_wait(&mut self) -> io::Result<Option<i32>> {
         self.0.try_wait()
     }
@@ -58,9 +62,62 @@ pub fn prepare_wrapper() -> io::Result<()> {
     os::prepare_wrapper()
 }
 
+/// Runs `closed` when the user closes the wrapper's tab, but not when the OS session is logging off or shutting
+/// down. Windows only; elsewhere the tab's hangup ends the wrapper unrecorded.
+pub fn on_tab_closed(closed: Box<dyn Fn() + Send + Sync>) {
+    os::on_tab_closed(closed);
+}
+
+/// Whether the OS session is logging off or shutting down, which ends the tab without the user closing it.
+pub fn session_ending() -> bool {
+    os::session_ending()
+}
+
 /// When a still-running process started, for telling a live wrapper from a reused pid.
 pub fn started_at(pid: u32) -> io::Result<Option<SystemTime>> {
     os::started_at(pid)
+}
+
+/// The calling process and its live ancestors, nearest first, as (pid, executable file name).
+pub fn ancestry() -> io::Result<Vec<(u32, String)>> {
+    let mut table = os::processes()?;
+    let mut chain = Vec::new();
+    let mut pid = std::process::id();
+    while let Some((parent, image)) = table.remove(&pid) {
+        chain.push((pid, image));
+        pid = parent;
+    }
+    Ok(chain)
+}
+
+/// Executable file names of every live process below `pid`.
+pub fn descendants(pid: u32) -> io::Result<Vec<String>> {
+    let table = os::processes()?;
+    let mut found = Vec::new();
+    let mut parents = vec![pid];
+    while let Some(parent) = parents.pop() {
+        for (child, (_, image)) in table.iter().filter(|(child, (of, _))| *of == parent && **child != parent) {
+            if !found.iter().any(|(seen, _)| seen == child) {
+                found.push((*child, image.clone()));
+                parents.push(*child);
+            }
+        }
+    }
+    Ok(found.into_iter().map(|(_, image)| image).collect())
+}
+
+/// Types into the console the agent shares with this process, as if from the keyboard.
+pub fn type_text(text: &str) -> io::Result<()> {
+    os::type_text(text)
+}
+
+pub fn press_enter() -> io::Result<()> {
+    os::press_enter()
+}
+
+/// How long since the last keyboard or mouse input to this desktop, where the platform can tell.
+pub fn input_idle() -> Option<Duration> {
+    os::input_idle()
 }
 
 /// Keeps a helper off the agent's console: through `tj_hook` on Windows, in its own session on Linux.
