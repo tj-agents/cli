@@ -61,6 +61,9 @@ pub struct Args {
     /// The session that handed this work off, as `host:id`.
     #[arg(long)]
     parent: Option<String>,
+    /// Bind a pre-created native Codex session, as `codex:UUID`.
+    #[arg(long)]
+    session: Option<String>,
     #[arg(long, hide = true, default_value_t = 120)]
     poll_seconds: u64,
     #[arg(long, hide = true, default_value_t = 600)]
@@ -126,19 +129,17 @@ fn prepare(launch: &Launch, arguments: &[OsString]) {
 }
 
 /// The agent's SessionStart registers against this row, so it must exist before the agent starts.
-fn record_launch(launch: &Launch, parent: Option<&str>, wrapper_pid: u32, wrapper_started_at: &str) {
+fn record_launch(launch: &Launch, parent: Option<&str>, wrapper_pid: u32, wrapper_started_at: &str) -> Result<()> {
     let mut failure = None;
     for delay in [0, 1, 2, 4].map(Duration::from_secs) {
         std::thread::sleep(delay);
         match store::launch(launch, parent, wrapper_pid, wrapper_started_at) {
-            Ok(()) => return,
-            Err(_) if store::recorded(&launch.id) => return,
+            Ok(()) => return Ok(()),
+            Err(_) if store::recorded(&launch.id) => return Ok(()),
             Err(error) => failure = Some(error),
         }
     }
-    if let Some(error) = failure {
-        eprintln!("tj run: launch {} was not recorded: {error:#}", launch.id);
-    }
+    Err(failure.unwrap_or_else(|| anyhow::anyhow!("agent-store did not record launch {}", launch.id)))
 }
 
 fn marks(launch_id: &str) -> Result<PathBuf> {
@@ -187,6 +188,60 @@ fn launch(args: &Args) -> Result<Launch> {
     let title = args.title.clone().unwrap_or_else(|| default_title(&cwd));
     let id = args.launch_id.clone().map_or_else(generated_id, Ok)?;
     Ok(Launch { id, host, title, cwd, item: args.item.clone() })
+}
+
+struct PreboundSession {
+    handle: String,
+}
+
+fn canonical_uuid(value: &str) -> bool {
+    value.len() == 36
+        && value.bytes().enumerate().all(|(index, byte)| {
+            matches!(index, 8 | 13 | 18 | 23) && byte == b'-'
+                || !matches!(index, 8 | 13 | 18 | 23) && byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()
+        })
+}
+
+fn prebound_session(args: &Args, launch: &Launch) -> Result<Option<PreboundSession>> {
+    let Some(handle) = &args.session else { return Ok(None) };
+    let Some(native_id) = handle.strip_prefix("codex:") else {
+        bail!("--session must be codex:UUID");
+    };
+    if !canonical_uuid(native_id) {
+        bail!("--session must contain a canonical lowercase UUID");
+    }
+    if args.host != Some(Host::Codex) || launch.host != Host::Codex {
+        bail!("--session requires --host codex");
+    }
+    let executable = Path::new(&args.agent[0]);
+    if !executable.is_absolute()
+        || Host::from_program(executable.as_os_str()) != Some(Host::Codex)
+        || executable.extension().is_some_and(|extension| !extension.to_string_lossy().eq_ignore_ascii_case("exe"))
+    {
+        bail!("--session requires an absolute native codex executable");
+    }
+    let expected = [
+        args.agent[0].as_os_str(),
+        OsStr::new("--cd"),
+        launch.cwd.as_os_str(),
+        OsStr::new("resume"),
+        OsStr::new(native_id),
+    ];
+    let prompt_is_delimited = match args.agent.get(expected.len()..) {
+        Some([]) => true,
+        Some([delimiter, _]) => delimiter == OsStr::new("--"),
+        _ => false,
+    };
+    if !prompt_is_delimited || args.agent.iter().take(expected.len()).map(OsString::as_os_str).ne(expected) {
+        bail!("--session requires `codex --cd <cwd> resume <UUID> [-- <prompt>]`");
+    }
+    Ok(Some(PreboundSession { handle: handle.clone() }))
+}
+
+fn end_not_started(launch: &Launch, prebound: &PreboundSession, wrapper_pid: u32, wrapper_started_at: &str) {
+    if let Err(error) = store::end_not_started(launch, &prebound.handle, wrapper_pid, wrapper_started_at) {
+        eprintln!("tj run: could not mark unstarted launch {}: {error:#}", launch.id);
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -383,17 +438,18 @@ fn mark_closed(launch_id: &str) {
 pub fn run(args: Args) -> Result<ExitCode> {
     agent::prepare_wrapper().context("could not prepare the console")?;
     let launch = launch(&args)?;
+    let prebound = prebound_session(&args, &launch)?;
     let id = launch.id.clone();
     let closed = launch.id.clone();
     agent::on_tab_closed(Box::new(move || mark_closed(&closed)));
-    let result = supervise(&args, launch);
+    let result = supervise(&args, launch, prebound.as_ref());
     if !agent::session_ending() {
         mark_open(&id, false);
     }
     result
 }
 
-fn supervise(args: &Args, launch: Launch) -> Result<ExitCode> {
+fn supervise(args: &Args, launch: Launch, prebound: Option<&PreboundSession>) -> Result<ExitCode> {
     let exe = std::env::current_exe().context("could not locate the tj executable")?;
     let selected = tj_agents::selected(&launch.cwd);
     let upstream = if selected && !args.successor {
@@ -414,7 +470,19 @@ fn supervise(args: &Args, launch: Launch) -> Result<ExitCode> {
         ("AGENT_CLI_TAB_TITLE", launch.title.clone()),
     ];
     if !args.successor {
-        record_launch(&launch, args.parent.as_deref(), pid, &started_at);
+        if let Err(error) = record_launch(&launch, args.parent.as_deref(), pid, &started_at) {
+            if let Some(prebound) = prebound {
+                end_not_started(&launch, prebound, pid, &started_at);
+                return Err(error);
+            }
+            eprintln!("tj run: launch {} was not recorded: {error:#}", launch.id);
+        }
+    }
+    if let Some(prebound) = prebound {
+        if let Err(error) = store::prebind(&launch, &prebound.handle, pid, &started_at) {
+            end_not_started(&launch, prebound, pid, &started_at);
+            return Err(error);
+        }
     }
     mark_open(&launch.id, true);
     if selected {
@@ -427,8 +495,17 @@ fn supervise(args: &Args, launch: Launch) -> Result<ExitCode> {
         }
         _ => {}
     }
-    let mut agent = Agent::start(&args.agent, &launch.cwd, &environment)
-        .with_context(|| format!("could not start {}", args.agent[0].to_string_lossy()))?;
+    let mut agent = match Agent::start(&args.agent, &launch.cwd, &environment)
+        .with_context(|| format!("could not start {}", args.agent[0].to_string_lossy()))
+    {
+        Ok(agent) => agent,
+        Err(error) => {
+            if let Some(prebound) = prebound {
+                end_not_started(&launch, prebound, pid, &started_at);
+            }
+            return Err(error);
+        }
+    };
     let poll = Duration::from_secs(args.poll_seconds);
     let grace = Duration::from_secs(args.grace_seconds);
     let graces = update::gate::Graces {
@@ -534,15 +611,169 @@ pub fn done() -> Result<ExitCode> {
 
 #[cfg(test)]
 mod tests {
-    use std::ffi::OsStr;
-    use std::path::Path;
+    use std::ffi::{OsStr, OsString};
+    use std::path::{Path, PathBuf};
 
     use crate::host::Host;
+
+    use super::{Args, Launch, canonical_uuid, prebound_session};
+
+    fn prebound_args(agent: Vec<OsString>) -> Args {
+        Args {
+            host: Some(Host::Codex),
+            title: Some("Tab".to_owned()),
+            cwd: None,
+            item: None,
+            launch_id: Some("launch".to_owned()),
+            parent: None,
+            session: Some("codex:123e4567-e89b-12d3-a456-426614174000".to_owned()),
+            poll_seconds: 120,
+            idle_seconds: 600,
+            grace_seconds: 10,
+            restart_grace_seconds: 30,
+            plugin_grace_seconds: 2,
+            input_idle_seconds: 2,
+            update_url: String::new(),
+            successor: false,
+            agent,
+        }
+    }
+
+    fn cwd() -> PathBuf {
+        if cfg!(windows) { PathBuf::from("C:/worktree") } else { PathBuf::from("/worktree") }
+    }
+
+    fn executable() -> OsString {
+        if cfg!(windows) { OsString::from("C:/bin/codex.exe") } else { OsString::from("/bin/codex") }
+    }
+
+    fn launch() -> Launch {
+        Launch { id: "launch".to_owned(), host: Host::Codex, title: "Tab".to_owned(), cwd: cwd(), item: None }
+    }
 
     #[test]
     fn the_host_is_read_from_the_agent_executable_name() {
         assert_eq!(Host::from_program(OsStr::new("claude")), Some(Host::Claude));
         assert_eq!(Host::from_program(Path::new("bin").join("Codex.EXE").as_os_str()), Some(Host::Codex));
         assert_eq!(Host::from_program(OsStr::new("python")), None);
+    }
+
+    #[test]
+    fn prebound_session_admits_only_the_native_codex_resume_shape() {
+        let launch = launch();
+        let without_prompt = prebound_args(vec![
+            executable(),
+            OsString::from("--cd"),
+            launch.cwd.clone().into_os_string(),
+            OsString::from("resume"),
+            OsString::from("123e4567-e89b-12d3-a456-426614174000"),
+        ]);
+        assert_eq!(
+            prebound_session(&without_prompt, &launch).unwrap().unwrap().handle,
+            without_prompt.session.unwrap()
+        );
+
+        let with_prompt = prebound_args(vec![
+            executable(),
+            OsString::from("--cd"),
+            launch.cwd.clone().into_os_string(),
+            OsString::from("resume"),
+            OsString::from("123e4567-e89b-12d3-a456-426614174000"),
+            OsString::from("--"),
+            OsString::from("Prompt"),
+        ]);
+        assert_eq!(prebound_session(&with_prompt, &launch).unwrap().unwrap().handle, with_prompt.session.unwrap());
+    }
+
+    #[test]
+    fn prebound_session_admits_only_a_delimited_literal_prompt() {
+        let launch = launch();
+        for prompt in ["--help", "--model=other", "-", " spaced 世界"] {
+            let args = prebound_args(vec![
+                executable(),
+                OsString::from("--cd"),
+                launch.cwd.clone().into_os_string(),
+                OsString::from("resume"),
+                OsString::from("123e4567-e89b-12d3-a456-426614174000"),
+                OsString::from("--"),
+                OsString::from(prompt),
+            ]);
+            assert!(prebound_session(&args, &launch).is_ok());
+        }
+    }
+
+    #[test]
+    fn prebound_session_rejects_undelimited_or_extra_arguments() {
+        let launch = launch();
+        let bare_prompt = prebound_args(vec![
+            executable(),
+            OsString::from("--cd"),
+            launch.cwd.clone().into_os_string(),
+            OsString::from("resume"),
+            OsString::from("123e4567-e89b-12d3-a456-426614174000"),
+            OsString::from("Prompt"),
+        ]);
+        assert!(prebound_session(&bare_prompt, &launch).is_err());
+
+        let bare_option = prebound_args(vec![
+            executable(),
+            OsString::from("--cd"),
+            launch.cwd.clone().into_os_string(),
+            OsString::from("resume"),
+            OsString::from("123e4567-e89b-12d3-a456-426614174000"),
+            OsString::from("--model=other"),
+        ]);
+        assert!(prebound_session(&bare_option, &launch).is_err());
+
+        let bare_delimiter = prebound_args(vec![
+            executable(),
+            OsString::from("--cd"),
+            launch.cwd.clone().into_os_string(),
+            OsString::from("resume"),
+            OsString::from("123e4567-e89b-12d3-a456-426614174000"),
+            OsString::from("--"),
+        ]);
+        assert!(prebound_session(&bare_delimiter, &launch).is_err());
+
+        let extra = prebound_args(vec![
+            executable(),
+            OsString::from("--cd"),
+            launch.cwd.clone().into_os_string(),
+            OsString::from("resume"),
+            OsString::from("123e4567-e89b-12d3-a456-426614174000"),
+            OsString::from("--"),
+            OsString::from("Prompt"),
+            OsString::from("extra"),
+        ]);
+        assert!(prebound_session(&extra, &launch).is_err());
+
+        let reordered = prebound_args(vec![
+            executable(),
+            OsString::from("resume"),
+            launch.cwd.clone().into_os_string(),
+            OsString::from("--cd"),
+            OsString::from("123e4567-e89b-12d3-a456-426614174000"),
+        ]);
+        assert!(prebound_session(&reordered, &launch).is_err());
+        assert!(!canonical_uuid("123E4567-e89b-12d3-a456-426614174000"));
+
+        let mut wrong_host = prebound_args(vec![
+            executable(),
+            OsString::from("--cd"),
+            launch.cwd.clone().into_os_string(),
+            OsString::from("resume"),
+            OsString::from("123e4567-e89b-12d3-a456-426614174000"),
+        ]);
+        wrong_host.host = Some(Host::Claude);
+        assert!(prebound_session(&wrong_host, &launch).is_err());
+
+        let wrong_cwd = prebound_args(vec![
+            executable(),
+            OsString::from("--cd"),
+            OsString::from("/other"),
+            OsString::from("resume"),
+            OsString::from("123e4567-e89b-12d3-a456-426614174000"),
+        ]);
+        assert!(prebound_session(&wrong_cwd, &launch).is_err());
     }
 }

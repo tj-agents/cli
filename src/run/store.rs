@@ -55,6 +55,104 @@ pub fn recorded(launch_id: &str) -> bool {
     call(&["show", "--launch-id", launch_id]).is_ok()
 }
 
+fn text<'a>(value: &'a Value, field: &str) -> Result<&'a str> {
+    value[field].as_str().with_context(|| format!("agent-store response has no {field}"))
+}
+
+fn active(value: &Value, subject: &str) -> Result<()> {
+    if text(value, "state")? != "active" {
+        bail!("agent-store {subject} is not active");
+    }
+    Ok(())
+}
+
+fn exact_launch(data: &Value, launch: &Launch, wrapper_pid: u32, wrapper_started_at: &str) -> Result<()> {
+    let row = &data["launch"];
+    let cwd = launch.cwd.to_str().context("launch cwd is not UTF-8")?;
+    if text(row, "launch_id")? != launch.id
+        || text(row, "host")? != launch.host.name()
+        || text(row, "title")? != launch.title
+        || text(row, "cwd")? != cwd
+        || row["wrapper"]["pid"].as_u64() != Some(u64::from(wrapper_pid))
+        || text(&row["wrapper"], "started_at")? != wrapper_started_at
+    {
+        bail!("agent-store launch does not match this wrapper");
+    }
+    active(row, "launch")
+}
+
+fn exact_binding(
+    data: &Value,
+    launch: &Launch,
+    handle: &str,
+    wrapper_pid: u32,
+    wrapper_started_at: &str,
+) -> Result<()> {
+    exact_launch(data, launch, wrapper_pid, wrapper_started_at)?;
+    let session = &data["session"];
+    let native_id = handle.strip_prefix("codex:").context("prebound session is not codex")?;
+    if text(&data["launch"], "session")? != handle
+        || text(session, "session")? != handle
+        || text(session, "native_id")? != native_id
+        || text(session, "host")? != launch.host.name()
+        || text(session, "launch_id")? != launch.id
+    {
+        bail!("agent-store session is not reciprocally bound to this launch");
+    }
+    active(session, "session")
+}
+
+fn launch_has_no_foreign_binding(
+    data: &Value,
+    launch: &Launch,
+    handle: &str,
+    wrapper_pid: u32,
+    wrapper_started_at: &str,
+) -> Result<()> {
+    exact_launch(data, launch, wrapper_pid, wrapper_started_at)?;
+    match &data["launch"]["session"] {
+        Value::Null => Ok(()),
+        Value::String(session) if session == handle => Ok(()),
+        _ => bail!("agent-store launch is bound to another session"),
+    }
+}
+
+fn register_arguments(launch: &Launch, handle: &str) -> Result<Vec<String>> {
+    let cwd = launch.cwd.to_str().context("launch cwd is not UTF-8")?;
+    Ok(vec![
+        "register".to_owned(),
+        "--session".to_owned(),
+        handle.to_owned(),
+        "--cwd".to_owned(),
+        cwd.to_owned(),
+        "--launch-id".to_owned(),
+        launch.id.clone(),
+    ])
+}
+
+pub fn prebind(launch: &Launch, handle: &str, wrapper_pid: u32, wrapper_started_at: &str) -> Result<()> {
+    let before = call(&["show", "--launch-id", &launch.id])?;
+    launch_has_no_foreign_binding(&before, launch, handle, wrapper_pid, wrapper_started_at)?;
+    let arguments = register_arguments(launch, handle)?;
+    let references = arguments.iter().map(String::as_str).collect::<Vec<_>>();
+    call(&references)?;
+    let by_launch = call(&["show", "--launch-id", &launch.id])?;
+    exact_binding(&by_launch, launch, handle, wrapper_pid, wrapper_started_at)?;
+    let by_session = call(&["show", handle])?;
+    exact_binding(&by_session, launch, handle, wrapper_pid, wrapper_started_at)
+}
+
+pub fn end_not_started(launch: &Launch, handle: &str, wrapper_pid: u32, wrapper_started_at: &str) -> Result<()> {
+    let data = call(&["show", "--launch-id", &launch.id])?;
+    launch_has_no_foreign_binding(&data, launch, handle, wrapper_pid, wrapper_started_at)?;
+    if matches!(&data["launch"]["session"], Value::String(session) if session == handle) {
+        exact_binding(&data, launch, handle, wrapper_pid, wrapper_started_at)?;
+        let by_session = call(&["show", handle])?;
+        exact_binding(&by_session, launch, handle, wrapper_pid, wrapper_started_at)?;
+    }
+    end(&launch.id, "not_started")
+}
+
 fn terminal() -> Option<(&'static str, String)> {
     let present = |name| std::env::var(name).ok().filter(|value| !value.is_empty());
     present("WT_SESSION").map(|id| ("windows-terminal", id)).or_else(|| present("TMUX_PANE").map(|id| ("tmux", id)))
@@ -179,4 +277,70 @@ fn row(value: &Value) -> Option<Row> {
         wrapper_pid: u32::try_from(value["wrapper"]["pid"].as_u64()?).ok()?,
         wrapper_started_at: text(&value["wrapper"]["started_at"])?,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use serde_json::json;
+
+    use super::{Host, Launch, exact_binding, register_arguments};
+
+    fn launch() -> Launch {
+        Launch {
+            id: "launch".to_owned(),
+            host: Host::Codex,
+            title: "Tab".to_owned(),
+            cwd: PathBuf::from("C:/worktree"),
+            item: None,
+        }
+    }
+
+    fn bound() -> serde_json::Value {
+        json!({
+            "launch": {
+                "launch_id": "launch",
+                "host": "codex",
+                "title": "Tab",
+                "cwd": "C:/worktree",
+                "session": "codex:123e4567-e89b-12d3-a456-426614174000",
+                "state": "active",
+                "wrapper": {"pid": 4, "started_at": "2026-11-11T00:00:00Z"}
+            },
+            "session": {
+                "session": "codex:123e4567-e89b-12d3-a456-426614174000",
+                "native_id": "123e4567-e89b-12d3-a456-426614174000",
+                "host": "codex",
+                "launch_id": "launch",
+                "state": "active"
+            }
+        })
+    }
+
+    #[test]
+    fn registration_has_only_the_prebound_session_and_launch_fields() {
+        assert_eq!(
+            register_arguments(&launch(), "codex:123e4567-e89b-12d3-a456-426614174000").unwrap(),
+            [
+                "register",
+                "--session",
+                "codex:123e4567-e89b-12d3-a456-426614174000",
+                "--cwd",
+                "C:/worktree",
+                "--launch-id",
+                "launch"
+            ]
+        );
+    }
+
+    #[test]
+    fn reciprocal_binding_rejects_a_foreign_native_id() {
+        let mut data = bound();
+        data["session"]["native_id"] = json!("123e4567-e89b-12d3-a456-426614174001");
+        assert!(
+            exact_binding(&data, &launch(), "codex:123e4567-e89b-12d3-a456-426614174000", 4, "2026-11-11T00:00:00Z")
+                .is_err()
+        );
+    }
 }
