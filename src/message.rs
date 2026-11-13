@@ -71,6 +71,9 @@ fn resolve(target: &str) -> Result<Session> {
 
 pub(crate) fn run(args: &Args) -> Result<ExitCode> {
     let target = resolve(&args.target)?;
+    if Host::from_name(&target.host).is_none() {
+        bail!("{} runs on {}, which tj message cannot reach", target.name(), target.host);
+    }
     let from = Host::current().and_then(Host::handle);
     let name = env("AGENT_CLI_TAB_TITLE").or_else(|| from.clone());
     let at = chrono::Local::now().format("%Y-%m-%d %H:%M").to_string();

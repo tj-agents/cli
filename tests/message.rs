@@ -284,8 +284,50 @@ fn feed_wait_returns_when_a_message_arrives() {
 fn feed_wait_gives_up_at_its_timeout() {
     let sandbox = sandbox(&[]);
     let output = sandbox.tj(&["feed", "--wait", "--timeout", "1"], &AS_CODEX_CHILD);
-    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
     assert_eq!(stdout(&output).trim(), "no message arrived within 1 seconds");
+}
+
+#[test]
+fn a_torn_line_is_passed_over_and_the_messages_after_it_still_arrive() {
+    let sandbox = sandbox(&[]);
+    let feed = sandbox.feed(&format!("codex-{CODEX_CHILD}.jsonl"));
+    std::fs::create_dir_all(feed.parent().unwrap()).unwrap();
+    let whole = "{\"at\":\"t\",\"from\":null,\"text\":\"after\"}";
+    std::fs::write(
+        &feed,
+        format!(
+            "{{\"at\":\"t\",\"te{whole}
+{whole}
+"
+        ),
+    )
+    .unwrap();
+    let shown = stdout(&sandbox.tj(&["feed"], &AS_CODEX_CHILD));
+    assert!(shown.contains("passed over 1 line(s) in the feed that were not JSON"), "{shown}");
+    assert_eq!(shown.matches("a terminal: after").count(), 1, "{shown}");
+    assert_eq!(stdout(&sandbox.tj(&["feed"], &AS_CODEX_CHILD)).trim(), "no unread messages");
+}
+
+#[cfg(unix)]
+#[test]
+fn only_the_owner_can_read_a_feed() {
+    use std::os::unix::fs::PermissionsExt;
+    let sandbox = sandbox(&[session("codex", CODEX_CHILD, "Phase 3b", "active")]);
+    sandbox.tj(&["message", "Phase 3b", "private"], &FROM_CLAUDE);
+    let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+    let feed = sandbox.feed(&format!("codex-{CODEX_CHILD}.jsonl"));
+    assert_eq!(mode(&feed), 0o600);
+    assert_eq!(mode(feed.parent().unwrap()), 0o700);
+}
+
+#[test]
+fn a_session_on_an_unknown_host_is_refused() {
+    let sandbox = sandbox(&[session("gemini", "g1", "elsewhere", "active")]);
+    let output = sandbox.tj(&["message", "elsewhere", "hi"], &FROM_CODEX);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(stderr(&output).contains("elsewhere runs on gemini, which tj message cannot reach"));
+    assert!(!sandbox.root.join("cache").join("feed").exists());
 }
 
 #[test]
