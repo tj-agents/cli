@@ -81,6 +81,19 @@ fn exact_launch(data: &Value, launch: &Launch, wrapper_pid: u32, wrapper_started
     active(row, "launch")
 }
 
+/// `session` is the session row; agent-store's `show <handle>` returns it without a launch row.
+fn exact_session(session: &Value, launch: &Launch, handle: &str) -> Result<()> {
+    let native_id = handle.strip_prefix("codex:").context("prebound session is not codex")?;
+    if text(session, "session")? != handle
+        || text(session, "native_id")? != native_id
+        || text(session, "host")? != launch.host.name()
+        || text(session, "launch_id")? != launch.id
+    {
+        bail!("agent-store session is not reciprocally bound to this launch");
+    }
+    active(session, "session")
+}
+
 fn exact_binding(
     data: &Value,
     launch: &Launch,
@@ -89,17 +102,10 @@ fn exact_binding(
     wrapper_started_at: &str,
 ) -> Result<()> {
     exact_launch(data, launch, wrapper_pid, wrapper_started_at)?;
-    let session = &data["session"];
-    let native_id = handle.strip_prefix("codex:").context("prebound session is not codex")?;
-    if text(&data["launch"], "session")? != handle
-        || text(session, "session")? != handle
-        || text(session, "native_id")? != native_id
-        || text(session, "host")? != launch.host.name()
-        || text(session, "launch_id")? != launch.id
-    {
-        bail!("agent-store session is not reciprocally bound to this launch");
+    if text(&data["launch"], "session")? != handle {
+        bail!("agent-store launch is not bound to this session");
     }
-    active(session, "session")
+    exact_session(&data["session"], launch, handle)
 }
 
 fn launch_has_no_foreign_binding(
@@ -138,8 +144,7 @@ pub fn prebind(launch: &Launch, handle: &str, wrapper_pid: u32, wrapper_started_
     call(&references)?;
     let by_launch = call(&["show", "--launch-id", &launch.id])?;
     exact_binding(&by_launch, launch, handle, wrapper_pid, wrapper_started_at)?;
-    let by_session = call(&["show", handle])?;
-    exact_binding(&by_session, launch, handle, wrapper_pid, wrapper_started_at)
+    exact_session(&call(&["show", handle])?["session"], launch, handle)
 }
 
 pub fn end_not_started(launch: &Launch, handle: &str, wrapper_pid: u32, wrapper_started_at: &str) -> Result<()> {
@@ -147,8 +152,7 @@ pub fn end_not_started(launch: &Launch, handle: &str, wrapper_pid: u32, wrapper_
     launch_has_no_foreign_binding(&data, launch, handle, wrapper_pid, wrapper_started_at)?;
     if matches!(&data["launch"]["session"], Value::String(session) if session == handle) {
         exact_binding(&data, launch, handle, wrapper_pid, wrapper_started_at)?;
-        let by_session = call(&["show", handle])?;
-        exact_binding(&by_session, launch, handle, wrapper_pid, wrapper_started_at)?;
+        exact_session(&call(&["show", handle])?["session"], launch, handle)?;
     }
     end(&launch.id, "not_started")
 }
