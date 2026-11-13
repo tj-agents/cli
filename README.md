@@ -223,7 +223,7 @@ Such a launch also checks, once and alongside `tj-prepare`, whether `tj-agents/m
 commit this host last converged to: one conditional `GET` of its `main` commit with `If-None-Match` set to the
 first line of `<cache>/published/<host>`, with a 1 s timeout. At most one launch per host checks a minute
 (`<cache>/update/<host>.lock` and `<host>.checked`), within GitHub's 60 unauthenticated requests an hour. A
-`304` costs nothing more. A `200` starts `tj install` in the background, logging to
+`304` costs nothing more. A `200` starts `tj-plugins update --host H` in the background, logging to
 `<cache>/update/<host>.log`, and the launch goes on; it publishes when done, and the update reaches open tabs
 as below. One commit is installed at most once every 10 minutes, so a failed install, which publishes nothing,
 is retried by a later launch. Any other answer or no answer prints one line and the launch goes on.
