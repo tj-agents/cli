@@ -286,7 +286,7 @@ agent's console. If the agent exits by itself, nothing is left running, so the w
 ```text
 tj message <title|host:id> <text>   post to another session's feed; nothing enters its conversation
 tj feed                             show this session's unread messages, once, with how to reply
-tj feed --wait [--timeout <secs>]   block until a message arrives (default 12 hours), then show it
+tj feed --wait [--timeout <secs>]   block until a message arrives (default 12 hours); exit 1 if none did
 ```
 
 The target is looked up with `agent-store sessions --title` (or `agent-store show` for a handle) and must be
@@ -294,7 +294,8 @@ exactly one session that has not ended. The caller is the Claude session when `C
 Codex thread in `CODEX_THREAD_ID`; a message from neither is shown as from a terminal.
 
 Each session's feed is `<cache>/feed/<host>-<id>.jsonl`, one JSON message per line appended in a single write,
-with `<host>-<id>.read` holding the byte offset already shown. A message reaches the receiver only when it runs
+with `<host>-<id>.read` holding the byte offset already shown. On Unix the folder and feeds are readable only
+by you. A line that is not JSON, such as one torn by a killed sender, is reported and passed over. A message reaches the receiver only when it runs
 `tj feed`; nothing is injected into its conversation. A parent waiting on a child runs `tj feed --wait` as a
 background command, so the child's final message returns through the parent's own task notification.
 
