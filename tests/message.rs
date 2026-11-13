@@ -210,15 +210,42 @@ fn a_message_to_a_codex_session_lands_in_its_feed_with_the_sender() {
 }
 
 #[test]
-fn a_message_to_a_claude_session_goes_to_its_feed_from_either_host() {
-    let sandbox = sandbox(&[session("claude", CLAUDE_PEER, "tj-agents-c2", "active")]);
+fn a_message_to_a_claude_session_reaches_its_native_inbox_from_either_host() {
+    let mut sandbox = sandbox(&[session("claude", CLAUDE_PEER, "tj-agents-c2", "active")]);
+    let inbox = sandbox.start_inbox();
+    sandbox.start_bridge(&inbox);
     for caller in [&FROM_CLAUDE[..], &FROM_CODEX[..]] {
         let output = sandbox.tj(&["message", "tj-agents-c2", "PR 56 is ready"], caller);
         assert!(output.status.success(), "{}", stderr(&output));
+        assert!(stdout(&output).contains("delivered to tj-agents-c2's inbox"));
     }
-    let posted = sandbox.posted(&format!("claude-{CLAUDE_PEER}.jsonl"));
-    let senders: Vec<&str> = posted.iter().map(|message| message["from"].as_str().unwrap()).collect();
-    assert_eq!(senders, ["claude:c1a0de00", "codex:019a-parent"]);
+    wait_for("the inbox to record both messages", || sandbox.inbox().len() == 4);
+    let lines = sandbox.inbox();
+    assert_eq!(lines[0], json!({"type": "auth", "token": TOKEN}));
+    assert_eq!(
+        lines[1]["message"]["content"],
+        "[tj message from cli 82; reply with: tj message claude:c1a0de00 \"<text>\"] PR 56 is ready"
+    );
+    assert_eq!(
+        lines[3]["message"]["content"],
+        "[tj message from agent 92; reply with: tj message codex:019a-parent \"<text>\"] PR 56 is ready"
+    );
+    assert!(!sandbox.root.join("cache").join("feed").exists());
+}
+
+#[test]
+fn a_claude_session_without_a_relay_is_an_error() {
+    let sandbox = sandbox(&[session("claude", CLAUDE_PEER, "tj-agents-c2", "active")]);
+    let output = sandbox.tj(&["message", "tj-agents-c2", "hi"], &FROM_CODEX);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(stderr(&output).contains("has no message relay"), "{}", stderr(&output));
+}
+
+#[test]
+fn feed_refuses_a_claude_session() {
+    let output = sandbox(&[]).tj(&["feed"], &AS_CLAUDE_PEER);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(stderr(&output).contains("a Claude session receives tj message in its own inbox"));
 }
 
 #[test]
@@ -231,16 +258,16 @@ fn a_handle_is_looked_up_with_show() {
 
 #[test]
 fn feed_shows_unread_messages_once_with_a_reply_route() {
-    let sandbox = sandbox(&[session("claude", CLAUDE_PEER, "tj-agents-c2", "active")]);
-    sandbox.tj(&["message", "tj-agents-c2", "PR 56 is ready"], &FROM_CODEX);
-    let first = sandbox.tj(&["feed"], &AS_CLAUDE_PEER);
+    let sandbox = sandbox(&[session("codex", CODEX_CHILD, "Phase 3b", "active")]);
+    sandbox.tj(&["message", "Phase 3b", "PR 56 is ready"], &FROM_CODEX);
+    let first = sandbox.tj(&["feed"], &AS_CODEX_CHILD);
     assert!(first.status.success(), "{}", stderr(&first));
     let shown = stdout(&first);
     assert!(shown.contains("agent 92 (codex:019a-parent): PR 56 is ready"), "{shown}");
     assert!(shown.contains("reply: tj message codex:019a-parent \"<text>\""), "{shown}");
-    assert_eq!(stdout(&sandbox.tj(&["feed"], &AS_CLAUDE_PEER)).trim(), "no unread messages");
-    sandbox.tj(&["message", "tj-agents-c2", "merged"], &FROM_CODEX);
-    let next = stdout(&sandbox.tj(&["feed"], &AS_CLAUDE_PEER));
+    assert_eq!(stdout(&sandbox.tj(&["feed"], &AS_CODEX_CHILD)).trim(), "no unread messages");
+    sandbox.tj(&["message", "Phase 3b", "merged"], &FROM_CODEX);
+    let next = stdout(&sandbox.tj(&["feed"], &AS_CODEX_CHILD));
     assert!(next.contains("merged") && !next.contains("PR 56"), "{next}");
 }
 
@@ -334,7 +361,7 @@ fn a_session_on_an_unknown_host_is_refused() {
 fn feed_needs_a_calling_session() {
     let output = sandbox(&[]).tj(&["feed"], &[]);
     assert_eq!(output.status.code(), Some(2));
-    assert!(stderr(&output).contains("tj feed reads the calling session's own feed"));
+    assert!(stderr(&output).contains("tj feed reads the calling Codex session's own feed"));
 }
 
 #[test]
