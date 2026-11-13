@@ -25,7 +25,7 @@ fn endpoint(session: &str) -> Result<PathBuf> {
 }
 
 /// Native Windows verifies an own-child message only by the token in its first line.
-pub fn post_own(text: &str) -> Result<()> {
+fn post_own(text: &str) -> Result<()> {
     let socket = env(SOCKET).with_context(|| format!("{SOCKET} is not set"))?;
     let token = env(TOKEN).with_context(|| format!("{TOKEN} is not set"))?;
     let lines = format!(

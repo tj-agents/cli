@@ -3,13 +3,13 @@ mod bridge;
 mod cr;
 mod external;
 mod f;
+mod feed;
 mod fzf;
 mod host;
 mod init;
 mod message;
 mod paths;
 mod run;
-mod subscribe;
 
 use std::ffi::OsString;
 use std::process::ExitCode;
@@ -43,11 +43,11 @@ enum Command {
     Launch,
     /// Close out a work item's sessions, or sweep launches whose tab is gone
     Closeout(run::closeout::Args),
-    /// Send a message to another Claude or Codex session, addressed by its tab title
+    /// Post a message to another Claude or Codex session's feed, addressed by its tab title
     Message(message::Args),
-    /// Get one notice when a Codex child session next goes idle or exits
-    Subscribe(subscribe::Args),
-    /// Relays `tj message` into this Claude session until it exits (run by the async SessionStart hook)
+    /// Read this session's unread feed messages, optionally waiting for the next one
+    Feed(feed::Args),
+    /// Relays `tj run`'s close-out notice into this Claude session until it exits (run by the async `SessionStart` hook)
     #[command(hide = true)]
     Bridge,
     /// Draws cr's preview pane (run by fzf, not by hand)
@@ -69,8 +69,8 @@ fn main() -> ExitCode {
         Command::Update(args) => run::update::publish(args),
         Command::Launch => Ok(run::owner::print()),
         Command::Closeout(args) => run::closeout::run(args),
-        Command::Message(args) => message::run(args),
-        Command::Subscribe(args) => subscribe::run(args),
+        Command::Message(args) => message::run(&args),
+        Command::Feed(args) => feed::run(&args),
         Command::Bridge => bridge::run(),
         Command::CrPreview(args) => cr::preview(args),
         Command::External(arguments) => external::run(arguments),
