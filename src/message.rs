@@ -1,34 +1,31 @@
-use std::ffi::OsStr;
-use std::process::{Command, ExitCode, Stdio};
+use std::process::ExitCode;
 
 use anyhow::{Context, Result, bail};
-use serde_json::Value;
+use serde_json::{Value, json};
 
-use crate::{bridge, host::Host, run::store};
-
-/// Exit code when nothing was sent because the caller must use its host's native tool.
-const NATIVE: u8 = 3;
+use crate::feed::{self, Feed};
+use crate::{host::Host, run::store};
 
 #[derive(clap::Args)]
-pub struct Args {
+pub(crate) struct Args {
     /// The recipient: its tab title, or its `host:session-id` handle
     target: String,
     /// The message
     text: String,
 }
 
-pub struct Session {
-    pub host: String,
-    pub id: String,
-    pub title: Option<String>,
+struct Session {
+    host: String,
+    id: String,
+    title: Option<String>,
 }
 
 impl Session {
-    pub fn handle(&self) -> String {
+    fn handle(&self) -> String {
         format!("{}:{}", self.host, self.id)
     }
 
-    pub fn name(&self) -> String {
+    fn name(&self) -> String {
         self.title.clone().unwrap_or_else(|| self.handle())
     }
 
@@ -45,21 +42,13 @@ fn env(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|value| !value.is_empty())
 }
 
-fn header(caller: Option<Host>) -> String {
-    let Some(handle) = caller.and_then(Host::handle) else {
-        return "[tj message from a terminal]".to_owned();
-    };
-    let name = env("AGENT_CLI_TAB_TITLE").unwrap_or_else(|| handle.clone());
-    format!("[tj message from {name}; reply with: tj message {handle} \"<text>\"]")
-}
-
 fn is_handle(target: &str) -> bool {
     target
         .split_once(':')
         .is_some_and(|(host, id)| ["claude", "codex"].contains(&host) && !id.is_empty() && !id.contains(' '))
 }
 
-pub fn resolve(target: &str) -> Result<Session> {
+fn resolve(target: &str) -> Result<Session> {
     let rows = if is_handle(target) {
         vec![store::call(&["show", target])?["session"].clone()]
     } else {
@@ -80,53 +69,17 @@ pub fn resolve(target: &str) -> Result<Session> {
     }
 }
 
-/// A host CLI run without a console window, so a detached caller never flashes one.
-pub fn host_command(program: &str) -> Result<Command> {
-    let executable = which::which(program).with_context(|| format!("`{program}` is not on PATH"))?;
-    let command = Command::new(executable);
-    #[cfg(windows)]
-    let command = {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        let mut command = command;
-        command.creation_flags(CREATE_NO_WINDOW);
-        command
-    };
-    Ok(command)
-}
-
-pub fn queue(thread: &str, text: &str) -> Result<()> {
-    let output = host_command("codex")?
-        .args([OsStr::new("queue"), "--thread".as_ref(), thread.as_ref(), "--message".as_ref(), text.as_ref()])
-        .stdin(Stdio::null())
-        .output()
-        .context("could not run codex queue")?;
-    if !output.status.success() {
-        bail!("codex queue: {}", String::from_utf8_lossy(&output.stderr).trim());
-    }
-    Ok(())
-}
-
-pub fn run(args: Args) -> Result<ExitCode> {
+pub(crate) fn run(args: &Args) -> Result<ExitCode> {
     let target = resolve(&args.target)?;
-    let from = Host::current();
-    let name = target.name();
-    let text = format!("{} {}", header(from), args.text);
-    match (target.host.as_str(), from) {
-        ("codex", _) => {
-            queue(&target.id, &text)?;
-            println!("queued for {name}; delivered at the target's next idle point");
-        }
-        ("claude", Some(Host::Claude)) => {
-            println!("not sent: {name} is a Claude session; send it with the native SendMessage tool, to: {name}");
-            return Ok(ExitCode::from(NATIVE));
-        }
-        ("claude", _) => {
-            bridge::post(&target.id, &text).with_context(|| format!("could not reach {name}"))?;
-            println!("delivered to {name}'s inbox; it starts a turn if idle, or reads it between tool calls");
-        }
-        (host, _) => bail!("{name} runs on {host}, which tj message cannot reach"),
+    if Host::from_name(&target.host).is_none() {
+        bail!("{} runs on {}, which tj message cannot reach", target.name(), target.host);
     }
+    let from = Host::current().and_then(Host::handle);
+    let name = env("AGENT_CLI_TAB_TITLE").or_else(|| from.clone());
+    let at = chrono::Local::now().format("%Y-%m-%d %H:%M").to_string();
+    Feed::new(&feed::folder()?, &target.handle())?
+        .post(&json!({"at": at, "from": from, "name": name, "text": &args.text}))?;
+    println!("posted to {}'s feed; it reads it when it runs tj feed", target.name());
     Ok(ExitCode::SUCCESS)
 }
 
