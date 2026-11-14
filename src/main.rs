@@ -32,7 +32,7 @@ enum Command {
     /// Print the shell functions to eval from your shell's startup file
     Init(init::Args),
     /// Run an agent as this tab's root process and close its work item out when it is finished
-    Run(run::Args),
+    Run(Box<run::Args>),
     /// Mark this tab's work done; `tj run` closes it out after an idle grace
     Done,
     /// Announce installed plugin updates; every tab under `tj run` applies them in place once idle (run by Agent)
@@ -64,7 +64,7 @@ fn main() -> ExitCode {
         Command::Cr(args) => cr::run(args),
         Command::F(args) => f::run(args),
         Command::Init(args) => init::run(args),
-        Command::Run(args) => run::run(args),
+        Command::Run(args) => run::run(*args),
         Command::Done => run::done(),
         Command::Update(args) => run::update::publish(args),
         Command::Launch => Ok(run::owner::print()),

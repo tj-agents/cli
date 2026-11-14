@@ -269,6 +269,13 @@ It closes out only when one of these happens:
 A merged PR never stops a session: an item can be merged before its session starts or while it still has
 work. The first time `tj item prs` (checked every two minutes) reports every PR for the item merged, the
 wrapper asks the agent once, through its Claude relay or Codex queue, to run `tj done` if nothing is left.
+
+Work needs no item or PR to finish, so the wrapper also asks an idle agent. Once the host has stayed idle
+for about 30 minutes after a turn, with no shell running under it and no `tj done` standing, the wrapper
+asks the agent the same way. Its answer to an ask is itself a turn, so the wrapper asks again only after a
+later turn. An agent waiting on a reply from the user, a child session or a merge is not finished. Whether
+the work is done is the agent's call; idleness alone never closes a tab.
+
 An agent that is unsure carries on and the tab stays open. A refused check withdraws `tj done` and prints
 the reason; the agent runs it again once the reason is fixed.
 

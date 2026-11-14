@@ -68,6 +68,8 @@ pub struct Args {
     poll_seconds: u64,
     #[arg(long, hide = true, default_value_t = 600)]
     idle_seconds: u64,
+    #[arg(long, hide = true, default_value_t = 1800)]
+    ask_idle_seconds: u64,
     #[arg(long, hide = true, default_value_t = 10)]
     grace_seconds: u64,
     #[arg(long, hide = true, default_value_t = 30)]
@@ -258,6 +260,8 @@ struct Watch {
     next_poll: Instant,
     reported: HashSet<String>,
     asked: bool,
+    ask_idle: Duration,
+    nudge: turn::Nudge,
     mark: Option<SystemTime>,
     pinned: Option<turn::Turn>,
     rollout: Option<PathBuf>,
@@ -338,12 +342,28 @@ impl Watch {
         }
         if !self.asked && self.delivered() {
             let item = self.launch.item.clone().unwrap_or_default();
-            match closeout::ask(&self.launch, &item) {
-                Ok(()) => self.asked = true,
-                Err(error) => self.report(format!("could not ask the agent to close out: {error:#}")),
+            self.asked = self.ask(&format!("Every PR linked to {item} has merged."));
+        } else if self.marked().is_none() {
+            let (turn, background) = self.turn(agent);
+            if self.nudge.due(SystemTime::now(), turn, background, self.ask_idle) {
+                self.ask("This session has stayed idle since its last turn ended.");
             }
         }
         None
+    }
+
+    fn ask(&mut self, reason: &str) -> bool {
+        let at = SystemTime::now();
+        match closeout::ask(&self.launch, reason) {
+            Ok(()) => {
+                self.nudge.asked(at);
+                true
+            }
+            Err(error) => {
+                self.report(format!("could not ask the agent to close out: {error:#}"));
+                false
+            }
+        }
     }
 }
 
@@ -374,6 +394,7 @@ fn successor_arguments(args: &Args, launch: &Launch, agent: Vec<OsString>) -> Ve
     let seconds = [
         ("--poll-seconds", args.poll_seconds),
         ("--idle-seconds", args.idle_seconds),
+        ("--ask-idle-seconds", args.ask_idle_seconds),
         ("--grace-seconds", args.grace_seconds),
         ("--restart-grace-seconds", args.restart_grace_seconds),
         ("--plugin-grace-seconds", args.plugin_grace_seconds),
@@ -522,6 +543,8 @@ fn supervise(args: &Args, launch: Launch, prebound: Option<&PreboundSession>) ->
         next_poll: Instant::now() + poll,
         reported: HashSet::new(),
         asked: false,
+        ask_idle: Duration::from_secs(args.ask_idle_seconds),
+        nudge: turn::Nudge::default(),
         mark: None,
         pinned: None,
         rollout: None,
@@ -629,6 +652,7 @@ mod tests {
             session: Some("codex:123e4567-e89b-12d3-a456-426614174000".to_owned()),
             poll_seconds: 120,
             idle_seconds: 600,
+            ask_idle_seconds: 1800,
             grace_seconds: 10,
             restart_grace_seconds: 30,
             plugin_grace_seconds: 2,
