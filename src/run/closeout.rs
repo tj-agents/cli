@@ -59,13 +59,13 @@ fn queue(thread: &str, text: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn ask(launch: &Launch, item: &str) -> Result<()> {
+pub fn ask(launch: &Launch, reason: &str) -> Result<()> {
     let session = store::bound_session(&launch.id)?
         .with_context(|| format!("no {} session is bound to launch {} yet", launch.host.name(), launch.id))?;
     let text = format!(
-        "[tj run] Every PR linked to {item} has merged. If this session has nothing left to do, with no open \
-         question, child session or follow-up, run `tj done` as your final step so this tab closes and its \
-         worktree is removed. Otherwise carry on and do not run it."
+        "[tj run] {reason} If this session's work is finished, with no reply awaited from the user and no open \
+         question, child session, pending merge or follow-up, run `tj done` as your final step so this tab \
+         closes and its worktree is removed. Otherwise carry on and do not run it."
     );
     match launch.host {
         Host::Claude => bridge::post(&session, &text),
