@@ -829,6 +829,24 @@ fn a_prebound_native_codex_session_registers_and_verifies_before_spawning() {
 }
 
 #[test]
+fn a_prebound_codex_accepts_model_and_effort_before_the_literal_prompt() {
+    let sandbox = sandbox();
+    prebind(&sandbox, false);
+    let mut arguments = prebound_arguments_with_prompt(&sandbox, "lane-model", "--model=literal-prompt");
+    let delimiter = arguments.len() - 2;
+    arguments.splice(
+        delimiter..delimiter,
+        ["--model", "chosen-model", "-c", "model_reasoning_effort=xhigh"].map(str::to_owned),
+    );
+    let output = finish(spawn(&sandbox, &arguments, &sandbox.root), Duration::from_secs(30));
+    assert!(!output.status.success());
+    let store = log(&sandbox, "stubs/agent-store.log");
+    assert!(store.contains(&format!("register --session codex:{PREBOUND}")), "{store}");
+    assert!(store.contains("end --launch-id lane-model --reason exited"), "{store}");
+    assert!(!store.contains("--reason not_started"), "{store}");
+}
+
+#[test]
 fn a_delimited_option_shaped_prompt_is_registered_before_spawning() {
     let sandbox = sandbox();
     prebind(&sandbox, false);
