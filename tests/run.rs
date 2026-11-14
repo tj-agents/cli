@@ -477,15 +477,22 @@ fn an_idle_session_without_an_item_is_asked_once_per_turn_and_only_its_done_clos
     let mut child = spawn(&sandbox, &arguments, &sandbox.root);
     wait_for_log(&sandbox, if keys { "raw" } else { "agent " });
     let asks = || log(&sandbox, "stubs/codex.log").lines().filter(|line| line.starts_with("queue ")).count();
+    let take_turn = || {
+        set_turn(&sandbox, false);
+        std::thread::sleep(Duration::from_secs(3));
+        set_turn(&sandbox, true);
+    };
     set_turn(&sandbox, true);
+    // Long enough for the wrapper to find the rollout, which it looks up every 10 s until it exists.
+    still_running(&mut child, Duration::from_secs(12));
+    assert_eq!(asks(), 0, "an agent that has had no turn was asked");
+    take_turn();
     wait_for_polls(&sandbox, "stubs/codex.log", "queue --thread sess-1 --message", 1);
     assert!(log(&sandbox, "stubs/codex.log").contains("tj done"));
-    set_turn(&sandbox, false);
-    set_turn(&sandbox, true);
+    take_turn();
     still_running(&mut child, Duration::from_secs(6));
     assert_eq!(asks(), 1, "the agent's answer to the ask earned another ask");
-    set_turn(&sandbox, false);
-    set_turn(&sandbox, true);
+    take_turn();
     wait_for_polls(&sandbox, "stubs/codex.log", "queue --thread sess-1 --message", 2);
     assert!(!log(&sandbox, "dummy.log").contains("graceful"), "the agent was stopped");
     done(&sandbox);

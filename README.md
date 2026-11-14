@@ -270,10 +270,12 @@ A merged PR never stops a session: an item can be merged before its session star
 work. The first time `tj item prs` (checked every two minutes) reports every PR for the item merged, the
 wrapper asks the agent once, through its Claude relay or Codex queue, to run `tj done` if nothing is left.
 
-Work needs no item or PR to finish, so the wrapper also asks an idle agent. Once the host has stayed idle
-for about 30 minutes after a turn, with no shell running under it and no `tj done` standing, the wrapper
-asks the agent the same way. Its answer to an ask is itself a turn, so the wrapper asks again only after a
-later turn. An agent waiting on a reply from the user, a child session or a merge is not finished. Whether
+Work needs no item or PR to finish, so the wrapper also asks an idle agent. It follows the host's turns
+throughout, and once the host has stayed idle for about 30 minutes after a turn it saw, with no shell
+running under it and no `tj done` standing, it asks the agent the same way. A tab that has had no turn is
+never asked, nor is one whose wrapper restarted for an update until its next turn. The first turn that
+starts after an ask is the answer, so the wrapper asks again only after a later turn, and a failed ask waits
+for one too. An agent waiting on a reply from the user, a child session or a merge is not finished. Whether
 the work is done is the agent's call; idleness alone never closes a tab.
 
 An agent that is unsure carries on and the tab stays open. A refused check withdraws `tj done` and prints
