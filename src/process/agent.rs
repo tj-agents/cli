@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::ffi::OsString;
 use std::io;
 use std::path::Path;
@@ -83,16 +84,30 @@ pub fn started_at(pid: u32) -> io::Result<Option<SystemTime>> {
     os::started_at(pid)
 }
 
-/// The calling process and its live ancestors, nearest first, as (pid, executable file name).
+/// The calling process and its verified ancestors, nearest first, as (pid, executable file name).
+/// A reused or unobservable parent ends the chain before it can establish ownership.
 pub fn ancestry() -> io::Result<Vec<(u32, String)>> {
-    let mut table = os::processes()?;
+    Ok(ancestry_from(os::processes()?, std::process::id(), os::started_at))
+}
+
+fn ancestry_from(
+    mut table: HashMap<u32, (u32, String)>,
+    mut pid: u32,
+    mut read_started: impl FnMut(u32) -> io::Result<Option<SystemTime>>,
+) -> Vec<(u32, String)> {
     let mut chain = Vec::new();
-    let mut pid = std::process::id();
+    let mut child_started = None;
     while let Some((parent, image)) = table.remove(&pid) {
+        let Ok(Some(created)) = read_started(pid) else { break };
+        // Windows can retain an exited parent's PID after that PID has been reused.
+        if child_started.is_some_and(|child| created > child) {
+            break;
+        }
         chain.push((pid, image));
+        child_started = Some(created);
         pid = parent;
     }
-    Ok(chain)
+    chain
 }
 
 /// Executable file names of every live process below `pid`.
@@ -132,7 +147,62 @@ pub fn hidden(program: &str, hook: &Path) -> Command {
 
 #[cfg(test)]
 mod tests {
-    use super::started_at;
+    use super::{ancestry, ancestry_from, started_at};
+    use std::io;
+    use std::time::{Duration, UNIX_EPOCH};
+
+    #[test]
+    fn a_reused_parent_pid_is_not_an_ancestor() {
+        let table = [
+            (9, (5, "tj.exe".to_owned())),
+            (5, (1, "shell.exe".to_owned())),
+            (1, (0, "unrelated-wrapper.exe".to_owned())),
+        ]
+        .into_iter()
+        .collect();
+        let chain = ancestry_from(table, 9, |pid| {
+            let seconds = match pid {
+                9 => 30,
+                5 => 20,
+                1 => 40,
+                _ => return Ok(None),
+            };
+            Ok(Some(UNIX_EPOCH + Duration::from_secs(seconds)))
+        });
+        assert_eq!(chain, [(9, "tj.exe".to_owned()), (5, "shell.exe".to_owned())]);
+    }
+
+    #[test]
+    fn valid_ancestors_remain_available() {
+        let table =
+            [(9, (5, "tj.exe".to_owned())), (5, (1, "agent.exe".to_owned())), (1, (0, "wrapper.exe".to_owned()))]
+                .into_iter()
+                .collect();
+        let chain = ancestry_from(table, 9, |pid| Ok(Some(UNIX_EPOCH + Duration::from_secs(u64::from(pid)))));
+        assert_eq!(chain.iter().map(|(pid, _)| *pid).collect::<Vec<_>>(), [9, 5, 1]);
+    }
+
+    #[test]
+    fn an_unobservable_parent_cannot_supply_an_ownership_link() {
+        for denied in [false, true] {
+            let table = [(9, (5, "tj.exe".to_owned())), (5, (1, "agent.exe".to_owned()))].into_iter().collect();
+            let chain = ancestry_from(table, 9, |pid| {
+                if pid == 9 {
+                    Ok(Some(UNIX_EPOCH + Duration::from_secs(30)))
+                } else if denied {
+                    Err(io::Error::new(io::ErrorKind::PermissionDenied, "unobservable parent"))
+                } else {
+                    Ok(None)
+                }
+            });
+            assert_eq!(chain, [(9, "tj.exe".to_owned())]);
+        }
+    }
+
+    #[test]
+    fn the_current_process_starts_its_verified_ancestry() {
+        assert_eq!(ancestry().unwrap().first().map(|(pid, _)| *pid), Some(std::process::id()));
+    }
 
     #[test]
     fn current_process_identity_is_stable() {
