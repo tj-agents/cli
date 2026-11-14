@@ -104,11 +104,66 @@ pub(crate) fn judge(
     if background == 0 && quiet >= idle { Done::Due } else { Done::Waiting }
 }
 
+/// When to ask an idle agent whether its work is finished. The wrapper follows the host's turns on every tick and
+/// asks only after it has seen one: Claude records itself idle at startup, and a restarted wrapper finds the turn
+/// its predecessor already asked about. Each idle stretch is asked about at most once. The agent's answer is the
+/// first turn that starts after the ask, so only a later turn earns another ask.
+#[derive(Debug, Default)]
+pub(crate) struct Nudge {
+    turned: bool,
+    ask: Ask,
+    spent: Option<SystemTime>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum Ask {
+    /// Nothing is asked, or the last ask has been answered.
+    #[default]
+    Ready,
+    /// Asked at this time; no turn has started since.
+    Sent(SystemTime),
+    /// A turn started after the ask, and its end is the answer.
+    Answering,
+}
+
+impl Nudge {
+    pub(crate) fn observe(&mut self, turn: Option<Turn>) {
+        let Some(turn) = turn else { return };
+        if !turn.idle {
+            self.turned = true;
+            if let Ask::Sent(at) = self.ask
+                && turn.changed > at
+            {
+                self.ask = Ask::Answering;
+            }
+        } else if self.ask == Ask::Answering {
+            self.ask = Ask::Ready;
+            self.spent = Some(turn.changed);
+        }
+    }
+
+    /// The idle turn to ask about, once the agent has stayed idle for the wait after a turn this wrapper saw.
+    pub(crate) fn due(&self, now: SystemTime, turn: Option<Turn>, wait: Duration) -> Option<Turn> {
+        let turn = turn.filter(|turn| turn.idle)?;
+        let quiet = now.duration_since(turn.changed).unwrap_or_default();
+        (self.turned && self.ask == Ask::Ready && self.spent != Some(turn.changed) && quiet >= wait).then_some(turn)
+    }
+
+    /// Spends an idle stretch before asking about it, so a failed ask waits for a later turn rather than repeating.
+    pub(crate) fn spend(&mut self, turn: Turn) {
+        self.spent = Some(turn.changed);
+    }
+
+    pub(crate) fn asked(&mut self, at: SystemTime) {
+        self.ask = Ask::Sent(at);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-    use super::{Done, Turn, judge, record, task};
+    use super::{Done, Nudge, Turn, judge, record, task};
 
     const IDLE: Duration = Duration::from_secs(600);
 
@@ -167,6 +222,60 @@ mod tests {
         assert_eq!(judge(at(100), at(9000), None, &mut pinned, 0, IDLE), Done::Waiting);
         assert_eq!(judge(at(100), at(9000), turn(true, 120), &mut pinned, 1, IDLE), Done::Waiting);
         assert_eq!(judge(at(100), at(9000), turn(true, 120), &mut pinned, 0, IDLE), Done::Due);
+    }
+
+    #[test]
+    fn an_agent_is_never_asked_before_a_turn_the_wrapper_saw() {
+        let mut nudge = Nudge::default();
+        nudge.observe(turn(true, 50));
+        assert_eq!(nudge.due(at(9000), turn(true, 50), IDLE), None);
+        nudge.observe(turn(false, 100));
+        assert_eq!(nudge.due(at(9000), turn(false, 100), IDLE), None);
+        nudge.observe(turn(true, 120));
+        assert_eq!(nudge.due(at(719), turn(true, 120), IDLE), None);
+        assert_eq!(nudge.due(at(720), turn(true, 120), IDLE), turn(true, 120));
+        assert_eq!(nudge.due(at(9000), None, IDLE), None);
+    }
+
+    #[test]
+    fn the_answer_to_an_ask_is_spent_and_only_a_later_turn_is_asked_about() {
+        let mut nudge = Nudge::default();
+        nudge.observe(turn(false, 10));
+        nudge.observe(turn(true, 20));
+        let idle = nudge.due(at(620), turn(true, 20), IDLE).unwrap();
+        nudge.spend(idle);
+        nudge.asked(at(620));
+        assert_eq!(nudge.due(at(9000), turn(true, 20), IDLE), None);
+        nudge.observe(turn(false, 630));
+        nudge.observe(turn(true, 640));
+        assert_eq!(nudge.due(at(9000), turn(true, 640), IDLE), None);
+        nudge.observe(turn(false, 9000));
+        nudge.observe(turn(true, 9010));
+        assert_eq!(nudge.due(at(9610), turn(true, 9010), IDLE), turn(true, 9010));
+    }
+
+    #[test]
+    fn a_turn_already_running_when_asked_is_not_the_answer() {
+        let mut nudge = Nudge::default();
+        nudge.observe(turn(false, 10));
+        nudge.asked(at(100));
+        nudge.observe(turn(true, 150));
+        assert_eq!(nudge.due(at(9000), turn(true, 150), IDLE), None);
+        nudge.observe(turn(false, 160));
+        nudge.observe(turn(true, 200));
+        assert_eq!(nudge.due(at(9000), turn(true, 200), IDLE), None);
+        nudge.observe(turn(false, 9000));
+        nudge.observe(turn(true, 9010));
+        assert_eq!(nudge.due(at(9610), turn(true, 9010), IDLE), turn(true, 9010));
+    }
+
+    #[test]
+    fn a_spent_stretch_is_not_asked_about_again_even_when_the_ask_failed() {
+        let mut nudge = Nudge::default();
+        nudge.observe(turn(false, 10));
+        nudge.observe(turn(true, 20));
+        nudge.spend(nudge.due(at(620), turn(true, 20), IDLE).unwrap());
+        assert_eq!(nudge.due(at(9000), turn(true, 20), IDLE), None);
     }
 
     #[test]
