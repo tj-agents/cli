@@ -8,7 +8,7 @@ use crate::host::Host;
 use crate::paths;
 
 pub(crate) const MARKETPLACE: &str = "https://api.github.com/repos/tj-agents/marketplace/commits/main";
-const CHECKED_FOR: Duration = Duration::from_secs(60);
+const CHECKED_FOR: Duration = Duration::from_secs(120);
 const LOCK_STALE: Duration = Duration::from_secs(30);
 const RETRY_AFTER: Duration = Duration::from_secs(600);
 const TIMEOUT: Duration = Duration::from_secs(1);

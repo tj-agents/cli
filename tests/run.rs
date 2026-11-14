@@ -710,9 +710,9 @@ fn an_agent_that_exits_after_done_closes_out_without_waiting() {
     std::thread::sleep(Duration::from_millis(50));
     assert_eq!(in_agent(&sandbox, &["done"]).0, 0);
     let pid = log(&sandbox, "dummy.log").lines().rev().find_map(|line| line.strip_prefix("pid ")).unwrap().to_owned();
-    let mut kill = if cfg!(windows) { Command::new("taskkill") } else { Command::new("kill") };
+    let mut kill = if cfg!(windows) { Command::new("powershell.exe") } else { Command::new("kill") };
     if cfg!(windows) {
-        kill.args(["/PID", pid.as_str(), "/F"]);
+        kill.args(["-NoProfile", "-NonInteractive", "-Command", "Stop-Process", "-Id", &pid, "-Force"]);
     } else {
         kill.arg(&pid);
     }
@@ -1153,11 +1153,19 @@ fn a_codex_update_is_applied_through_its_app_server() {
     wait_until("the Codex app-server was never asked to take the update", || {
         std::fs::read_to_string(&codex).unwrap_or_default().contains(r#""reloadUserConfig": true"#)
     });
+    wait_until("the Codex WebSocket peer never completed both fragmented replies", || {
+        std::fs::read_to_string(&codex).unwrap_or_default().matches(r#""websocket": "masked-pong""#).count() == 2
+    });
+    let wire = std::fs::read_to_string(&codex).unwrap();
+    assert!(wire.contains(r#""websocket": "upgrade""#), "no HTTP upgrade: {wire}");
+    assert!(wire.contains(r#""proxy": "initialized""#), "initialization was not completed: {wire}");
+    assert_eq!(wire.matches(r#""websocket": "masked-text""#).count(), 3, "{wire}");
     let agent = log(&sandbox, "dummy.log");
     assert_eq!(agent.matches("agent codex-reload Test tab").count(), 1, "the agent restarted: {agent}");
     set_reply(&sandbox, "agent-store-show.json", CLOSING);
     let output = finish(child, Duration::from_secs(60));
     assert_closed_out(&sandbox, &output, "codex-reload");
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("could not update codex"), "{output:?}");
 }
 
 #[test]
@@ -1488,7 +1496,7 @@ fn select_tj_agents(sandbox: &Sandbox) {
     std::fs::write(folder.join("plugins.json"), r#"{"plugins":["agent@tj-agents"]}"#).unwrap();
 }
 
-/// Selects tj-agents with this minute's update check already done, so the launch makes no request.
+/// Selects tj-agents with a recent update check, so the launch makes no request.
 fn select_tj_agents_checked(sandbox: &Sandbox) {
     select_tj_agents(sandbox);
     std::fs::create_dir_all(update_state(sandbox, "")).unwrap();
@@ -1513,7 +1521,7 @@ fn update_state(sandbox: &Sandbox, file: &str) -> PathBuf {
 }
 
 #[test]
-fn an_unchanged_marketplace_costs_one_conditional_request_a_minute_and_installs_nothing() {
+fn an_unchanged_marketplace_makes_one_conditional_request_and_installs_nothing() {
     let sandbox = sandbox();
     select_tj_agents(&sandbox);
     publish(&sandbox, "claude", MARKETPLACE_SHA);
@@ -1529,7 +1537,7 @@ fn an_unchanged_marketplace_costs_one_conditional_request_a_minute_and_installs_
     assert!(requests[0].contains(&format!("if-none-match: \"{MARKETPLACE_SHA}\"")), "{}", requests[0]);
     assert!(requests[0].contains("accept: application/vnd.github.sha"), "{}", requests[0]);
     launch_checking(&sandbox, &upstream, "again");
-    assert_eq!(upstream.requests().len(), 1, "checked again within a minute");
+    assert_eq!(upstream.requests().len(), 1, "checked again within the shared interval");
     assert_eq!(log(&sandbox, "stubs/tj-plugins.log"), "");
 }
 
@@ -1548,6 +1556,28 @@ fn a_changed_marketplace_installs_in_the_background_once_per_commit() {
     launch_checking(&sandbox, &upstream, "retry");
     assert_eq!(upstream.requests().len(), 2);
     assert_eq!(log(&sandbox, "stubs/tj-plugins.log").lines().count(), 1, "installed the same commit twice");
+}
+
+#[test]
+fn a_running_tab_checks_again_and_starts_an_update() {
+    let sandbox = sandbox();
+    select_tj_agents_checked(&sandbox);
+    stub(&sandbox.stubs, "tj-plugins", "updated");
+    let upstream = Upstream::changed();
+    let mut arguments = run_arguments(&sandbox, "periodic", "claude", "signal", "10");
+    let separator = arguments.iter().position(|argument| argument == "--").unwrap();
+    arguments.splice(separator..separator, ["--update-url".to_owned(), upstream.url.clone()]);
+    let mut child = spawn(&sandbox, &arguments, &sandbox.root);
+    wait_for_log(&sandbox, "agent periodic");
+    assert!(upstream.requests().is_empty(), "launch ignored the recent shared check");
+    std::fs::remove_file(update_state(&sandbox, "claude.checked")).unwrap();
+    wait_until("running tab never started the update", || {
+        log(&sandbox, "stubs/tj-plugins.log").contains("update --host claude")
+    });
+    assert_eq!(upstream.requests().len(), 1);
+    assert!(child.try_wait().unwrap().is_none(), "the agent exited during the update check");
+    child.kill().unwrap();
+    let _ = child.wait();
 }
 
 #[test]

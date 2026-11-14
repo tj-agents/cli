@@ -219,33 +219,13 @@ repository's selected plugins and its standards index before the host reads nati
 preparation or a preparation failure prints a warning and the session still starts. Install Agent to provide
 `tj-prepare`.
 
-Such a launch also checks, once and alongside `tj-prepare`, whether `tj-agents/marketplace` moved past the
-commit this host last converged to: one conditional `GET` of its `main` commit with `If-None-Match` set to the
-first line of `<cache>/published/<host>`, with a 1 s timeout. At most one launch per host checks a minute
-(`<cache>/update/<host>.lock` and `<host>.checked`), within GitHub's 60 unauthenticated requests an hour. A
-`304` costs nothing more. A `200` starts `tj-plugins update --host H` in the background, logging to
-`<cache>/update/<host>.log`, and the launch goes on; it publishes when done, and the update reaches open tabs
-as below. One commit is installed at most once every 10 minutes, so a failed install, which publishes nothing,
-is retried by a later launch. Any other answer or no answer prints one line and the launch goes on.
+The [plugin update flow](docs/plugin-updates.md) describes marketplace checks, installation and reloads in
+running tabs, including the host-specific acceptance checks.
 
 Only the tab's own agent speaks for it. `tj done` acts only when
 the caller descends from the wrapper through its agent, with no second copy of that agent in between; a tab,
 shell or agent started from inside the session inherits `TJ_RUN_*` but is ignored. `tj launch` prints the
 launch the caller belongs to, for Agent's `SessionStart` binding.
-
-Running tabs apply updates by themselves. Agent's `tj install` ends with a hidden
-`tj update --host H --revision <marketplace commit>`, which replaces `<cache>/published/<host>`; every wrapper of that host checks
-it and its own executable on each half-second poll and applies each publish once, in place:
-
-- Claude: once Claude's own record for the agent process, `<claude home>/sessions/<pid>.json`, has said
-  `idle` for 2 s and the keyboard and mouse have been idle 2 s (Windows; Linux has only Claude's status), the
-  wrapper types `/reload-plugins` and Enter into the shared console (`WriteConsoleInputW`, or `tmux
-  send-keys`). Claude reports a running turn, tool or `!` command as busy, so none is typed into. Claude has no
-  other way to load plugins into a running interactive session. Text typed but not sent is invisible to the wrapper; the
-  command is appended to it.
-- Codex: the wrapper asks the shared app-server for `config/batchWrite` with `reloadUserConfig`, which loads
-  plugins, skills, hooks and `config.toml` into every loaded thread. The TUI's own `$` and `@` completion
-  lists stay as they were until it restarts.
 
 An updated `tj` executable restarts the agent once the new file has settled and runs, Claude has been idle
 30 s with no shell running under it (a background task), and input has been idle 30 s. The wrapper stops the agent the way closeout does
