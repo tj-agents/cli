@@ -554,6 +554,9 @@ fn supervise(args: &Args, launch: Launch, prebound: Option<&PreboundSession>) ->
         next_lookup: Instant::now(),
     };
     let resumed = args.successor;
+    // The shared timestamp limits requests even when tabs start at different times.
+    let mut next_upstream = Instant::now() + poll;
+    let mut upstream = None;
     let removal = loop {
         if let Some(code) = agent.try_wait()? {
             agent.kill_tree(Duration::from_secs(30))?;
@@ -589,6 +592,17 @@ fn supervise(args: &Args, launch: Launch, prebound: Option<&PreboundSession>) ->
                     }
                 }
             }
+        }
+        if upstream.as_ref().is_some_and(std::thread::JoinHandle::is_finished) {
+            match upstream.take().map(std::thread::JoinHandle::join) {
+                Some(Ok(Ok(Some(line)))) => eprintln!("tj run: {line}"),
+                Some(Ok(Err(error))) => watch.report(format!("could not check for tj-agents updates: {error}")),
+                _ => {}
+            }
+        }
+        if selected && upstream.is_none() && Instant::now() >= next_upstream {
+            next_upstream = Instant::now() + poll;
+            upstream = update::upstream::start(watch.launch.host, &watch.launch.cwd, args.update_url.clone());
         }
         let host = update::host(watch.launch.host);
         let due = if watch.marked().is_some() { None } else { update::due(&mut watcher, host, agent.pid(), graces) };
