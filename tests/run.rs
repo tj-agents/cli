@@ -468,6 +468,36 @@ fn a_merge_mid_session_asks_the_agent_once_and_only_its_done_closes_out() {
 }
 
 #[test]
+fn an_idle_session_without_an_item_is_asked_once_per_turn_and_only_its_done_closes_out() {
+    let sandbox = sandbox();
+    let keys = cfg!(windows);
+    let mut arguments = run_arguments(&sandbox, "idle-ask", "codex", if keys { "keys" } else { "signal" }, "10");
+    let item = arguments.iter().position(|argument| argument == "--item").unwrap();
+    arguments.splice(item..item + 2, ["--ask-idle-seconds", "2"].map(str::to_owned));
+    let mut child = spawn(&sandbox, &arguments, &sandbox.root);
+    wait_for_log(&sandbox, if keys { "raw" } else { "agent " });
+    let asks = || log(&sandbox, "stubs/codex.log").lines().filter(|line| line.starts_with("queue ")).count();
+    set_turn(&sandbox, true);
+    wait_for_polls(&sandbox, "stubs/codex.log", "queue --thread sess-1 --message", 1);
+    assert!(log(&sandbox, "stubs/codex.log").contains("tj done"));
+    set_turn(&sandbox, false);
+    set_turn(&sandbox, true);
+    still_running(&mut child, Duration::from_secs(6));
+    assert_eq!(asks(), 1, "the agent's answer to the ask earned another ask");
+    set_turn(&sandbox, false);
+    set_turn(&sandbox, true);
+    wait_for_polls(&sandbox, "stubs/codex.log", "queue --thread sess-1 --message", 2);
+    assert!(!log(&sandbox, "dummy.log").contains("graceful"), "the agent was stopped");
+    done(&sandbox);
+    let output = finish(child, Duration::from_secs(60));
+    assert_eq!(output.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&output.stderr));
+    assert!(!sandbox.worktree.exists(), "the worktree is still there");
+    assert!(log(&sandbox, "stubs/agent-store.log").contains("end --launch-id idle-ask --reason closed"));
+    assert!(log(&sandbox, "stubs/tj-item.log").is_empty(), "a launch without an item queried the tracker");
+    assert_eq!(asks(), 2);
+}
+
+#[test]
 fn closes_out_the_worktree_bound_after_launch() {
     for host in ["claude", "codex"] {
         let sandbox = sandbox();

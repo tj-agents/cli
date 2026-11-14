@@ -104,11 +104,39 @@ pub(crate) fn judge(
     if background == 0 && quiet >= idle { Done::Due } else { Done::Waiting }
 }
 
+/// When to ask an idle agent whether its work is finished: once it has stayed idle for the wait with no shell
+/// running under it, at most once per turn. The agent's answer to an ask is itself a turn, so the idle record
+/// that follows an ask is spent and only a later turn earns another ask.
+#[derive(Debug, Default)]
+pub(crate) struct Nudge {
+    asked: Option<SystemTime>,
+    spent: Option<SystemTime>,
+}
+
+impl Nudge {
+    pub(crate) fn asked(&mut self, at: SystemTime) {
+        self.asked = Some(at);
+    }
+
+    pub(crate) fn due(&mut self, now: SystemTime, turn: Option<Turn>, background: u32, wait: Duration) -> bool {
+        let Some(turn) = turn.filter(|turn| turn.idle) else { return false };
+        if let Some(asked) = self.asked {
+            if turn.changed <= asked {
+                return false;
+            }
+            self.asked = None;
+            self.spent = Some(turn.changed);
+        }
+        let quiet = now.duration_since(turn.changed).unwrap_or_default();
+        self.spent != Some(turn.changed) && background == 0 && quiet >= wait
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-    use super::{Done, Turn, judge, record, task};
+    use super::{Done, Nudge, Turn, judge, record, task};
 
     const IDLE: Duration = Duration::from_secs(600);
 
@@ -167,6 +195,29 @@ mod tests {
         assert_eq!(judge(at(100), at(9000), None, &mut pinned, 0, IDLE), Done::Waiting);
         assert_eq!(judge(at(100), at(9000), turn(true, 120), &mut pinned, 1, IDLE), Done::Waiting);
         assert_eq!(judge(at(100), at(9000), turn(true, 120), &mut pinned, 0, IDLE), Done::Due);
+    }
+
+    #[test]
+    fn an_idle_agent_is_asked_once_and_again_only_after_a_later_turn() {
+        let mut nudge = Nudge::default();
+        assert!(!nudge.due(at(100), turn(true, 50), 0, IDLE));
+        assert!(nudge.due(at(650), turn(true, 50), 0, IDLE));
+        nudge.asked(at(650));
+        assert!(!nudge.due(at(9000), turn(true, 50), 0, IDLE));
+        assert!(!nudge.due(at(9000), turn(false, 660), 0, IDLE));
+        assert!(!nudge.due(at(9000), turn(true, 700), 0, IDLE));
+        assert!(!nudge.due(at(9900), turn(true, 700), 0, IDLE));
+        assert!(!nudge.due(at(9100), turn(true, 9000), 0, IDLE));
+        assert!(nudge.due(at(9600), turn(true, 9000), 0, IDLE));
+    }
+
+    #[test]
+    fn a_busy_agent_a_background_shell_or_an_unreadable_host_is_never_asked() {
+        let mut nudge = Nudge::default();
+        assert!(!nudge.due(at(9000), turn(false, 50), 0, IDLE));
+        assert!(!nudge.due(at(9000), turn(true, 50), 1, IDLE));
+        assert!(!nudge.due(at(9000), None, 0, IDLE));
+        assert!(nudge.due(at(9000), turn(true, 50), 0, IDLE));
     }
 
     #[test]
