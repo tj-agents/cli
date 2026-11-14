@@ -259,7 +259,7 @@ struct Watch {
     idle: Duration,
     next_poll: Instant,
     reported: HashSet<String>,
-    asked: bool,
+    merge_asked: bool,
     ask_idle: Duration,
     nudge: turn::Nudge,
     mark: Option<SystemTime>,
@@ -280,28 +280,28 @@ impl Watch {
         self.marks.join("done").metadata().and_then(|meta| meta.modified()).ok()
     }
 
-    fn turn(&mut self, agent: u32) -> (Option<turn::Turn>, u32) {
+    fn turn(&mut self, agent: u32) -> Option<turn::Turn> {
         match self.launch.host {
-            Host::Claude => (turn::claude(agent), turn::shells(agent)),
+            Host::Claude => turn::claude(agent),
             Host::Codex => {
                 if self.rollout.is_none() && Instant::now() >= self.next_lookup {
-                    self.next_lookup = Instant::now() + Duration::from_secs(10);
+                    self.next_lookup = Instant::now() + self.poll.max(Duration::from_secs(10));
                     self.rollout =
                         store::bound_session(&self.launch.id).ok().flatten().and_then(|thread| turn::rollout(&thread));
                 }
-                (self.rollout.as_deref().and_then(turn::codex), turn::shells(agent))
+                self.rollout.as_deref().and_then(turn::codex)
             }
         }
     }
 
-    fn done(&mut self, agent: u32) -> bool {
+    fn done(&mut self, agent: u32, turn: Option<turn::Turn>) -> bool {
         let marked = self.marked();
         if marked != self.mark {
             self.mark = marked;
             self.pinned = None;
         }
         let Some(marked) = marked else { return false };
-        let (turn, background) = self.turn(agent);
+        let background = turn::shells(agent);
         match turn::judge(marked, SystemTime::now(), turn, &mut self.pinned, background, self.idle) {
             turn::Done::Due => true,
             turn::Done::Waiting => false,
@@ -330,7 +330,9 @@ impl Watch {
     }
 
     fn trigger(&mut self, agent: u32) -> Option<Trigger> {
-        if self.done(agent) {
+        let turn = self.turn(agent);
+        self.nudge.observe(turn);
+        if self.done(agent, turn) {
             return Some(Trigger::Done);
         }
         if Instant::now() < self.next_poll {
@@ -340,14 +342,15 @@ impl Watch {
         if self.closing() {
             return Some(Trigger::Closing);
         }
-        if !self.asked && self.delivered() {
+        if !self.merge_asked && self.delivered() {
             let item = self.launch.item.clone().unwrap_or_default();
-            self.asked = self.ask(&format!("Every PR linked to {item} has merged."));
-        } else if self.marked().is_none() {
-            let (turn, background) = self.turn(agent);
-            if self.nudge.due(SystemTime::now(), turn, background, self.ask_idle) {
-                self.ask("This session has stayed idle since its last turn ended.");
-            }
+            self.merge_asked = self.ask(&format!("Every PR linked to {item} has merged."));
+        } else if self.marked().is_none()
+            && let Some(idle) = self.nudge.due(SystemTime::now(), turn, self.ask_idle)
+            && turn::shells(agent) == 0
+        {
+            self.nudge.spend(idle);
+            self.ask("This session has stayed idle since its last turn ended.");
         }
         None
     }
@@ -542,7 +545,7 @@ fn supervise(args: &Args, launch: Launch, prebound: Option<&PreboundSession>) ->
         idle: Duration::from_secs(args.idle_seconds),
         next_poll: Instant::now() + poll,
         reported: HashSet::new(),
-        asked: false,
+        merge_asked: false,
         ask_idle: Duration::from_secs(args.ask_idle_seconds),
         nudge: turn::Nudge::default(),
         mark: None,
