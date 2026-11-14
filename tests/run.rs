@@ -836,7 +836,7 @@ fn a_prebound_codex_accepts_model_and_effort_before_the_literal_prompt() {
     let delimiter = arguments.len() - 2;
     arguments.splice(
         delimiter..delimiter,
-        ["--model", "chosen-model", "-c", "model_reasoning_effort=xhigh"].map(str::to_owned),
+        ["--model", "chosen-model", "-c", "model_reasoning_effort=xhigh", "--remote", "unix://"].map(str::to_owned),
     );
     let output = finish(spawn(&sandbox, &arguments, &sandbox.root), Duration::from_secs(30));
     assert!(!output.status.success());
