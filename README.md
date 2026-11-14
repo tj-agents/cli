@@ -315,7 +315,9 @@ text to that relay, which posts it to `CLAUDE_CODE_MESSAGING_SOCKET` with an aut
 `bypassPermissions` mode. The text opens with who sent it and the `tj message` command to reply. A Claude
 session without a relay is an error; nothing is stored for it. `tj run`'s close-out notice uses the same relay.
 
-A Codex target has no native messaging, so the message goes to its feed, `<cache>/feed/codex-<id>.jsonl`: one
+A Codex target's native queue (`codex queue`) does not yet deliver reliably: an interrupted thread can hold a
+queued message indefinitely, and an embedded thread is out of the shared daemon's reach. So the message goes to
+its feed, `<cache>/feed/codex-<id>.jsonl`: one
 JSON message per line appended in a single write, with `codex-<id>.read` holding the byte offset already shown.
 On Unix the folder and feeds are readable only by you. A line that is not JSON, such as one torn by a killed
 sender, is reported and passed over. The Codex session reads it with `tj feed`; a Codex parent waiting on a child
