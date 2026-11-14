@@ -111,9 +111,19 @@ pub(crate) fn judge(
 #[derive(Debug, Default)]
 pub(crate) struct Nudge {
     turned: bool,
-    asked: Option<SystemTime>,
-    answering: bool,
+    ask: Ask,
     spent: Option<SystemTime>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum Ask {
+    /// Nothing is asked, or the last ask has been answered.
+    #[default]
+    Ready,
+    /// Asked at this time; no turn has started since.
+    Sent(SystemTime),
+    /// A turn started after the ask, and its end is the answer.
+    Answering,
 }
 
 impl Nudge {
@@ -121,10 +131,13 @@ impl Nudge {
         let Some(turn) = turn else { return };
         if !turn.idle {
             self.turned = true;
-            self.answering |= self.asked.is_some_and(|asked| turn.changed > asked);
-        } else if self.answering {
-            self.answering = false;
-            self.asked = None;
+            if let Ask::Sent(at) = self.ask
+                && turn.changed > at
+            {
+                self.ask = Ask::Answering;
+            }
+        } else if self.ask == Ask::Answering {
+            self.ask = Ask::Ready;
             self.spent = Some(turn.changed);
         }
     }
@@ -133,7 +146,7 @@ impl Nudge {
     pub(crate) fn due(&self, now: SystemTime, turn: Option<Turn>, wait: Duration) -> Option<Turn> {
         let turn = turn.filter(|turn| turn.idle)?;
         let quiet = now.duration_since(turn.changed).unwrap_or_default();
-        (self.turned && self.asked.is_none() && self.spent != Some(turn.changed) && quiet >= wait).then_some(turn)
+        (self.turned && self.ask == Ask::Ready && self.spent != Some(turn.changed) && quiet >= wait).then_some(turn)
     }
 
     /// Spends an idle stretch before asking about it, so a failed ask waits for a later turn rather than repeating.
@@ -142,8 +155,7 @@ impl Nudge {
     }
 
     pub(crate) fn asked(&mut self, at: SystemTime) {
-        self.asked = Some(at);
-        self.answering = false;
+        self.ask = Ask::Sent(at);
     }
 }
 
