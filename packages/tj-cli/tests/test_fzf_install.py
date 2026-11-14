@@ -1,6 +1,5 @@
 import hashlib
 import io
-import platform
 import subprocess
 import tarfile
 import urllib.request
@@ -9,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from tj_cli import fzf_install, tool_receipts
+from tj_cli import fzf_install, host_os, tool_receipts
 
 
 @pytest.mark.parametrize("system", ["Windows", "Linux"])
@@ -20,8 +19,8 @@ def test_verified_install_is_idempotent_and_repairs_drift(
     system: str,
     machine: str,
 ) -> None:
-    monkeypatch.setattr(platform, "system", lambda: system)
-    monkeypatch.setattr(platform, "machine", lambda: machine)
+    monkeypatch.setattr(host_os, "system", lambda: system)
+    monkeypatch.setattr(host_os, "machine", lambda: machine)
     monkeypatch.setattr(
         subprocess, "run", lambda *a, **kw: pytest.fail("must not run binaries")
     )
@@ -77,8 +76,8 @@ def test_bad_download_leaves_previous_installation_untouched(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(platform, "system", lambda: "Linux")
-    monkeypatch.setattr(platform, "machine", lambda: "x86_64")
+    monkeypatch.setattr(host_os, "system", lambda: "Linux")
+    monkeypatch.setattr(host_os, "machine", lambda: "x86_64")
     target = tmp_path / "fzf"
     target.write_bytes(b"previous")
     monkeypatch.setattr(
@@ -93,8 +92,8 @@ def test_unsupported_platform_does_not_download(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(platform, "system", lambda: "Linux")
-    monkeypatch.setattr(platform, "machine", lambda: "mips")
+    monkeypatch.setattr(host_os, "system", lambda: "Linux")
+    monkeypatch.setattr(host_os, "machine", lambda: "mips")
     monkeypatch.setattr(
         urllib.request, "urlopen", lambda *a, **kw: pytest.fail("unsupported")
     )
@@ -104,7 +103,7 @@ def test_unsupported_platform_does_not_download(
 def test_explicit_directory_does_not_need_windows_default_environment(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(platform, "system", lambda: "Windows")
+    monkeypatch.setattr(host_os, "system", lambda: "Windows")
     for variable in ("LOCALAPPDATA", "TJ_BIN_DIR", "CI"):
         monkeypatch.delenv(variable, raising=False)
     assert fzf_install.main(["--bin-dir", str(tmp_path), "--check"]) == 1
