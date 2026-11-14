@@ -177,8 +177,11 @@ def proxy(source: BinaryIO, target: BinaryIO, log: Path, scenario: str) -> None:
         if scenario == "silent-initialize" or method == "test/timeout":
             source.read()
             return
-        if method in {"test/close", "test/close-hold"}:
+        if method in {"test/close", "test/close-delayed", "test/close-hold"}:
             write(target, frame(Opcode.CLOSE, b"\x03\xe8"))
+            if method == "test/close-delayed":
+                # Reproduce a peer scheduled after the client has flushed its reply.
+                threading.Event().wait(0.2)
             closed = receive(source)
             if closed != Frame(Opcode.CLOSE, b"\x03\xe8"):
                 raise ValueError("the client did not complete the close handshake")

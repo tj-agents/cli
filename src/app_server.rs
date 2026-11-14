@@ -260,14 +260,22 @@ async fn proxy(
         _ = &mut stopping => Ok(()),
         result = result => result,
     };
+    let peer_closed = matches!(&outcome, Err(Error::Closed));
+    #[cfg(unix)]
+    let proxy_group = child.id();
     // Notify a waiting request before process cleanup, including when the peer sent Close.
     if let Err(error) = outcome {
         let _ = incoming.send(Err(error));
     }
+    if peer_closed {
+        // Let the peer consume the flushed Close reply before terminating its proxy.
+        // A peer that keeps its pipes open still has a bounded cleanup deadline.
+        let _ = timeout(Duration::from_secs(1), child.wait()).await;
+    }
     // The Windows helper owns a job; Unix launches in a dedicated process group.
     // Terminate descendants before waiting for Tokio's pipe readers to finish.
     #[cfg(unix)]
-    if let Some(pid) = child.id() {
+    if let Some(pid) = proxy_group {
         terminate_group(pid);
     }
     let _ = child.start_kill();
@@ -388,7 +396,7 @@ mod tests {
 
     #[test]
     fn close_eof_and_invalid_json_reach_the_waiting_request() {
-        for method in ["test/close", "test/abrupt", "test/malformed"] {
+        for method in ["test/close", "test/close-delayed", "test/abrupt", "test/malformed"] {
             let directory = tempfile::tempdir().unwrap();
             let log = directory.path().join("proxy.jsonl");
             let mut server = connect(&log);
@@ -399,7 +407,7 @@ mod tests {
             );
             drop(server);
             assert_proxy_stopped(&log);
-            if method == "test/close" {
+            if matches!(method, "test/close" | "test/close-delayed") {
                 assert!(std::fs::read_to_string(&log).unwrap().contains("close-acknowledged"));
             }
         }
