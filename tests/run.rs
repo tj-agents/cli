@@ -1084,7 +1084,7 @@ fn only_the_tabs_own_agent_can_mark_it_done() {
     };
     let mark = sandbox.root.join("cache").join("run").join("owned").join("done");
     let refused = foreign(&["done"]);
-    assert!(!refused.status.success());
+    assert!(!refused.status.success(), "an unrelated process was accepted as the tab's agent: {refused:?}");
     assert!(String::from_utf8_lossy(&refused.stderr).contains("inherited another tab"));
     assert!(!mark.exists(), "a process outside the tab marked it done");
     assert!(foreign(&["launch"]).stdout.is_empty());
