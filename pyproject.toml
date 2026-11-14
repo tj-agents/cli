@@ -184,16 +184,6 @@ rule = "PY016"
 reason = "Executable fixture reads process state to emulate an external command."
 
 [[tool.python-standards.exceptions]]
-path = "tests/fixtures/fake_codex.py"
-rule = "PY009"
-reason = "Executable fixture performs import-time process reads to emulate an external command."
-
-[[tool.python-standards.exceptions]]
-path = "tests/fixtures/fake_codex.py"
-rule = "PY016"
-reason = "Executable fixture reads process state to emulate an external command."
-
-[[tool.python-standards.exceptions]]
 path = "tests/fixtures/fake_inbox.py"
 rule = "PY016"
 reason = "Executable fixture reads process state to emulate an external command."
