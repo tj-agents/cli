@@ -229,13 +229,30 @@ fn prebound_session(args: &Args, launch: &Launch) -> Result<Option<PreboundSessi
         OsStr::new("resume"),
         OsStr::new(native_id),
     ];
-    let prompt_is_delimited = match args.agent.get(expected.len()..) {
-        Some([]) => true,
-        Some([delimiter, _]) => delimiter == OsStr::new("--"),
+    let mut remaining = args.agent.get(expected.len()..).unwrap_or_default();
+    if let [option, model, rest @ ..] = remaining {
+        if option == "--model" && !model.is_empty() && !model.to_string_lossy().starts_with('-') {
+            remaining = rest;
+        }
+    }
+    if let [option, effort, rest @ ..] = remaining {
+        if option == "-c"
+            && effort.to_str().is_some_and(|value| {
+                value.strip_prefix("model_reasoning_effort=").is_some_and(|value| !value.is_empty())
+            })
+        {
+            remaining = rest;
+        }
+    }
+    let prompt_is_delimited = match remaining {
+        [] => true,
+        [delimiter, _] => delimiter == OsStr::new("--"),
         _ => false,
     };
     if !prompt_is_delimited || args.agent.iter().take(expected.len()).map(OsString::as_os_str).ne(expected) {
-        bail!("--session requires `codex --cd <cwd> resume <UUID> [-- <prompt>]`");
+        bail!(
+            "--session requires `codex --cd <cwd> resume <UUID> [--model <model>] [-c model_reasoning_effort=<effort>] [-- <prompt>]`"
+        );
     }
     Ok(Some(PreboundSession { handle: handle.clone() }))
 }
@@ -710,6 +727,45 @@ mod tests {
             OsString::from("Prompt"),
         ]);
         assert_eq!(prebound_session(&with_prompt, &launch).unwrap().unwrap().handle, with_prompt.session.unwrap());
+    }
+
+    #[test]
+    fn prebound_session_carries_only_model_and_reasoning_overrides() {
+        let launch = launch();
+        for overrides in [
+            vec!["--model", "chosen"],
+            vec!["-c", "model_reasoning_effort=xhigh"],
+            vec!["--model", "chosen", "-c", "model_reasoning_effort=high"],
+        ] {
+            let mut agent = vec![
+                executable(),
+                "--cd".into(),
+                launch.cwd.clone().into_os_string(),
+                "resume".into(),
+                "123e4567-e89b-12d3-a456-426614174000".into(),
+            ];
+            agent.extend(overrides.into_iter().map(OsString::from));
+            agent.extend(["--".into(), "--model=literal-prompt".into()]);
+            assert!(prebound_session(&prebound_args(agent), &launch).is_ok());
+        }
+        for overrides in [
+            vec!["--model", ""],
+            vec!["--model", "--last"],
+            vec!["-c", "model_reasoning_effort="],
+            vec!["-c", "approval_policy=never"],
+            vec!["--last"],
+            vec!["--model", "chosen", "--model", "other"],
+        ] {
+            let mut agent = vec![
+                executable(),
+                "--cd".into(),
+                launch.cwd.clone().into_os_string(),
+                "resume".into(),
+                "123e4567-e89b-12d3-a456-426614174000".into(),
+            ];
+            agent.extend(overrides.into_iter().map(OsString::from));
+            assert!(prebound_session(&prebound_args(agent), &launch).is_err());
+        }
     }
 
     #[test]

@@ -76,6 +76,9 @@ impl Host {
         let mut kept = vec![agent[0].clone()];
         let mut arguments = agent[1..].iter().peekable();
         while let Some(argument) = arguments.next() {
+            if argument == "--" {
+                break;
+            }
             let follows_value = kept.len() > 1 && self.takes_value(&kept[kept.len() - 1]);
             match self {
                 Self::Claude if named(argument, CLAUDE_SESSION_FLAGS) => continue,
@@ -85,7 +88,10 @@ impl Host {
                     }
                     continue;
                 }
-                Self::Codex if !follows_value && named(argument, CODEX_SESSION_COMMANDS) => break,
+                Self::Codex if !follows_value && named(argument, CODEX_SESSION_COMMANDS) => {
+                    arguments.next();
+                    continue;
+                }
                 _ => kept.push(argument.clone()),
             }
         }
@@ -186,5 +192,28 @@ mod tests {
             ["codex", "--cd", "d", "resume", "id"]
         );
         assert_eq!(resume(Host::Codex, &["codex"]), ["codex", "resume", "id"]);
+    }
+
+    #[test]
+    fn a_resumed_codex_keeps_its_model_and_effort() {
+        assert_eq!(
+            resume(
+                Host::Codex,
+                &[
+                    "codex",
+                    "--cd",
+                    "d",
+                    "resume",
+                    "old",
+                    "--model",
+                    "chosen",
+                    "-c",
+                    "model_reasoning_effort=xhigh",
+                    "--",
+                    "--model=other"
+                ]
+            ),
+            ["codex", "--cd", "d", "--model", "chosen", "-c", "model_reasoning_effort=xhigh", "resume", "id"]
+        );
     }
 }
