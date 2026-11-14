@@ -244,6 +244,11 @@ fn prebound_session(args: &Args, launch: &Launch) -> Result<Option<PreboundSessi
             remaining = rest;
         }
     }
+    if let [option, endpoint, rest @ ..] = remaining {
+        if option == "--remote" && endpoint == "unix://" {
+            remaining = rest;
+        }
+    }
     let prompt_is_delimited = match remaining {
         [] => true,
         [delimiter, _] => delimiter == OsStr::new("--"),
@@ -251,7 +256,7 @@ fn prebound_session(args: &Args, launch: &Launch) -> Result<Option<PreboundSessi
     };
     if !prompt_is_delimited || args.agent.iter().take(expected.len()).map(OsString::as_os_str).ne(expected) {
         bail!(
-            "--session requires `codex --cd <cwd> resume <UUID> [--model <model>] [-c model_reasoning_effort=<effort>] [-- <prompt>]`"
+            "--session requires `codex --cd <cwd> resume <UUID> [--model <model>] [-c model_reasoning_effort=<effort>] [--remote unix://] [-- <prompt>]`"
         );
     }
     Ok(Some(PreboundSession { handle: handle.clone() }))
@@ -736,6 +741,8 @@ mod tests {
             vec!["--model", "chosen"],
             vec!["-c", "model_reasoning_effort=xhigh"],
             vec!["--model", "chosen", "-c", "model_reasoning_effort=high"],
+            vec!["--model", "chosen", "-c", "model_reasoning_effort=high", "--remote", "unix://"],
+            vec!["--remote", "unix://"],
         ] {
             let mut agent = vec![
                 executable(),
@@ -755,6 +762,8 @@ mod tests {
             vec!["-c", "approval_policy=never"],
             vec!["--last"],
             vec!["--model", "chosen", "--model", "other"],
+            vec!["--remote", "ws://localhost:9000"],
+            vec!["--remote", "unix:///another-daemon.sock"],
         ] {
             let mut agent = vec![
                 executable(),
