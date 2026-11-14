@@ -1,6 +1,5 @@
 import hashlib
 import io
-import platform
 import subprocess
 import tarfile
 import urllib.request
@@ -9,14 +8,14 @@ from pathlib import Path
 
 import pytest
 
-from tj_cli import tool_receipts, worktrunk_install
+from tj_cli import host_os, tool_receipts, worktrunk_install
 
 
 def test_a_download_with_the_wrong_digest_installs_nothing(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    monkeypatch.setattr(platform, "system", lambda: "Linux")
-    monkeypatch.setattr(platform, "machine", lambda: "x86_64")
+    monkeypatch.setattr(host_os, "system", lambda: "Linux")
+    monkeypatch.setattr(host_os, "machine", lambda: "x86_64")
     monkeypatch.setattr(
         urllib.request, "urlopen", lambda url, timeout: io.BytesIO(b"tampered")
     )
@@ -42,8 +41,8 @@ def test_install_writes_receipt_and_repairs_changed_binary_without_executing_it(
     monkeypatch: pytest.MonkeyPatch,
     system: str,
 ) -> None:
-    monkeypatch.setattr(platform, "system", lambda: system)
-    monkeypatch.setattr(platform, "machine", lambda: "x86_64")
+    monkeypatch.setattr(host_os, "system", lambda: system)
+    monkeypatch.setattr(host_os, "machine", lambda: "x86_64")
     monkeypatch.setattr(
         subprocess, "run", lambda *a, **kw: pytest.fail("file-only probe")
     )
@@ -87,7 +86,7 @@ def test_install_writes_receipt_and_repairs_changed_binary_without_executing_it(
 def test_explicit_directory_does_not_need_windows_default_environment(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(platform, "system", lambda: "Windows")
+    monkeypatch.setattr(host_os, "system", lambda: "Windows")
     for variable in ("LOCALAPPDATA", "TJ_BIN_DIR", "CI"):
         monkeypatch.delenv(variable, raising=False)
     assert worktrunk_install.main(["--bin-dir", str(tmp_path), "--check"]) == 1

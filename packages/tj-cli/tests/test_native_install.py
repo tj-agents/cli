@@ -1,7 +1,6 @@
 import hashlib
 import json
 import os
-import platform as platform_module
 import shutil
 import subprocess
 import sys
@@ -11,7 +10,7 @@ from unittest import mock
 
 import pytest
 
-from tj_cli import native_install, tool_receipts
+from tj_cli import host_os, native_install, tool_receipts
 
 
 def test_installer_check_rejects_present_but_incompatible_pair_without_writing(
@@ -444,7 +443,7 @@ def test_supported_platform_mapping(
     names: tuple[str, str],
 ) -> None:
     system = "Windows" if operating_system == "win32" else "Linux"
-    monkeypatch.setattr(platform_module, "system", lambda: system)
+    monkeypatch.setattr(host_os, "system", lambda: system)
     assert native_install._asset_name() == asset
     assert native_install._binary_names() == names
 
@@ -503,7 +502,7 @@ def test_explicit_native_directory_needs_no_windows_default_environment(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(platform_module, "system", lambda: "Windows")
+    monkeypatch.setattr(host_os, "system", lambda: "Windows")
     monkeypatch.delenv("LOCALAPPDATA", raising=False)
     monkeypatch.delenv("TJ_BIN_DIR", raising=False)
     monkeypatch.setattr(
