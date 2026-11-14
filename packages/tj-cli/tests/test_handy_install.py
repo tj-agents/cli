@@ -2,7 +2,6 @@ import contextlib
 import hashlib
 import json
 import os
-import platform
 import shutil
 import subprocess
 import sys
@@ -12,7 +11,7 @@ from typing import Any
 
 import pytest
 
-from tj_cli import handy_install, tool_receipts
+from tj_cli import handy_install, host_os, tool_receipts
 
 
 @pytest.fixture(autouse=True)
@@ -51,7 +50,7 @@ def windows_registry(monkeypatch: pytest.MonkeyPatch) -> dict[tuple[int, int], s
 
 @pytest.fixture(autouse=True)
 def isolated_desktop(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    monkeypatch.setattr(platform, "system", lambda: "Windows")
+    monkeypatch.setattr(host_os, "system", lambda: "Windows")
     monkeypatch.setattr(shutil, "which", lambda command: None)
     for variable in ("CI", "DISPLAY", "WAYLAND_DISPLAY", "ProgramW6432"):
         monkeypatch.delenv(variable, raising=False)
@@ -275,7 +274,7 @@ def test_linux_desktop_requires_handy(
     capsys: pytest.CaptureFixture[str],
     variable: str,
 ) -> None:
-    monkeypatch.setattr(platform, "system", lambda: "Linux")
+    monkeypatch.setattr(host_os, "system", lambda: "Linux")
     monkeypatch.setenv(variable, "desktop")
     assert handy_install.main(["--check"]) == 1
     assert "missing    Handy" in capsys.readouterr().out
@@ -284,7 +283,7 @@ def test_linux_desktop_requires_handy(
 def test_headless_linux_does_not_install_desktop_software(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    monkeypatch.setattr(platform, "system", lambda: "Linux")
+    monkeypatch.setattr(host_os, "system", lambda: "Linux")
     assert handy_install.main([]) == 0
     assert "no desktop session" in capsys.readouterr().out
 
@@ -317,8 +316,8 @@ def test_linux_installs_verified_package_once(
     root: bool,
     current: str | None,
 ) -> None:
-    monkeypatch.setattr(platform, "system", lambda: "Linux")
-    monkeypatch.setattr(platform, "machine", lambda: machine)
+    monkeypatch.setattr(host_os, "system", lambda: "Linux")
+    monkeypatch.setattr(host_os, "machine", lambda: machine)
     monkeypatch.setenv("DISPLAY", ":0")
     installed = tmp_path / "handy"
     package = b"upstream package"
@@ -440,8 +439,8 @@ def test_linux_unverified_download_never_reaches_package_manager(
 def test_linux_unsupported_package_manager_gives_manual_resolution(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    monkeypatch.setattr(platform, "system", lambda: "Linux")
-    monkeypatch.setattr(platform, "machine", lambda: "x86_64")
+    monkeypatch.setattr(host_os, "system", lambda: "Linux")
+    monkeypatch.setattr(host_os, "machine", lambda: "x86_64")
     monkeypatch.setenv("DISPLAY", ":0")
     assert handy_install.main([]) == 1
     assert "requires apt-get or dnf" in capsys.readouterr().err
@@ -514,8 +513,8 @@ def test_linux_no_escalate_never_calls_sudo_or_downloads(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    monkeypatch.setattr(platform, "system", lambda: "Linux")
-    monkeypatch.setattr(platform, "machine", lambda: "x86_64")
+    monkeypatch.setattr(host_os, "system", lambda: "Linux")
+    monkeypatch.setattr(host_os, "machine", lambda: "x86_64")
     monkeypatch.setenv("DISPLAY", ":0")
     monkeypatch.setattr(
         shutil,
@@ -588,8 +587,8 @@ def test_linux_wrong_package_version_never_gets_a_receipt(
     capsys: pytest.CaptureFixture[str],
     manager: str,
 ) -> None:
-    monkeypatch.setattr(platform, "system", lambda: "Linux")
-    monkeypatch.setattr(platform, "machine", lambda: "x86_64")
+    monkeypatch.setattr(host_os, "system", lambda: "Linux")
+    monkeypatch.setattr(host_os, "machine", lambda: "x86_64")
     monkeypatch.setenv("DISPLAY", ":0")
     package = b"verified package"
     suffix = "_amd64.deb" if manager == "apt-get" else ".x86_64.rpm"
@@ -634,7 +633,7 @@ def test_linux_wrong_package_version_never_gets_a_receipt(
 def test_pending_uses_only_the_explicit_receipt_directory(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, system: str
 ) -> None:
-    monkeypatch.setattr(platform, "system", lambda: system)
+    monkeypatch.setattr(host_os, "system", lambda: system)
     bin_dir = tmp_path / "explicit"
     application = tmp_path / ("handy.exe" if system == "Windows" else "handy")
     application.write_bytes(b"pinned application")
@@ -661,7 +660,7 @@ def test_pending_uses_only_the_explicit_receipt_directory(
 def test_explicit_directory_does_not_need_windows_default_environment(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(platform, "system", lambda: "Windows")
+    monkeypatch.setattr(host_os, "system", lambda: "Windows")
     for variable in ("LOCALAPPDATA", "TJ_BIN_DIR", "CI"):
         monkeypatch.delenv(variable, raising=False)
     assert handy_install.main(["--bin-dir", str(tmp_path), "--check"]) == 1
