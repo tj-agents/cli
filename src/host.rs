@@ -82,7 +82,18 @@ impl Host {
     }
 
     pub(crate) fn current() -> Option<Self> {
-        Self::from_env(|name| std::env::var(name).ok())
+        let env = |name: &str| std::env::var(name).ok();
+        if Self::Claude.active(&env) && Self::Codex.active(&env) {
+            return Self::from_ancestry(&tj_cli::process::agent::ancestry().ok()?);
+        }
+        Self::from_env(env)
+    }
+
+    pub(crate) fn from_ancestry(chain: &[(u32, String)]) -> Option<Self> {
+        chain.iter().find_map(|(_, image)| {
+            let name = image.rsplit(['/', '\\']).next()?.to_ascii_lowercase();
+            Self::from_name(name.trim_end_matches(".exe"))
+        })
     }
 }
 
@@ -120,6 +131,15 @@ mod tests {
             _ => None,
         };
         assert_eq!(Host::from_env(env), None);
+    }
+
+    #[test]
+    fn nearest_agent_wins_when_markers_are_inherited() {
+        let chain = [(7, "tj.exe".into()), (6, "pwsh.exe".into()), (4, "Codex.EXE".into()), (2, "claude.exe".into())];
+        assert_eq!(Host::from_ancestry(&chain), Some(Host::Codex));
+        let nested = [(7, "tj".into()), (6, "claude".into()), (4, "codex".into())];
+        assert_eq!(Host::from_ancestry(&nested), Some(Host::Claude));
+        assert_eq!(Host::from_ancestry(&[(7, "tj".into())]), None);
     }
 
     #[derive(Debug, PartialEq, Eq)]

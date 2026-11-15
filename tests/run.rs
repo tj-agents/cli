@@ -123,6 +123,8 @@ fn environment(sandbox: &Sandbox) -> Vec<(&'static str, std::ffi::OsString)> {
         ("DUMMY_TJ", std::ffi::OsString::from(env!("CARGO_BIN_EXE_tj"))),
         ("CLAUDE_CONFIG_DIR", sandbox.root.join("claude").into_os_string()),
         ("CODEX_HOME", sandbox.root.join("codex").into_os_string()),
+        ("CODEX_THREAD_ID", std::ffi::OsString::new()),
+        ("CODEX_SESSION_ID", std::ffi::OsString::new()),
         ("HOME", home.clone()),
         ("APPDATA", home.clone()),
         ("XDG_CONFIG_HOME", home),
@@ -1026,6 +1028,7 @@ fn done_outside_tj_run_fails() {
         let mut output = Command::new(env!("CARGO_BIN_EXE_tj"))
             .args(arguments)
             .env_remove("TJ_RUN_LAUNCH_ID")
+            .env_remove("CODEX_THREAD_ID")
             .stderr(Stdio::piped())
             .spawn()
             .unwrap();
@@ -1034,7 +1037,7 @@ fn done_outside_tj_run_fails() {
         (output.wait().unwrap().success(), stderr)
     };
     let (succeeded, stderr) = run(&["done"]);
-    assert!(!succeeded && stderr.contains("only works inside a tj run session"));
+    assert!(!succeeded && stderr.contains("only works inside a verified tj run session"));
 }
 
 fn with_prompt(sandbox: &Sandbox, launch: &str, host: &str, mode: &str) -> Vec<String> {
@@ -1078,6 +1081,7 @@ fn only_the_tabs_own_agent_can_mark_it_done() {
         Command::new(env!("CARGO_BIN_EXE_tj"))
             .args(arguments)
             .envs([("TJ_RUN_LAUNCH_ID", "owned"), ("TJ_RUN_PID", pid), ("TJ_RUN_STARTED_AT", started_at)])
+            .env_remove("CODEX_THREAD_ID")
             .env("TJ_CACHE_DIR", sandbox.root.join("cache"))
             .output()
             .unwrap()
@@ -1227,7 +1231,12 @@ fn a_new_tj_binary_resumes_the_same_conversation_in_the_same_tab() {
 
 #[test]
 fn launch_prints_nothing_outside_tj_run() {
-    let output = Command::new(env!("CARGO_BIN_EXE_tj")).arg("launch").env_remove("TJ_RUN_LAUNCH_ID").output().unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_tj"))
+        .arg("launch")
+        .env_remove("TJ_RUN_LAUNCH_ID")
+        .env_remove("CODEX_THREAD_ID")
+        .output()
+        .unwrap();
     assert!(output.status.success() && output.stdout.is_empty());
 }
 
