@@ -661,7 +661,7 @@ pub fn done() -> Result<ExitCode> {
         if launch_id().is_some() {
             bail!("tj done only works from the tab's own agent; this process inherited another tab's tj run");
         }
-        bail!("tj done only works inside a tj run session (TJ_RUN_LAUNCH_ID is not set)");
+        bail!("tj done only works inside a verified tj run session");
     };
     let marks = marks(&launch_id)?;
     let marker = marks.join("done");

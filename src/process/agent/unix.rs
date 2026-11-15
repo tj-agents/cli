@@ -119,13 +119,23 @@ pub fn processes() -> io::Result<std::collections::HashMap<u32, (u32, String)>> 
         let Some(pid) = entry?.file_name().to_str().and_then(|name| name.parse::<u32>().ok()) else { continue };
         let Ok(Some(fields)) = stat_fields(libc::pid_t::try_from(pid).map_err(io::Error::other)?) else { continue };
         let parent = fields.get(1).and_then(|parent| parent.parse().ok()).unwrap_or(0);
-        let image = std::fs::read_link(format!("/proc/{pid}/exe"))
-            .ok()
-            .and_then(|path| path.file_name().map(|name| name.to_string_lossy().into_owned()))
-            .unwrap_or_default();
+        let executable = std::fs::read_link(format!("/proc/{pid}/exe")).unwrap_or_default();
+        let arguments = std::fs::read(format!("/proc/{pid}/cmdline")).unwrap_or_default();
+        let image = process_image(&executable, &arguments);
         table.insert(pid, (parent, image));
     }
     Ok(table)
+}
+
+fn process_image(executable: &std::path::Path, arguments: &[u8]) -> String {
+    let image = executable.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default();
+    let argument = arguments.split(|byte| *byte == 0).next().unwrap_or_default();
+    let argument = String::from_utf8_lossy(argument);
+    let invoked = std::path::Path::new(argument.as_ref()).file_name().and_then(|name| name.to_str());
+    match invoked {
+        Some(name @ ("claude" | "codex")) => name.to_owned(),
+        _ => image,
+    }
 }
 
 fn adopted_children() -> Vec<libc::pid_t> {
@@ -190,4 +200,16 @@ pub fn hidden(program: &str, _hook: &Path) -> Command {
         command.pre_exec(|| check(libc::setsid()).map(|_| ()));
     }
     command
+}
+
+#[cfg(test)]
+mod image_tests {
+    use super::process_image;
+    use std::path::Path;
+
+    #[test]
+    fn a_version_named_native_claude_keeps_its_invoked_name() {
+        assert_eq!(process_image(Path::new("/opt/versions/2.1.0"), b"/home/user/.local/bin/claude\0--help"), "claude");
+        assert_eq!(process_image(Path::new("/usr/bin/bash"), b"bash\0script"), "bash");
+    }
 }
