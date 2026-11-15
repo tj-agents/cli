@@ -138,18 +138,6 @@ fn process_image(executable: &std::path::Path, arguments: &[u8]) -> String {
     }
 }
 
-#[cfg(test)]
-mod image_tests {
-    use super::process_image;
-    use std::path::Path;
-
-    #[test]
-    fn a_version_named_native_claude_keeps_its_invoked_name() {
-        assert_eq!(process_image(Path::new("/opt/versions/2.1.0"), b"/home/user/.local/bin/claude\0--help"), "claude");
-        assert_eq!(process_image(Path::new("/usr/bin/bash"), b"bash\0script"), "bash");
-    }
-}
-
 fn adopted_children() -> Vec<libc::pid_t> {
     let me = std::process::id().to_string();
     let Ok(entries) = std::fs::read_dir("/proc") else { return Vec::new() };
@@ -212,4 +200,16 @@ pub fn hidden(program: &str, _hook: &Path) -> Command {
         command.pre_exec(|| check(libc::setsid()).map(|_| ()));
     }
     command
+}
+
+#[cfg(test)]
+mod image_tests {
+    use super::process_image;
+    use std::path::Path;
+
+    #[test]
+    fn a_version_named_native_claude_keeps_its_invoked_name() {
+        assert_eq!(process_image(Path::new("/opt/versions/2.1.0"), b"/home/user/.local/bin/claude\0--help"), "claude");
+        assert_eq!(process_image(Path::new("/usr/bin/bash"), b"bash\0script"), "bash");
+    }
 }
