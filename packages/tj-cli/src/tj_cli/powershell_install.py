@@ -5,10 +5,12 @@ from __future__ import annotations
 import hashlib
 import io
 import os
+import shutil
 import stat
 import tarfile
 import tempfile
 import urllib.request
+import uuid
 import zipfile
 from pathlib import Path, PurePosixPath
 
@@ -143,6 +145,21 @@ def _extract(data: bytes, name: str, destination: Path) -> None:
             archive.extractall(destination, filter="data")
 
 
+def _assert_owned(root: Path) -> None:
+    receipt = tool_receipts.read(root / RECEIPT)
+    if receipt is None or any(not _safe_name(name) for name in receipt.hashes):
+        raise PowerShellInstallError(
+            f"Refusing to replace an unowned PowerShell directory: {root}"
+        )
+    files = set(receipt.hashes) | {RECEIPT}
+    for path in root.rglob("*"):
+        relative = path.relative_to(root).as_posix()
+        if _link(path) or (not path.is_dir() and relative not in files):
+            raise PowerShellInstallError(
+                f"Refusing to remove an unowned PowerShell path: {path}"
+            )
+
+
 def ensure(bin_dir: Path) -> Path:
     """Install the verified portable runtime, or return the current executable."""
     if pending(bin_dir) is None:
@@ -176,17 +193,22 @@ def ensure(bin_dir: Path) -> Path:
         tool_receipts.write(
             staged / RECEIPT, tool_receipts.Receipt(VERSION, hashes, name, digest)
         )
-        old = Path(temporary) / "previous"
+        old = root.parent / f".previous-{uuid.uuid4().hex}"
         if root.exists():
-            if tool_receipts.read(root / RECEIPT) is None:
-                raise PowerShellInstallError(
-                    f"Refusing to replace an unowned PowerShell directory: {root}"
-                )
+            _assert_owned(root)
             root.rename(old)
         try:
             staged.rename(root)
         except OSError:
             if old.exists():
-                old.rename(root)
+                try:
+                    old.rename(root)
+                except OSError as restore_error:
+                    raise PowerShellInstallError(
+                        "PowerShell replacement failed; previous runtime "
+                        f"preserved at {old}"
+                    ) from restore_error
             raise
+        if old.exists():
+            shutil.rmtree(old)
     return executable(bin_dir)

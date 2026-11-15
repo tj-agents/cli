@@ -53,6 +53,33 @@ def test_install_checks_entire_tree_and_repairs_corruption(
     assert powershell_install.pending(tmp_path) is None
 
 
+def test_preserves_unowned_files_on_repair(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(host_os, "system", lambda: "Windows")
+    monkeypatch.setattr(host_os, "machine", lambda: "AMD64")
+    content = io.BytesIO()
+    with zipfile.ZipFile(content, "w") as archive:
+        archive.writestr("pwsh.exe", b"binary")
+    data = content.getvalue()
+    monkeypatch.setitem(
+        powershell_install.ASSETS,
+        ("Windows", "x64"),
+        ("test.zip", hashlib.sha256(data).hexdigest()),
+    )
+    monkeypatch.setattr(
+        urllib.request, "urlopen", lambda url, timeout: io.BytesIO(data)
+    )
+    binary = powershell_install.ensure(tmp_path)
+    unrelated = binary.parent / "personal.txt"
+    unrelated.write_text("keep", encoding="utf-8")
+    binary.write_bytes(b"changed")
+    with pytest.raises(powershell_install.PowerShellInstallError, match="unowned"):
+        powershell_install.ensure(tmp_path)
+    assert unrelated.read_text(encoding="utf-8") == "keep"
+    assert binary.read_bytes() == b"changed"
+
+
 def test_rejects_checksum_mismatch_without_installing(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
