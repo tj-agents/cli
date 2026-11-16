@@ -57,7 +57,7 @@ last step before presenting it. Never make the user choose between several outst
 
 ```text
 Agent: repair local setup, start tests and verify the reviewed commits are ready.
-Human handoff: tj approve --session <originating-session>
+Human handoff: ! tj approve
 Agent: verify current approval and passing checks, then queue the reviewed changes.
 While approval is pending: prepare other work without replacing the clipboard or asking for another paste.
 If the request becomes obsolete: reconcile completed actions and supersede it with only remaining human work.
@@ -70,7 +70,16 @@ it. A "Copied ..." line means it landed at that moment, not that it survived sin
 
 **Put it on the clipboard. Never print it for him to copy out of the terminal.** Terminal copy bakes in
 wrapping and indentation and silently breaks a long command on paste. Show the command in your reply too
-so he can read it, but the clipboard copy is the one he runs.
+so he can read it, but the clipboard copy is the one he runs. This applies to every command, by default,
+without being asked.
+
+He runs it in the agent session, so the copied text starts with `! ` and pastes straight into the prompt.
+Omit the prefix only when the command cannot run there, such as one that needs a real console or a
+different machine; then say where to run it.
+
+```text
+Clipboard: ! gh auth status
+```
 
 Do not invent a wrapper script to dodge the problem; write a script only when the thing is genuinely worth
 keeping and re-running.
