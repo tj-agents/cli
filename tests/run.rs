@@ -1913,9 +1913,12 @@ fn a_running_tab_checks_again_and_starts_an_update() {
 }
 
 #[test]
-fn an_unanswered_check_gives_one_line_and_never_holds_the_launch() {
+fn an_unanswered_probe_uses_the_native_updater_and_recovers_without_a_false_success() {
     let sandbox = sandbox();
     select_tj_agents(&sandbox);
+    stub(&sandbox.stubs, "tj-plugins", "updated");
+    publish(&sandbox, "claude", MARKETPLACE_SHA);
+    let publication = std::fs::read_to_string(sandbox.root.join("cache/published/claude")).unwrap();
     let upstream = Upstream::serve(String::new());
     let (output, reached) = launch_checking(&sandbox, &upstream, "offline");
     assert!(
@@ -1924,8 +1927,28 @@ fn an_unanswered_check_gives_one_line_and_never_holds_the_launch() {
         String::from_utf8_lossy(&output.stderr)
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert_eq!(stderr.matches("could not check for tj-agents updates").count(), 1, "{stderr}");
+    assert!(!stderr.contains("could not check for tj-agents updates"), "{stderr}");
+    assert!(!stderr.contains("changed upstream"), "a failed probe claimed a change: {stderr}");
+    wait_until("the unavailable probe never handed over to the native updater", || {
+        log(&sandbox, "stubs/tj-plugins.log").contains("update --host claude")
+    });
+    assert_eq!(std::fs::read_to_string(sandbox.root.join("cache/published/claude")).unwrap(), publication);
+    assert_eq!(std::fs::read_to_string(update_state(&sandbox, "claude.started")).unwrap(), "");
     assert!(update_state(&sandbox, "claude.checked").exists(), "a failed check is retried at once");
+
+    // Another wrapper after the check interval must not start a second fallback in the retry window.
+    std::fs::remove_file(update_state(&sandbox, "claude.checked")).unwrap();
+    launch_checking(&sandbox, &upstream, "offline-again");
+    assert_eq!(log(&sandbox, "stubs/tj-plugins.log").lines().count(), 1);
+
+    // A genuinely fresh head is actionable immediately, even after that unverified refresh attempt.
+    std::fs::remove_file(update_state(&sandbox, "claude.checked")).unwrap();
+    let recovered = Upstream::changed();
+    launch_checking(&sandbox, &recovered, "recovered");
+    wait_until("the recovered probe never started the newly verified update", || {
+        log(&sandbox, "stubs/tj-plugins.log").lines().count() == 2
+    });
+    assert_eq!(std::fs::read_to_string(update_state(&sandbox, "claude.started")).unwrap(), UPSTREAM_SHA);
 }
 
 #[test]
