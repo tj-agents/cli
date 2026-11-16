@@ -37,6 +37,9 @@ enum Command {
     /// Announce installed plugin updates; every tab under `tj run` applies them in place once idle (run by Agent)
     #[command(hide = true)]
     Update(run::update::Args),
+    /// Observe plugin updates for an existing Codex daemon (run by Agent)
+    #[command(hide = true)]
+    ObserveCodexUpdates(run::update::observer::Args),
     /// Prints the `tj run` launch this process belongs to, if any (run by the agent's SessionStart hook)
     #[command(hide = true)]
     Launch,
@@ -63,6 +66,7 @@ fn main() -> ExitCode {
         Command::Run(args) => run::run(*args),
         Command::Done => run::done(),
         Command::Update(args) => run::update::publish(args),
+        Command::ObserveCodexUpdates(args) => run::update::observer::run(args),
         Command::Launch => Ok(run::owner::print()),
         Command::Closeout(args) => run::closeout::run(args),
         Command::Message(args) => message::run(&args),
