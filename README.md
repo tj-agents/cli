@@ -268,6 +268,9 @@ fetched default branch; a merged item PR alone cannot authorize deletion. Worktr
 checks for squash and rebase merges. Live or unknown process ownership keeps the worktree open, and
 unmanaged claims require recovery or adoption before closeout.
 
+Historical cleanup requires a shared linked work item. Unlinked launches retain their separate claims
+and cleanup journals; their common native conversation does not establish a shared task.
+
 After stopping its own agent process tree, the wrapper repeats those checks and refuses changed ownership or content. Each worktree and branch must disappear before its ownership record is released under its original launch. Cleanup journals preserve unfinished removals across repeated recoveries. The item becomes Done and the launch closes only after all of those roots are removed. Primary checkouts remain. A missing or unrecorded ownership root requires recovery; cleanup never guesses ownership from a neighbouring folder or adopts legacy location metadata.
 
 1. asks the agent to exit: a console break or SIGINT for Claude, a Ctrl+C keypress for Codex (through

@@ -1665,12 +1665,8 @@ fn recovered_done_from_primary_removes_predecessor_claims_with_original_identity
         let old = format!("previous-{host}");
         let arguments = recovered_arguments(&sandbox, &launch, host);
         let mut rows = vec![predecessor(&sandbox, &old, host)];
-        // Store's canonical goal, including None, controls history rather than the CLI item spelling.
-        let item = if host == "claude" {
-            serde_json::Value::Null
-        } else {
-            serde_json::json!({"ref": "github:github.com/acme/app:42"})
-        };
+        // Store's canonical goal controls history rather than the CLI item spelling.
+        let item = serde_json::json!({"ref": "github:github.com/acme/app:42"});
         set_reply(
             &sandbox,
             "agent-store-show.json",
@@ -1719,6 +1715,46 @@ fn recovered_done_from_primary_removes_predecessor_claims_with_original_identity
         assert!(!store.contains("--launch-id other-item --path"), "{store}");
         assert_eq!(store.matches("release-worktree ").count(), if host == "codex" { 2 } else { 1 });
     }
+}
+
+#[test]
+fn unlinked_recovery_keeps_historical_claims_and_cleans_only_the_current_launch() {
+    let sandbox = sandbox();
+    let launch = "unlinked-current";
+    let mut arguments = recovered_arguments(&sandbox, launch, "claude");
+    let item = arguments.iter().position(|value| value == "--item").unwrap();
+    arguments.drain(item..=item + 1);
+    set_reply(
+        &sandbox,
+        "agent-store-show.json",
+        &serde_json::json!({"ok": true, "data": {"launch": {"item": null}, "session": {}}}).to_string(),
+    );
+    let mut old = predecessor(&sandbox, "unlinked-previous", "claude");
+    old["item"] = serde_json::Value::Null;
+    set_store_list(&sandbox.stubs, "launches", serde_json::json!([old]));
+    let current = sandbox.root.join("current");
+    git(&sandbox.primary, &["worktree", "add", "-q", current.to_str().unwrap(), "-b", "current"]);
+    set_store_list(
+        &sandbox.stubs,
+        "worktrees",
+        serde_json::json!([
+            {"path": sandbox.worktree.canonicalize().unwrap(), "session": "claude:sess-1", "launch_id": "unlinked-previous"},
+            {"path": current.canonicalize().unwrap(), "session": "claude:sess-1", "launch_id": launch}
+        ]),
+    );
+    let child = spawn(&sandbox, &arguments, &sandbox.root);
+    wait_for_log(&sandbox, "agent ");
+    done(&sandbox);
+    let output = finish(child, Duration::from_secs(120));
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert!(sandbox.worktree.exists(), "unlinked historical work belongs to an unidentified task");
+    assert!(!current.exists());
+    assert!(!git(&sandbox.primary, &["branch", "--list", "Feature/1"]).is_empty());
+    let store = log(&sandbox, "stubs/agent-store.log");
+    assert!(!store.contains("--launch-id unlinked-previous --path"), "{store}");
+    assert_eq!(store.matches("release-worktree ").count(), 1, "{store}");
+    assert!(store.contains("end --launch-id unlinked-current --reason closed"));
+    assert!(!log(&sandbox, "stubs/tj-item.log").contains("--state Done"));
 }
 
 #[test]
