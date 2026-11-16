@@ -1,9 +1,12 @@
 import hashlib
 import io
+import shutil
 import tarfile
 import urllib.request
 import zipfile
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from threading import Event
 
 import pytest
 
@@ -90,7 +93,124 @@ def test_rejects_checksum_mismatch_without_installing(
     )
     with pytest.raises(powershell_install.PowerShellInstallError, match="SHA-256"):
         powershell_install.ensure(tmp_path)
-    assert not list(tmp_path.iterdir())
+    assert not powershell_install.executable(tmp_path).exists()
+
+
+def test_recovers_interrupted_replacement_without_downloading(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(host_os, "system", lambda: "Windows")
+    monkeypatch.setattr(host_os, "machine", lambda: "AMD64")
+    content = io.BytesIO()
+    with zipfile.ZipFile(content, "w") as archive:
+        archive.writestr("pwsh.exe", b"binary")
+    data = content.getvalue()
+    monkeypatch.setitem(
+        powershell_install.ASSETS,
+        ("Windows", "x64"),
+        ("test.zip", hashlib.sha256(data).hexdigest()),
+    )
+    monkeypatch.setattr(
+        urllib.request, "urlopen", lambda url, timeout: io.BytesIO(data)
+    )
+    binary = powershell_install.ensure(tmp_path)
+    binary.parent.rename(binary.parent.parent / ".previous")
+
+    def unexpected(*args: object, **kwargs: object) -> None:
+        pytest.fail("recovery should reuse the prior runtime")
+
+    monkeypatch.setattr(urllib.request, "urlopen", unexpected)
+    assert powershell_install.ensure(tmp_path).read_bytes() == b"binary"
+    assert powershell_install.pending(tmp_path) is None
+    assert not (binary.parent.parent / ".previous").exists()
+
+
+def test_concurrent_installers_download_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(host_os, "system", lambda: "Windows")
+    monkeypatch.setattr(host_os, "machine", lambda: "AMD64")
+    content = io.BytesIO()
+    with zipfile.ZipFile(content, "w") as archive:
+        archive.writestr("pwsh.exe", b"binary")
+    data = content.getvalue()
+    monkeypatch.setitem(
+        powershell_install.ASSETS,
+        ("Windows", "x64"),
+        ("test.zip", hashlib.sha256(data).hexdigest()),
+    )
+    entered, release = Event(), Event()
+    calls: list[str] = []
+
+    def download(url: str, timeout: int) -> io.BytesIO:
+        calls.append(url)
+        entered.set()
+        assert release.wait(10)
+        return io.BytesIO(data)
+
+    monkeypatch.setattr(urllib.request, "urlopen", download)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(powershell_install.ensure, tmp_path)
+        assert entered.wait(10)
+        second = pool.submit(powershell_install.ensure, tmp_path)
+        release.set()
+        assert first.result() == second.result()
+    assert len(calls) == 1
+    assert powershell_install.pending(tmp_path) is None
+
+
+def test_finishes_interrupted_cleanup_without_replacing_current_runtime(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(host_os, "system", lambda: "Windows")
+    monkeypatch.setattr(host_os, "machine", lambda: "AMD64")
+    content = io.BytesIO()
+    with zipfile.ZipFile(content, "w") as archive:
+        archive.writestr("pwsh.exe", b"binary")
+    data = content.getvalue()
+    monkeypatch.setitem(
+        powershell_install.ASSETS,
+        ("Windows", "x64"),
+        ("test.zip", hashlib.sha256(data).hexdigest()),
+    )
+    monkeypatch.setattr(
+        urllib.request, "urlopen", lambda url, timeout: io.BytesIO(data)
+    )
+    binary = powershell_install.ensure(tmp_path)
+    previous = binary.parent.parent / ".previous"
+    shutil.copytree(binary.parent, previous)
+    before = binary.stat().st_mtime_ns
+    assert powershell_install.pending(tmp_path) is not None
+    assert powershell_install.ensure(tmp_path) == binary
+    assert binary.stat().st_mtime_ns == before
+    assert not previous.exists()
+    assert powershell_install.pending(tmp_path) is None
+
+
+def test_recovers_previous_runtime_if_replacement_is_incomplete(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(host_os, "system", lambda: "Windows")
+    monkeypatch.setattr(host_os, "machine", lambda: "AMD64")
+    content = io.BytesIO()
+    with zipfile.ZipFile(content, "w") as archive:
+        archive.writestr("pwsh.exe", b"binary")
+    data = content.getvalue()
+    monkeypatch.setitem(
+        powershell_install.ASSETS,
+        ("Windows", "x64"),
+        ("test.zip", hashlib.sha256(data).hexdigest()),
+    )
+    monkeypatch.setattr(
+        urllib.request, "urlopen", lambda url, timeout: io.BytesIO(data)
+    )
+    binary = powershell_install.ensure(tmp_path)
+    previous = binary.parent.parent / ".previous"
+    shutil.copytree(binary.parent, previous)
+    binary.write_bytes(b"damaged")
+    assert powershell_install.ensure(tmp_path).read_bytes() == b"binary"
+    assert not previous.exists()
+    assert powershell_install.pending(tmp_path) is None
 
 
 def test_rejects_archive_traversal(

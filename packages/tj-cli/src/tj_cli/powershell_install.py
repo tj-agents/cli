@@ -3,15 +3,18 @@
 from __future__ import annotations
 
 import hashlib
+import importlib
 import io
 import os
 import shutil
 import stat
 import tarfile
 import tempfile
+import time
 import urllib.request
-import uuid
 import zipfile
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path, PurePosixPath
 
 from tj_cli import host_os, tool_receipts
@@ -85,6 +88,13 @@ def _link(path: Path) -> bool:
 
 
 def pending(bin_dir: Path) -> str | None:
+    previous = _root(bin_dir).parent / ".previous"
+    if previous.exists() or _link(previous):
+        return f"interrupted PowerShell installation: {previous}"
+    return _current_pending(bin_dir)
+
+
+def _current_pending(bin_dir: Path) -> str | None:
     name, digest = _asset()
     root = _root(bin_dir)
     if _link(root) or _link(root.parent):
@@ -152,16 +162,100 @@ def _assert_owned(root: Path) -> None:
             f"Refusing to replace an unowned PowerShell directory: {root}"
         )
     files = set(receipt.hashes) | {RECEIPT}
+    directories: set[str] = set()
+    for name in files:
+        directories.update(
+            parent.as_posix()
+            for parent in PurePosixPath(name).parents
+            if str(parent) != "."
+        )
     for path in root.rglob("*"):
         relative = path.relative_to(root).as_posix()
-        if _link(path) or (not path.is_dir() and relative not in files):
+        if (
+            _link(path)
+            or (path.is_dir() and relative not in directories)
+            or (not path.is_dir() and relative not in files)
+        ):
             raise PowerShellInstallError(
                 f"Refusing to remove an unowned PowerShell path: {path}"
             )
 
 
+@contextmanager
+def _locked(parent: Path) -> Iterator[None]:
+    parent.mkdir(parents=True, exist_ok=True)
+    with (parent / ".install.lock").open("a+b") as lock:
+        if lock.tell() == 0:
+            lock.write(b"\0")
+            lock.flush()
+        deadline = time.monotonic() + 30
+        while True:
+            try:
+                lock.seek(0)
+                if os.name == "nt":
+                    msvcrt = importlib.import_module("msvcrt")
+                    msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
+                else:
+                    fcntl = importlib.import_module("fcntl")
+                    fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except (BlockingIOError, PermissionError):
+                if time.monotonic() >= deadline:
+                    raise PowerShellInstallError(
+                        "Timed out waiting for PowerShell installation lock"
+                    ) from None
+                time.sleep(0.05)
+        try:
+            yield
+        finally:
+            lock.seek(0)
+            if os.name == "nt":
+                msvcrt.locking(lock.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+
+def _remove_previous(previous: Path, parent: Path) -> None:
+    if (
+        _link(previous)
+        or _link(parent)
+        or previous.resolve().parent != parent.resolve()
+    ):
+        raise PowerShellInstallError(
+            f"Unsafe previous PowerShell directory: {previous}"
+        )
+    _assert_owned(previous)
+    shutil.rmtree(previous)
+
+
+def _recover(bin_dir: Path, root: Path) -> None:
+    previous = root.parent / ".previous"
+    if _link(previous):
+        raise PowerShellInstallError(
+            f"Unsafe previous PowerShell directory: {previous}"
+        )
+    if not previous.exists():
+        return
+    _assert_owned(previous)
+    if root.exists():
+        if _current_pending(bin_dir) is None:
+            _remove_previous(previous, root.parent)
+            return
+        _remove_previous(root, root.parent)
+    previous.rename(root)
+
+
 def ensure(bin_dir: Path) -> Path:
     """Install the verified portable runtime, or return the current executable."""
+    root = _root(bin_dir)
+    if _link(root) or _link(root.parent):
+        raise PowerShellInstallError(f"PowerShell directory is a symbolic link: {root}")
+    with _locked(root.parent):
+        _recover(bin_dir, root)
+        return _ensure_locked(bin_dir)
+
+
+def _ensure_locked(bin_dir: Path) -> Path:
     if pending(bin_dir) is None:
         return executable(bin_dir)
     name, digest = _asset()
@@ -193,7 +287,7 @@ def ensure(bin_dir: Path) -> Path:
         tool_receipts.write(
             staged / RECEIPT, tool_receipts.Receipt(VERSION, hashes, name, digest)
         )
-        old = root.parent / f".previous-{uuid.uuid4().hex}"
+        old = root.parent / ".previous"
         if root.exists():
             _assert_owned(root)
             root.rename(old)
@@ -210,5 +304,5 @@ def ensure(bin_dir: Path) -> Path:
                     ) from restore_error
             raise
         if old.exists():
-            shutil.rmtree(old)
+            _remove_previous(old, root.parent)
     return executable(bin_dir)
