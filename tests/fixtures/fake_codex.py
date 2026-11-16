@@ -149,6 +149,7 @@ def proxy(source: BinaryIO, target: BinaryIO, log: Path, scenario: str) -> None:
     upgrade(source, target, log, scenario)
     if scenario in {"silent-upgrade", "reject-upgrade", "bad-accept"}:
         return
+    observer_reads = 0
     while True:
         try:
             message = receive(source)
@@ -177,6 +178,37 @@ def proxy(source: BinaryIO, target: BinaryIO, log: Path, scenario: str) -> None:
         if scenario == "silent-initialize" or method == "test/timeout":
             source.read()
             return
+        if (
+            scenario in {"observer", "observer-disconnect"}
+            and method == "thread/loaded/list"
+        ):
+            observer_reads += 1
+            if scenario == "observer-disconnect" and observer_reads > 1:
+                return
+            if observer_reads == 1:
+                Path(os.environ["FAKE_OBSERVER_PUBLICATION"]).write_text(
+                    "new-revision", encoding="utf-8"
+                )
+            reply(
+                source,
+                target,
+                log,
+                {
+                    "id": request["id"],
+                    "result": {"data": ["thread"] if observer_reads == 1 else []},
+                },
+            )
+            continue
+        if scenario == "observer-live" and method == "thread/loaded/list":
+            loaded = (
+                []
+                if Path(os.environ["FAKE_OBSERVER_SHUTDOWN"]).exists()
+                else ["thread"]
+            )
+            reply(
+                source, target, log, {"id": request["id"], "result": {"data": loaded}}
+            )
+            continue
         if method in {"test/close", "test/close-delayed", "test/close-hold"}:
             write(target, frame(Opcode.CLOSE, b"\x03\xe8"))
             if method == "test/close-delayed":
