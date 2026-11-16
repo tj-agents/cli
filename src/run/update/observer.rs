@@ -56,6 +56,37 @@ fn socket_identity(socket: &Path) -> Result<(u64, u64)> {
     Ok((metadata.creation_time(), metadata.last_write_time()))
 }
 
+#[cfg(target_os = "linux")]
+struct SocketGuard(File);
+
+#[cfg(target_os = "linux")]
+impl SocketGuard {
+    fn open(socket: &Path) -> Result<Self> {
+        use rustix::fs::{Mode, OFlags, open};
+        let fd = open(socket, OFlags::PATH | OFlags::CLOEXEC, Mode::empty()).context("could not pin daemon socket")?;
+        Ok(Self(File::from(fd)))
+    }
+
+    fn identity(&self) -> Result<(u64, u64)> {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = self.0.metadata().context("could not inspect pinned daemon socket")?;
+        Ok((metadata.dev(), metadata.ino()))
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+struct SocketGuard((u64, u64));
+
+#[cfg(not(target_os = "linux"))]
+impl SocketGuard {
+    fn open(socket: &Path) -> Result<Self> {
+        socket_identity(socket).map(Self)
+    }
+    fn identity(&self) -> Result<(u64, u64)> {
+        Ok(self.0)
+    }
+}
+
 #[cfg(unix)]
 fn socket_identity(socket: &Path) -> Result<(u64, u64)> {
     use std::os::unix::fs::MetadataExt;
@@ -194,11 +225,12 @@ fn observe(
     server: &mut Server,
     cwd: &Path,
     mut watcher: Watcher,
-    poll: Duration,
-    check_updates: bool,
+    settings: (Duration, bool),
     current_socket: impl Fn() -> Result<bool>,
+    withdraw: impl FnOnce() -> Result<()>,
+    mut check: Option<JoinHandle<Result<Option<upstream::OwnedUpdate>, upstream::CheckError>>>,
 ) -> Result<()> {
-    let mut check = None;
+    let (poll, check_updates) = settings;
     let mut updater = None;
     let result = (|| {
         let mut next_poll = Instant::now();
@@ -233,9 +265,32 @@ fn observe(
             let _ = server.next(next_poll).context("Codex daemon disconnected")?;
         }
     })();
+    let withdrawal = withdraw();
     stop_check(check);
     drop(updater);
+    withdrawal?;
     result
+}
+
+fn cycles<T>(
+    state: &mut T,
+    mut cycle: impl FnMut(&mut T) -> Result<()>,
+    mut active: impl FnMut(&mut T) -> Result<bool>,
+) -> Result<()> {
+    loop {
+        cycle(state)?;
+        if !active(state)? {
+            return Ok(());
+        }
+    }
+}
+
+fn withdraw(marker: &Path) -> Result<()> {
+    match fs::remove_file(marker) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
 }
 
 fn foreground(args: &Args) -> Result<ExitCode> {
@@ -246,7 +301,8 @@ fn foreground(args: &Args) -> Result<ExitCode> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(e.into()),
     }
-    let socket = socket_identity(&args.socket)?;
+    let socket_guard = SocketGuard::open(&args.socket)?;
+    let socket = socket_guard.identity()?;
     let mut server = Server::connect_socket(&args.socket).context("could not connect to existing Codex daemon")?;
     if socket_identity(&args.socket)? != socket {
         bail!("daemon socket changed during observer startup");
@@ -254,14 +310,30 @@ fn foreground(args: &Args) -> Result<ExitCode> {
     if !loaded(&mut server)? {
         return Ok(ExitCode::from(3));
     }
-    let watcher = Watcher::new(std::env::current_exe()?, published(Host::Codex)?);
-    reload(&mut server)?;
     let pid = std::process::id();
     let identity = started(pid)?.context("observer process identity unavailable")?;
-    fs::write(&marker, serde_json::to_vec(&json!({"pid": pid, "started": identity, "socket": [socket.0, socket.1]}))?)?;
-    let result = observe(&mut server, &args.cwd, watcher, POLL, true, || Ok(socket_identity(&args.socket)? == socket));
-    let _ = fs::remove_file(marker);
-    result.map(|()| ExitCode::SUCCESS)
+    cycles(
+        &mut server,
+        |server| {
+            let watcher = Watcher::new(std::env::current_exe()?, published(Host::Codex)?);
+            reload(server)?;
+            fs::write(
+                &marker,
+                serde_json::to_vec(&json!({"pid": pid, "started": identity, "socket": [socket.0, socket.1]}))?,
+            )?;
+            observe(
+                server,
+                &args.cwd,
+                watcher,
+                (POLL, true),
+                || Ok(socket_identity(&args.socket)? == socket),
+                || withdraw(&marker),
+                None,
+            )
+        },
+        |server| Ok(socket_identity(&args.socket)? == socket && loaded(server)?),
+    )?;
+    Ok(ExitCode::SUCCESS)
 }
 
 pub(crate) fn run(args: Args) -> Result<ExitCode> {
@@ -328,7 +400,16 @@ mod tests {
         fs::write(&publication, "old-revision").unwrap();
         let mut server = fake(&log, &publication, "observer");
         let watcher = Watcher::new(std::env::current_exe().unwrap(), publication);
-        observe(&mut server, directory.path(), watcher, Duration::from_millis(20), false, || Ok(true)).unwrap();
+        observe(
+            &mut server,
+            directory.path(),
+            watcher,
+            (Duration::from_millis(20), false),
+            || Ok(true),
+            || Ok(()),
+            None,
+        )
+        .unwrap();
         drop(server);
         let events = fs::read_to_string(log).unwrap();
         assert_eq!(events.matches("config/batchWrite").count(), 1);
@@ -344,7 +425,16 @@ mod tests {
         let mut server = fake(&log, &publication, "observer-disconnect");
         let watcher = Watcher::new(std::env::current_exe().unwrap(), publication);
         assert!(
-            observe(&mut server, directory.path(), watcher, Duration::from_millis(20), false, || Ok(true)).is_err()
+            observe(
+                &mut server,
+                directory.path(),
+                watcher,
+                (Duration::from_millis(20), false),
+                || Ok(true),
+                || Ok(()),
+                None
+            )
+            .is_err()
         );
         drop(server);
         let events = fs::read_to_string(log).unwrap();
@@ -356,5 +446,94 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         assert_eq!(status(&directory.path().join("missing.sock")).unwrap(), 3);
         assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pinned_socket_identifies_a_replacement_listener() {
+        use std::os::unix::net::UnixListener;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("daemon.sock");
+        let old = UnixListener::bind(&path).unwrap();
+        let guard = SocketGuard::open(&path).unwrap();
+        let identity = guard.identity().unwrap();
+        fs::remove_file(&path).unwrap();
+        drop(old);
+        let _replacement = UnixListener::bind(&path).unwrap();
+        assert_ne!(identity, socket_identity(&path).unwrap());
+    }
+
+    #[test]
+    fn new_thread_during_shutdown_restarts_observation_after_readiness_withdrawal() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+            mpsc,
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("daemon.sock");
+        let marker = ready_path(&socket).unwrap();
+        let log = directory.path().join("daemon.jsonl");
+        let publication = directory.path().join("published");
+        fs::write(&socket, "socket").unwrap();
+        fs::write(&publication, "old-revision").unwrap();
+        let owner = lock(&socket, true).unwrap().unwrap();
+        let pid = std::process::id();
+        let identity = socket_identity(&socket).unwrap();
+        let marker_contents = serde_json::to_vec(
+            &json!({"pid":pid,"started":started(pid).unwrap().unwrap(),"socket":[identity.0,identity.1]}),
+        )
+        .unwrap();
+        let (withdrawn_tx, withdrawn_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let new_thread = Arc::new(AtomicBool::new(false));
+        let active = Arc::clone(&new_thread);
+        let cwd = directory.path().to_path_buf();
+        let marker_for_worker = marker.clone();
+        let worker = std::thread::spawn(move || {
+            let mut server = fake(&log, &publication, "observer");
+            let mut runs = 0;
+            let mut resume_rx = Some(resume_rx);
+            cycles(
+                &mut server,
+                |server| {
+                    runs += 1;
+                    fs::write(&marker_for_worker, &marker_contents)?;
+                    if runs == 2 {
+                        return Ok(());
+                    }
+                    let resume_rx = resume_rx.take().unwrap();
+                    let check = std::thread::spawn(move || {
+                        resume_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                        Ok(None)
+                    });
+                    let watcher = Watcher::new(std::env::current_exe()?, publication.clone());
+                    observe(
+                        server,
+                        &cwd,
+                        watcher,
+                        (Duration::from_millis(20), false),
+                        || Ok(true),
+                        || {
+                            withdraw(&marker_for_worker)?;
+                            withdrawn_tx.send(()).unwrap();
+                            Ok(())
+                        },
+                        Some(check),
+                    )
+                },
+                |_| Ok(active.swap(false, Ordering::SeqCst)),
+            )
+            .unwrap();
+            runs
+        });
+        withdrawn_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(!owner_ready(&socket).unwrap());
+        assert!(lock(&socket, true).unwrap().is_none());
+        new_thread.store(true, Ordering::SeqCst);
+        resume_tx.send(()).unwrap();
+        assert_eq!(worker.join().unwrap(), 2);
+        assert!(owner_ready(&socket).unwrap());
+        drop(owner);
     }
 }
