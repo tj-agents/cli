@@ -68,8 +68,6 @@ pub struct Args {
     poll_seconds: u64,
     #[arg(long, hide = true, default_value_t = 600)]
     idle_seconds: u64,
-    #[arg(long, hide = true, default_value_t = 1800)]
-    ask_idle_seconds: u64,
     #[arg(long, hide = true, default_value_t = 10)]
     grace_seconds: u64,
     #[arg(long, hide = true, default_value_t = 30)]
@@ -83,6 +81,10 @@ pub struct Args {
     /// Continues this launch in a replaced tj binary: the launch, its marks and its conversation already exist.
     #[arg(long, hide = true)]
     successor: bool,
+    // Already-running wrappers include this in their handover command. Accept it only during that
+    // upgrade; it has no behavior and new wrappers never forward it.
+    #[arg(long = "ask-idle-seconds", hide = true, requires = "successor")]
+    _retired_ask_idle_seconds: Option<u64>,
     /// The agent's command line.
     #[arg(last = true, required = true)]
     agent: Vec<OsString>,
@@ -281,9 +283,6 @@ struct Watch {
     idle: Duration,
     next_poll: Instant,
     reported: HashSet<String>,
-    merge_asked: bool,
-    ask_idle: Duration,
-    nudge: turn::Nudge,
     mark: Option<SystemTime>,
     pinned: Option<turn::Turn>,
     rollout: Option<PathBuf>,
@@ -344,16 +343,21 @@ impl Watch {
         })
     }
 
-    fn delivered(&mut self) -> bool {
-        closeout::delivered(&self.launch).unwrap_or_else(|error| {
-            self.report(format!("{error:#}"));
-            false
-        })
+    fn completed_on_exit(&self, turn: Option<turn::Turn>) -> bool {
+        let Some(marked) = self.marked() else { return false };
+        let Some(turn) = turn else { return false };
+        if let Some(pinned) = self.pinned {
+            return turn == pinned;
+        }
+        // A successful host exit may precede its final idle record. A later turn withdraws done.
+        if !turn.idle {
+            return turn.changed < marked;
+        }
+        turn::judge(marked, SystemTime::now(), Some(turn), &mut None, 0, Duration::ZERO) == turn::Done::Due
     }
 
     fn trigger(&mut self, agent: u32) -> Option<Trigger> {
         let turn = self.turn(agent);
-        self.nudge.observe(turn);
         if self.done(agent, turn) {
             return Some(Trigger::Done);
         }
@@ -364,31 +368,10 @@ impl Watch {
         if self.closing() {
             return Some(Trigger::Closing);
         }
-        if !self.merge_asked && self.delivered() {
-            let item = self.launch.item.clone().unwrap_or_default();
-            self.merge_asked = self.ask(&format!("Every PR linked to {item} has merged."));
-        } else if self.marked().is_none()
-            && let Some(idle) = self.nudge.due(SystemTime::now(), turn, self.ask_idle)
-            && turn::shells(agent) == 0
-        {
-            self.nudge.spend(idle);
-            self.ask("This session has stayed idle since its last turn ended.");
+        if let Err(error) = closeout::notify(&self.launch) {
+            self.report(format!("could not record merge notification: {error:#}"));
         }
         None
-    }
-
-    fn ask(&mut self, reason: &str) -> bool {
-        let at = SystemTime::now();
-        match closeout::ask(&self.launch, reason) {
-            Ok(()) => {
-                self.nudge.asked(at);
-                true
-            }
-            Err(error) => {
-                self.report(format!("could not ask the agent to close out: {error:#}"));
-                false
-            }
-        }
     }
 }
 
@@ -419,7 +402,6 @@ fn successor_arguments(args: &Args, launch: &Launch, agent: Vec<OsString>) -> Ve
     let seconds = [
         ("--poll-seconds", args.poll_seconds),
         ("--idle-seconds", args.idle_seconds),
-        ("--ask-idle-seconds", args.ask_idle_seconds),
         ("--grace-seconds", args.grace_seconds),
         ("--restart-grace-seconds", args.restart_grace_seconds),
         ("--plugin-grace-seconds", args.plugin_grace_seconds),
@@ -567,9 +549,6 @@ fn supervise(args: &Args, launch: Launch, prebound: Option<&PreboundSession>) ->
         idle: Duration::from_secs(args.idle_seconds),
         next_poll: Instant::now() + poll,
         reported: HashSet::new(),
-        merge_asked: false,
-        ask_idle: Duration::from_secs(args.ask_idle_seconds),
-        nudge: turn::Nudge::default(),
         mark: None,
         pinned: None,
         rollout: None,
@@ -586,7 +565,10 @@ fn supervise(args: &Args, launch: Launch, prebound: Option<&PreboundSession>) ->
                 eprintln!("\r\ntj run: the resumed agent exited with code {code}\r");
                 wait_for_enter();
             }
-            let closing = watch.marked().is_some() || watch.closing() || watch.delivered();
+            let turn = watch.turn(agent.pid());
+            // Even an agent that exits itself must explicitly finish. Failure is never completion.
+            let finished = code == 0 && watch.completed_on_exit(turn);
+            let closing = watch.closing() || finished;
             let _ = std::fs::remove_dir_all(&watch.marks);
             if closing {
                 let result = closeout::owned_preflight(&watch.launch)
@@ -691,13 +673,13 @@ mod tests {
             session: Some("codex:123e4567-e89b-12d3-a456-426614174000".to_owned()),
             poll_seconds: 120,
             idle_seconds: 600,
-            ask_idle_seconds: 1800,
             grace_seconds: 10,
             restart_grace_seconds: 30,
             plugin_grace_seconds: 2,
             input_idle_seconds: 2,
             update_url: String::new(),
             successor: false,
+            _retired_ask_idle_seconds: None,
             agent,
         }
     }

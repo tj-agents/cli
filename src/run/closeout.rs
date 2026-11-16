@@ -1,14 +1,12 @@
-use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::{ExitCode, Stdio};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use super::{Launch, hidden, store};
-use crate::host::Host;
-use crate::{app_server, bridge, paths};
+use crate::{feed, paths};
 
 mod journal;
 
@@ -32,8 +30,8 @@ fn repository(launch: &Launch) -> Result<PathBuf> {
     bail!("launch directory is gone and no owned repository is available")
 }
 
-pub fn delivered(launch: &Launch) -> Result<bool> {
-    let Some(item) = &launch.item else { return Ok(false) };
+pub fn notify(launch: &Launch) -> Result<()> {
+    let Some(item) = &launch.item else { return Ok(()) };
     let output = hidden("tj-item")
         .args(["prs", item])
         .current_dir(repository(launch)?)
@@ -44,33 +42,35 @@ pub fn delivered(launch: &Launch) -> Result<bool> {
         bail!("tj item prs {item}: {}", String::from_utf8_lossy(&output.stderr).trim());
     }
     let reply: Value = serde_json::from_slice(&output.stdout).context("tj item prs printed no JSON")?;
-    Ok(reply["all_merged"] == Value::Bool(true))
-}
-
-fn queue(thread: &str, text: &str) -> Result<()> {
-    let output = app_server::host_command("codex")?
-        .args([OsStr::new("queue"), "--thread".as_ref(), thread.as_ref(), "--message".as_ref(), text.as_ref()])
-        .stdin(Stdio::null())
-        .output()
-        .context("could not run codex queue")?;
-    if !output.status.success() {
-        bail!("codex queue: {}", String::from_utf8_lossy(&output.stderr).trim());
-    }
+    let item = reply["ref"].as_str().unwrap_or(item);
+    let Some(event) = merged_event(item, &reply) else { return Ok(()) };
+    let session = store::bound_session(&launch.id)?
+        .with_context(|| format!("no {} session is bound to launch {} yet", launch.host.name(), launch.id))?;
+    feed::Feed::new(&feed::folder()?, &format!("{}:{session}", launch.host.name()))?.post_once(
+        &event,
+        &json!({
+            "at": chrono::Local::now().format("%Y-%m-%d %H:%M").to_string(),
+            "from": null,
+            "name": "tj run",
+            "kind": "merged",
+            "text": format!("Every PR linked to {item} has merged. Closeout still requires the session's explicit `tj done` after its remaining work and waits finish.")
+        }),
+    )?;
     Ok(())
 }
 
-pub fn ask(launch: &Launch, reason: &str) -> Result<()> {
-    let session = store::bound_session(&launch.id)?
-        .with_context(|| format!("no {} session is bound to launch {} yet", launch.host.name(), launch.id))?;
-    let text = format!(
-        "[tj run] {reason} If this session's work is finished, with no reply awaited from the user and no open \
-         question, child session, pending merge or follow-up, run `tj done` as your final step so this tab \
-         closes and its worktree is removed. Otherwise carry on and do not run it."
-    );
-    match launch.host {
-        Host::Claude => bridge::post(&session, &text),
-        Host::Codex => queue(&session, &text),
+/// Identity is the item and PR set, not launch, turn, title or query ordering.
+fn merged_event(item: &str, reply: &Value) -> Option<Value> {
+    if reply["all_merged"] != Value::Bool(true) {
+        return None;
     }
+    let mut urls = reply["prs"].as_array()?.iter().map(|pr| pr["url"].as_str()).collect::<Option<Vec<_>>>()?;
+    if urls.is_empty() || urls.iter().any(|url| url.trim().is_empty()) {
+        return None;
+    }
+    urls.sort_unstable();
+    urls.dedup();
+    Some(json!({"kind": "merged", "item": item, "prs": urls}))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -378,13 +378,7 @@ pub fn run(args: Args) -> Result<ExitCode> {
         }
         let launch = &row.launch;
         let started = !matches!(journal::read(launch), Ok(None));
-        let swept = args.item.is_some()
-            || row.closing
-            || started
-            || delivered(launch).unwrap_or_else(|error| {
-                eprintln!("{}: {error:#}", launch.id);
-                false
-            });
+        let swept = args.item.is_some() || row.closing || started;
         if !swept {
             continue;
         }
@@ -402,9 +396,21 @@ pub fn run(args: Args) -> Result<ExitCode> {
 
 #[cfg(test)]
 mod tests {
-    use super::wrapper_alive;
+    use super::{merged_event, wrapper_alive};
     use crate::host::Host;
     use crate::run::{Launch, store};
+
+    #[test]
+    fn merge_identity_ignores_order_and_duplicates_but_preserves_new_prs() {
+        let event = |prs| merged_event("item", &serde_json::json!({"all_merged": true, "prs": prs}));
+        let first = event(serde_json::json!([{"url": "b"}, {"url": "a"}, {"url": "b"}]));
+        assert_eq!(first, event(serde_json::json!([{"url": "a"}, {"url": "b"}])));
+        assert_ne!(first, event(serde_json::json!([{"url": "a"}, {"url": "b"}, {"url": "c"}])));
+        for prs in [serde_json::json!([]), serde_json::json!([{}]), serde_json::json!([{"url": ""}])] {
+            assert_eq!(event(prs), None);
+        }
+        assert_eq!(merged_event("item", &serde_json::json!({"all_merged": false, "prs": [{"url": "a"}]})), None);
+    }
 
     #[test]
     fn wrapper_checks_require_a_matching_process_identity() {
