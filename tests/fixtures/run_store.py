@@ -124,17 +124,15 @@ def main() -> None:
         launch_id = (
             value(arguments, "--launch-id") if "--launch-id" in arguments else None
         )
+        released_keys = {
+            (claim["path"], claim["session"], claim["launch_id"]) for claim in released
+        }
         reply["data"]["worktrees"] = [
             row
             for row in reply["data"]["worktrees"]
             if row["session"] == value(arguments, "--session")
             and row["launch_id"] == launch_id
-            and not any(
-                row["path"] == claim["path"]
-                and row["session"] == claim["session"]
-                and row["launch_id"] == claim["launch_id"]
-                for claim in released
-            )
+            and (row["path"], row["session"], row["launch_id"]) not in released_keys
         ]
     print(json.dumps(reply))
 
