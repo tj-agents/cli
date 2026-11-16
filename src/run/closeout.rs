@@ -15,7 +15,8 @@ fn repository(launch: &Launch) -> Result<PathBuf> {
         return Ok(launch.cwd.clone());
     }
     let owner = store::ownership(launch)?;
-    for path in owner.paths {
+    for claim in owner.claims {
+        let path = claim.path;
         if path.is_dir() {
             let common = git(&path, &["rev-parse", "--path-format=absolute", "--git-common-dir"])?;
             return Ok(Path::new(&common).parent().context("git common dir has no parent")?.to_path_buf());
@@ -87,6 +88,7 @@ pub struct Plan {
     owner: store::Ownership,
     removals: Vec<Removal>,
     repository: PathBuf,
+    journals: Vec<String>,
 }
 
 fn identity(path: &Path) -> Result<String> {
@@ -121,7 +123,11 @@ fn other_writers(owner: &store::Ownership) -> Result<()> {
         for location in ["cwd", "worktree"] {
             let Some(path) = session[location].as_str().map(Path::new).filter(|path| path.exists()) else { continue };
             let location = identity(path)?;
-            if !owner.paths.iter().any(|owned| identity(owned).is_ok_and(|owned| paths::within(&location, &owned))) {
+            if !owner
+                .claims
+                .iter()
+                .any(|claim| identity(&claim.path).is_ok_and(|owned| paths::within(&location, &owned)))
+            {
                 continue;
             }
             let wrapper = &session["wrapper"];
@@ -188,7 +194,8 @@ fn integrated(cwd: &Path, root: &Path) -> Result<String> {
     Ok(default.to_owned())
 }
 
-fn preflight(path: &Path) -> Result<Removal> {
+fn preflight(claim: &store::Claim) -> Result<Removal> {
+    let path = &claim.path;
     let (root, primary) = linked(path)?.context("ownership points to a primary checkout; refusing removal")?;
     if identity(path)? != identity(&root)? {
         bail!("ownership is not an exact linked root: {}", path.display());
@@ -211,48 +218,107 @@ fn preflight(path: &Path) -> Result<Removal> {
     Ok(Removal { primary, worktree: path.to_path_buf(), registration: root, branch, head, default })
 }
 
-pub fn owned_preflight(launch: &Launch) -> Result<Plan, String> {
-    let prepare = || -> Result<Plan> {
-        let owner = store::ownership(launch)?;
-        let saved = journal::read(launch)?;
-        if saved.as_ref().is_some_and(|saved| saved.session != owner.session) {
+fn completion_owner(launch: &Launch) -> Result<(store::Ownership, Vec<journal::Journal>)> {
+    let mut owner = store::ownership(launch)?;
+    store::require_managed_claims(&owner.session)?;
+    let predecessors = store::predecessors(launch, &owner)?;
+    let mut saved = journal::read(launch)?.into_iter().collect::<Vec<_>>();
+    for predecessor in &predecessors {
+        let claims = store::claims(&owner.session, &predecessor.launch.id)?;
+        let previous = journal::read(&predecessor.launch)?;
+        if claims.is_empty() && previous.is_none() {
+            continue;
+        }
+        if wrapper_alive(predecessor)? {
+            bail!("historical launch wrapper is still alive: {}", predecessor.launch.id);
+        }
+        owner.claims.extend(claims);
+        saved.extend(previous);
+    }
+    for journal in &saved {
+        if journal.session != owner.session {
             bail!("cleanup journal belongs to another session; recovery required");
         }
+    }
+    let mut roots = std::collections::HashSet::new();
+    for claim in &owner.claims {
+        let root =
+            if claim.path.try_exists()? { identity(&claim.path)? } else { paths::norm(&claim.path.to_string_lossy()) };
+        if !roots.insert(root) {
+            bail!("duplicate worktree ownership; recovery required: {}", claim.path.display());
+        }
+    }
+    owner.claims.sort_by(|left, right| left.path.cmp(&right.path));
+    Ok((owner, saved))
+}
+
+fn removal_claim<'a>(owner: &'a store::Ownership, removal: &Removal) -> Option<&'a store::Claim> {
+    owner
+        .claims
+        .iter()
+        .find(|claim| paths::norm(&claim.path.to_string_lossy()) == paths::norm(&removal.worktree.to_string_lossy()))
+}
+
+pub fn owned_preflight(launch: &Launch) -> Result<Plan, String> {
+    let prepare = || -> Result<Plan> {
+        let (owner, saved) = completion_owner(launch)?;
+        let mut journals = Vec::new();
+        let mut proof: Vec<Removal> = Vec::new();
+        for saved in saved {
+            if saved.launch_id != launch.id {
+                journals.push(saved.launch_id);
+            }
+            for removal in saved.removals {
+                if let Some(previous) = proof.iter().find(|previous| {
+                    paths::norm(&previous.worktree.to_string_lossy())
+                        == paths::norm(&removal.worktree.to_string_lossy())
+                }) {
+                    if previous != &removal {
+                        bail!("conflicting cleanup journal proofs; recovery required");
+                    }
+                } else {
+                    proof.push(removal);
+                }
+            }
+        }
+        journals.sort();
+        journals.dedup();
         for path in [Some(&launch.cwd), owner.location.as_ref()].into_iter().flatten().filter(|path| path.exists()) {
             if let Some((root, _)) = linked(path)? {
                 let root = identity(&root)?;
-                if !owner.paths.iter().any(|owned| identity(owned).is_ok_and(|owned| owned == root)) {
+                if !owner.claims.iter().any(|claim| identity(&claim.path).is_ok_and(|owned| owned == root)) {
                     bail!("linked worktree has no recorded ownership; recovery required: {}", path.display());
                 }
             }
         }
         other_writers(&owner)?;
         let mut removals = owner
-            .paths
+            .claims
             .iter()
-            .map(|path| {
+            .map(|claim| {
+                let path = &claim.path;
                 if path.try_exists()? {
-                    return preflight(path);
+                    return preflight(claim);
                 }
-                let removal = saved
-                    .as_ref()
-                    .and_then(|saved| saved.removals.iter().find(|removal| removal.worktree == *path))
+                let removal = proof
+                    .iter()
+                    .find(|removal| {
+                        paths::norm(&removal.worktree.to_string_lossy()) == paths::norm(&path.to_string_lossy())
+                    })
                     .context("missing owned root has no cleanup journal; recovery required")?;
                 removed(removal)?;
                 Ok(removal.clone())
             })
             .collect::<Result<Vec<_>>>()?;
-        if let Some(saved) = saved {
-            for removal in saved.removals {
-                if !owner.paths.contains(&removal.worktree) {
-                    removed(&removal)?;
-                    removals.push(removal);
-                }
+        for removal in proof {
+            if removal_claim(&owner, &removal).is_none() {
+                removed(&removal)?;
+                removals.push(removal);
             }
         }
         removals.sort_by(|left, right| left.worktree.cmp(&right.worktree));
         let repository = removals.first().map_or_else(|| repository(launch), |removal| Ok(removal.primary.clone()))?;
-        Ok(Plan { owner, removals, repository })
+        Ok(Plan { owner, removals, repository, journals })
     };
     prepare().map_err(|error| format!("{error:#}"))
 }
@@ -310,23 +376,27 @@ fn removed(removal: &Removal) -> Result<()> {
 
 pub fn finish(launch: &Launch, plan: Plan) -> Result<()> {
     let rechecked = owned_preflight(launch).map_err(anyhow::Error::msg)?;
-    if rechecked.owner != plan.owner || rechecked.removals != plan.removals {
+    if rechecked.owner != plan.owner || rechecked.removals != plan.removals || rechecked.journals != plan.journals {
         bail!("worktree ownership or content changed while stopping the agent; recovery required");
     }
     journal::write(launch, &plan)?;
+    // The aggregate is durable before any predecessor proof is retired.
+    for source in &plan.journals {
+        journal::clear(source)?;
+    }
     for removal in &plan.removals {
-        if !plan.owner.paths.contains(&removal.worktree) {
+        let Some(claim) = removal_claim(&plan.owner, removal) else {
             removed(removal)?;
             continue;
-        }
+        };
         if removal.worktree.try_exists()? {
             remove(removal)?;
         } else {
             removed(removal)?;
         }
-        store::release(launch, &plan.owner, &removal.worktree)?;
+        store::release(&plan.owner, claim)?;
     }
-    if !store::ownership(launch)?.paths.is_empty() {
+    if !completion_owner(launch)?.0.claims.is_empty() {
         bail!("owned worktrees remain after cleanup; recovery required");
     }
     if let Some(item) = &launch.item {
@@ -341,7 +411,7 @@ pub fn finish(launch: &Launch, plan: Plan) -> Result<()> {
         }
     }
     store::end(&launch.id, "closed")?;
-    journal::clear(launch)
+    journal::clear(&launch.id)
 }
 
 fn wrapper_alive(row: &store::Row) -> Result<bool> {

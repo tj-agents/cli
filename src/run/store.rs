@@ -6,6 +6,7 @@ use serde_json::Value;
 
 use super::{Launch, hidden};
 use crate::host::Host;
+use crate::paths;
 
 pub(crate) fn call(arguments: &[&str]) -> Result<Value> {
     let output =
@@ -179,8 +180,27 @@ pub fn bound_session(launch_id: &str) -> Result<Option<String>> {
 #[derive(Debug, PartialEq, Eq)]
 pub struct Ownership {
     pub session: String,
-    pub paths: Vec<PathBuf>,
+    pub claims: Vec<Claim>,
     pub location: Option<PathBuf>,
+    pub item: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Claim {
+    pub launch_id: String,
+    pub path: PathBuf,
+}
+
+fn item(row: &Value) -> Result<Option<String>> {
+    let value = row.get("item").context("agent-store launch is missing its item field")?;
+    if value.is_null() {
+        return Ok(None);
+    }
+    let reference = text(value, "ref")?;
+    if reference.trim().is_empty() {
+        bail!("agent-store item has no canonical reference");
+    }
+    Ok(Some(reference.to_owned()))
 }
 
 pub fn ownership(launch: &Launch) -> Result<Ownership> {
@@ -198,33 +218,80 @@ pub fn ownership(launch: &Launch) -> Result<Ownership> {
     {
         bail!("session is not bound to {} launch {}", launch.host.name(), launch.id);
     }
-    let data = call(&["worktrees", "--session", &handle, "--launch-id", &launch.id])?;
+    let claims = claims(&handle, &launch.id)?;
+    let location = session["worktree"].as_str().map(PathBuf::from);
+    if location.as_ref().is_some_and(|path| !path.is_absolute()) {
+        bail!("bound session worktree is not absolute");
+    }
+    Ok(Ownership { session: handle, claims, location, item: item(&data["launch"])? })
+}
+
+pub fn claims(session: &str, launch_id: &str) -> Result<Vec<Claim>> {
+    let data = call(&["worktrees", "--session", session, "--launch-id", launch_id])?;
     let rows = data["worktrees"].as_array().context("agent-store worktrees returned no list")?;
-    let mut paths = Vec::new();
+    let mut claims: Vec<Claim> = Vec::new();
     for row in rows {
         let path = PathBuf::from(row["path"].as_str().context("owned worktree has no path")?);
         if !path.is_absolute() {
             bail!("owned worktree is not absolute: {}", path.display());
         }
-        if row["session"].as_str() != Some(handle.as_str())
-            || row["launch_id"].as_str() != Some(launch.id.as_str())
-            || paths.contains(&path)
+        if row["session"].as_str() != Some(session)
+            || row["launch_id"].as_str() != Some(launch_id)
+            || claims
+                .iter()
+                .any(|claim| paths::norm(&claim.path.to_string_lossy()) == paths::norm(&path.to_string_lossy()))
         {
-            bail!("worktree ownership does not match launch {}", launch.id);
+            bail!("worktree ownership does not match launch {launch_id}");
         }
-        paths.push(path);
+        claims.push(Claim { launch_id: launch_id.to_owned(), path });
     }
-    paths.sort();
-    let location = session["worktree"].as_str().map(PathBuf::from);
-    if location.as_ref().is_some_and(|path| !path.is_absolute()) {
-        bail!("bound session worktree is not absolute");
-    }
-    Ok(Ownership { session: handle, paths, location })
+    claims.sort_by(|left, right| left.path.cmp(&right.path));
+    Ok(claims)
 }
 
-pub fn release(launch: &Launch, owner: &Ownership, path: &std::path::Path) -> Result<()> {
-    let path = path.to_string_lossy();
-    let data = call(&["release-worktree", "--session", &owner.session, "--launch-id", &launch.id, "--path", &path])?;
+pub fn require_managed_claims(session: &str) -> Result<()> {
+    // Omitting --launch-id selects NULL ownership, not the session's current launch.
+    let data = call(&["worktrees", "--session", session])?;
+    let rows = data["worktrees"].as_array().context("agent-store worktrees returned no list")?;
+    if !rows.is_empty() {
+        bail!("native session has unmanaged worktree claims; recovery/adoption required");
+    }
+    Ok(())
+}
+
+/// Historical launch rows retain their binding when this native session registers a new launch.
+pub fn predecessors(launch: &Launch, owner: &Ownership) -> Result<Vec<Row>> {
+    let Some(current_item) = owner.item.as_deref() else {
+        return Ok(Vec::new());
+    };
+    let data = call(&["launches"])?;
+    let rows = data["launches"].as_array().context("agent-store launches returned no list")?;
+    let mut predecessors: Vec<Row> = Vec::new();
+    for value in rows {
+        if value["launch_id"].as_str() == Some(launch.id.as_str())
+            || value["session"].as_str() != Some(owner.session.as_str())
+        {
+            continue;
+        }
+        if value["host"].as_str() != Some(launch.host.name()) {
+            bail!("historical launch host does not match its session");
+        }
+        if item(value)?.as_deref() != Some(current_item) {
+            continue;
+        }
+        let predecessor = row(value).context("historical launch identity is incomplete")?;
+        if predecessor.launch.id.is_empty() || predecessors.iter().any(|old| old.launch.id == predecessor.launch.id) {
+            bail!("historical launch identity is ambiguous");
+        }
+        predecessors.push(predecessor);
+    }
+    Ok(predecessors)
+}
+
+pub fn release(owner: &Ownership, claim: &Claim) -> Result<()> {
+    let path = claim.path.to_string_lossy();
+    let data =
+        call(&["release-worktree", "--session", &owner.session, "--launch-id", &claim.launch_id, "--path", &path])?;
     if data["released"] != Value::Bool(true) {
         bail!("worktree ownership was not released: {path}");
     }
@@ -346,5 +413,15 @@ mod tests {
             exact_binding(&data, &launch(), "codex:123e4567-e89b-12d3-a456-426614174000", 4, "2026-11-11T00:00:00Z")
                 .is_err()
         );
+    }
+
+    #[test]
+    fn canonical_item_distinguishes_unlinked_launches_from_missing_metadata() {
+        assert_eq!(super::item(&json!({"item": null})).unwrap(), None);
+        let reference = "github:github.com/acme/app:1";
+        assert_eq!(super::item(&json!({"item": {"ref": reference}})).unwrap(), Some(reference.to_owned()));
+        for row in [json!({}), json!({"item": {}}), json!({"item": {"ref": " "}})] {
+            assert!(super::item(&row).is_err(), "unknown work item must not be treated as unlinked: {row}");
+        }
     }
 }
