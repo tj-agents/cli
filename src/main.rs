@@ -1,5 +1,4 @@
 mod app_server;
-mod bridge;
 mod cr;
 mod external;
 mod f;
@@ -46,13 +45,10 @@ enum Command {
     Launch,
     /// Close out a work item's sessions, or sweep launches whose tab is gone
     Closeout(run::closeout::Args),
-    /// Message another session by its tab title: a Claude session's native inbox, or a Codex session's feed
+    /// Post to another session's feed without submitting a prompt
     Message(message::Args),
-    /// Read this Codex session's unread feed messages, optionally waiting for the next one
+    /// Read this session's unread feed messages, optionally waiting for the next one
     Feed(feed::Args),
-    /// Relays `tj message` and `tj run`'s close-out notice into this Claude session until it exits (run by the async `SessionStart` hook)
-    #[command(hide = true)]
-    Bridge,
     /// Draws cr's preview pane (run by fzf, not by hand)
     #[command(hide = true)]
     CrPreview(cr::PreviewArgs),
@@ -75,7 +71,6 @@ fn main() -> ExitCode {
         Command::Closeout(args) => run::closeout::run(args),
         Command::Message(args) => message::run(&args),
         Command::Feed(args) => feed::run(&args),
-        Command::Bridge => bridge::run(),
         Command::CrPreview(args) => cr::preview(args),
         Command::External(arguments) => external::run(arguments),
     };

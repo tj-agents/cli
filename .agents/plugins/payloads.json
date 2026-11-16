@@ -9,11 +9,6 @@
       "plugin": "cli",
       "distribution": "tj-cli",
       "destination": ".agents/cli/runtime"
-    },
-    {
-      "plugin": "cli",
-      "source": ".claude/hooks/cli.json",
-      "destination": "hooks/claude.json"
     }
   ]
 }
