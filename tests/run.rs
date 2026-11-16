@@ -91,6 +91,7 @@ fn sandbox() -> Sandbox {
     )
     .unwrap();
     set_store_list(&stubs, "sessions", serde_json::json!([]));
+    set_store_list(&stubs, "launches", serde_json::json!([]));
     stub(&stubs, "tj-item", r#"{"prs":[],"all_merged":false}"#);
     stub(&stubs, "tj-prepare", "prepared");
     stub(&stubs, "codex", "unexpected prompt delivery");
@@ -1629,6 +1630,299 @@ fn closes_out_all_owned_worktrees_across_repositories() {
     }
 }
 
+fn predecessor(sandbox: &Sandbox, launch: &str, host: &str) -> serde_json::Value {
+    serde_json::json!({
+        "launch_id": launch, "host": host, "title": "Previous tab", "cwd": sandbox.primary,
+        "worktree": sandbox.primary, "session": format!("{host}:sess-1"),
+        "item": {"ref": ITEM}, "state": "active", "open": false,
+        "wrapper": {"pid": 0, "started_at": "2026-01-01T00:00:00Z"}
+    })
+}
+
+fn recovered_arguments(sandbox: &Sandbox, launch: &str, host: &str) -> Vec<String> {
+    let keys = cfg!(windows) && host == "codex";
+    let mut arguments = run_arguments(sandbox, launch, host, if keys { "keys" } else { "signal" }, "2");
+    let cwd = arguments.iter().position(|arg| arg == "--cwd").unwrap() + 1;
+    arguments[cwd] = sandbox.primary.to_string_lossy().into_owned();
+    set_reply(
+        sandbox,
+        "agent-store-show.json",
+        &serde_json::json!({
+            "ok": true, "data": {
+                "launch": {"item": {"ref": ITEM}}, "session": {"worktree": sandbox.primary}
+            }
+        })
+        .to_string(),
+    );
+    arguments
+}
+
+#[test]
+fn recovered_done_from_primary_removes_predecessor_claims_with_original_identity() {
+    for host in ["claude", "codex"] {
+        let sandbox = sandbox();
+        let launch = format!("recovered-{host}");
+        let old = format!("previous-{host}");
+        let arguments = recovered_arguments(&sandbox, &launch, host);
+        let mut rows = vec![predecessor(&sandbox, &old, host)];
+        // Store's canonical goal, including None, controls history rather than the CLI item spelling.
+        let item = if host == "claude" {
+            serde_json::Value::Null
+        } else {
+            serde_json::json!({"ref": "github:github.com/acme/app:42"})
+        };
+        set_reply(
+            &sandbox,
+            "agent-store-show.json",
+            &serde_json::json!({"ok": true, "data": {"launch": {"item": item}, "session": {}}}).to_string(),
+        );
+        rows[0]["item"] = item;
+        rows[0]["state"] = serde_json::json!("ended");
+        rows[0]["end_reason"] = serde_json::json!("closed");
+        let mut claims = vec![serde_json::json!({
+            "path": sandbox.worktree.canonicalize().unwrap(), "session": format!("{host}:sess-1"), "launch_id": old
+        })];
+        let mut retained = Vec::new();
+        for (id, session, item) in [("foreign", "codex:foreign", ITEM), ("other-item", "claude:sess-1", ITEM)] {
+            let path = sandbox.root.join(id);
+            git(&sandbox.primary, &["worktree", "add", "-q", path.to_str().unwrap(), "-b", id]);
+            let mut row = predecessor(&sandbox, id, host);
+            // The other-item row shares this native session in both host modes.
+            let session = if id == "other-item" { format!("{host}:sess-1") } else { session.to_owned() };
+            row["session"] = serde_json::json!(session);
+            row["item"]["ref"] = serde_json::json!(item);
+            rows.push(row);
+            claims.push(serde_json::json!({"path": path.canonicalize().unwrap(), "session": session, "launch_id": id}));
+            retained.push(path);
+        }
+        let current = sandbox.root.join("current");
+        if host == "codex" {
+            git(&sandbox.primary, &["worktree", "add", "-q", current.to_str().unwrap(), "-b", "current"]);
+            claims.push(serde_json::json!({"path": current.canonicalize().unwrap(), "session": format!("{host}:sess-1"), "launch_id": launch}));
+        }
+        set_store_list(&sandbox.stubs, "launches", serde_json::json!(rows));
+        set_store_list(&sandbox.stubs, "worktrees", serde_json::json!(claims));
+        let child = spawn(&sandbox, &arguments, &sandbox.root);
+        wait_for_log(&sandbox, if cfg!(windows) && host == "codex" { "raw" } else { "agent " });
+        done(&sandbox);
+        let output = finish(child, Duration::from_secs(120));
+        assert_closed_out(&sandbox, &output, &launch);
+        assert!(git(&sandbox.primary, &["branch", "--list", "Feature/1"]).is_empty());
+        assert!(retained.iter().all(|path| path.exists()));
+        assert!(!current.exists());
+        let store = log(&sandbox, "stubs/agent-store.log");
+        assert!(
+            store.contains(&format!("release-worktree --session {host}:sess-1 --launch-id {old} --path ")),
+            "{store}"
+        );
+        assert!(!store.contains("--launch-id foreign --path"), "{store}");
+        assert!(!store.contains("--launch-id other-item --path"), "{store}");
+        assert_eq!(store.matches("release-worktree ").count(), if host == "codex" { 2 } else { 1 });
+    }
+}
+
+#[test]
+fn recovered_preflight_refuses_live_unknown_unmanaged_and_unsafe_historical_claims() {
+    let sandbox = sandbox();
+    let launch = "recovered-refusals";
+    let arguments = recovered_arguments(&sandbox, launch, "claude");
+    let old = predecessor(&sandbox, "previous", "claude");
+    let claim = serde_json::json!({"path": sandbox.worktree.canonicalize().unwrap(), "session": "claude:sess-1", "launch_id": "previous"});
+    set_store_list(&sandbox.stubs, "worktrees", serde_json::json!([claim]));
+    let mut live = old.clone();
+    let pid = std::process::id();
+    let started: chrono::DateTime<chrono::Utc> = tj_cli::process::agent::started_at(pid).unwrap().unwrap().into();
+    live["wrapper"] = serde_json::json!({"pid": pid, "started_at": started.to_rfc3339()});
+    set_store_list(&sandbox.stubs, "launches", serde_json::json!([live]));
+    let mut child = spawn(&sandbox, &arguments, &sandbox.root);
+    wait_for_log(&sandbox, "agent ");
+    refused(&sandbox, &mut child, launch);
+
+    let mut unknown = old.clone();
+    unknown["wrapper"]["started_at"] = serde_json::json!("invalid");
+    set_store_list(&sandbox.stubs, "launches", serde_json::json!([unknown]));
+    refused(&sandbox, &mut child, launch);
+    let mut incomplete = old.clone();
+    incomplete["wrapper"] = serde_json::Value::Null;
+    set_store_list(&sandbox.stubs, "launches", serde_json::json!([incomplete]));
+    refused(&sandbox, &mut child, launch);
+    set_store_list(&sandbox.stubs, "launches", serde_json::json!([old]));
+
+    let mut unmanaged = claim.clone();
+    unmanaged["launch_id"] = serde_json::Value::Null;
+    set_store_list(&sandbox.stubs, "worktrees", serde_json::json!([claim, unmanaged]));
+    refused(&sandbox, &mut child, launch);
+    let mut duplicate = claim.clone();
+    duplicate["launch_id"] = serde_json::json!(launch);
+    let path = sandbox.worktree.canonicalize().unwrap().to_string_lossy().into_owned();
+    duplicate["path"] = serde_json::json!(if cfg!(windows) { path.to_lowercase() } else { format!("{path}/") });
+    set_store_list(&sandbox.stubs, "worktrees", serde_json::json!([claim, duplicate]));
+    refused(&sandbox, &mut child, launch);
+
+    let mut primary = claim.clone();
+    primary["path"] = serde_json::json!(sandbox.primary.canonicalize().unwrap());
+    set_store_list(&sandbox.stubs, "worktrees", serde_json::json!([primary]));
+    refused(&sandbox, &mut child, launch);
+    set_store_list(&sandbox.stubs, "worktrees", serde_json::json!([claim]));
+    std::fs::write(sandbox.worktree.join("unfinished.txt"), "only copy").unwrap();
+    refused(&sandbox, &mut child, launch);
+    assert_eq!(std::fs::read_to_string(sandbox.worktree.join("unfinished.txt")).unwrap(), "only copy");
+    git(&sandbox.worktree, &["add", "."]);
+    git(&sandbox.worktree, &["commit", "-q", "-m", "unfinished"]);
+    refused(&sandbox, &mut child, launch);
+    assert_unfinished(&sandbox, launch);
+    git(&sandbox.primary, &["merge", "--squash", "Feature/1"]);
+    git(&sandbox.primary, &["commit", "-q", "-m", "delivered"]);
+    git(&sandbox.primary, &["push", "-q", "origin", "main"]);
+    done(&sandbox);
+    let output = finish(child, Duration::from_secs(120));
+    assert_closed_out(&sandbox, &output, launch);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    for reason in [
+        "historical launch wrapper is still alive",
+        "invalid wrapper creation time",
+        "historical launch identity is incomplete",
+        "unmanaged worktree claims; recovery/adoption required",
+        "duplicate worktree ownership",
+        "primary checkout",
+        "uncommitted changes",
+        "unmerged commits",
+    ] {
+        assert!(stderr.contains(reason), "missing {reason}: {stderr}");
+    }
+}
+
+#[test]
+fn recovered_journal_retries_partial_multi_launch_releases_under_original_owners() {
+    let sandbox = sandbox();
+    let launch = "recovered-journal";
+    let arguments = recovered_arguments(&sandbox, launch, "claude");
+    let mut old = predecessor(&sandbox, "previous", "claude");
+    old["state"] = serde_json::json!("ended");
+    old["end_reason"] = serde_json::json!("closed");
+    set_store_list(&sandbox.stubs, "launches", serde_json::json!([old]));
+    let current = sandbox.root.join("a-current");
+    git(&sandbox.primary, &["worktree", "add", "-q", current.to_str().unwrap(), "-b", "current"]);
+    set_store_list(
+        &sandbox.stubs,
+        "worktrees",
+        serde_json::json!([
+            {"path": current.canonicalize().unwrap(), "session": "claude:sess-1", "launch_id": launch},
+            {"path": sandbox.worktree.canonicalize().unwrap(), "session": "claude:sess-1", "launch_id": "previous"}
+        ]),
+    );
+    let failure = "agent-store-release-worktree-previous.json";
+    set_reply(&sandbox, failure, r#"{"ok":false,"error":{"message":"historical release failed"}}"#);
+    let child = spawn(&sandbox, &arguments, &sandbox.root);
+    wait_for_log(&sandbox, "agent ");
+    done(&sandbox);
+    let output = finish(child, Duration::from_secs(120));
+    assert_eq!(output.status.code(), Some(1), "{}", String::from_utf8_lossy(&output.stderr));
+    assert!(!sandbox.worktree.exists() && !current.exists());
+    assert!(!log(&sandbox, "stubs/tj-item.log").contains("--state Done"));
+    assert!(!log(&sandbox, "stubs/agent-store.log").contains("--reason closed"));
+    let journal = sandbox.root.join("cache/run/recovered-journal.closeout.json");
+    let saved: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&journal).unwrap()).unwrap();
+    assert_eq!(saved["schema"], 1);
+    assert_eq!(saved["removals"].as_array().unwrap().len(), 2);
+    std::fs::remove_file(sandbox.stubs.join(failure)).unwrap();
+    let mut current_row = predecessor(&sandbox, launch, "claude");
+    current_row["state"] = serde_json::json!("closing");
+    set_store_list(&sandbox.stubs, "launches", serde_json::json!([old, current_row]));
+    let output = sweep_closeout(&sandbox);
+    assert_closed_out(&sandbox, &output, launch);
+    assert!(!journal.exists());
+    let store = log(&sandbox, "stubs/agent-store.log");
+    assert_eq!(
+        store.matches(&format!("release-worktree --session claude:sess-1 --launch-id {launch} --path ")).count(),
+        1
+    );
+    assert_eq!(store.matches("release-worktree --session claude:sess-1 --launch-id previous --path ").count(), 2);
+}
+
+#[test]
+fn recovered_predecessor_journal_survives_another_recovery_and_retires_consumed_proof() {
+    let sandbox = sandbox();
+    let _arguments = recovered_arguments(&sandbox, "recovered-proof", "claude");
+    claim(&sandbox, "previous", "claude", std::slice::from_ref(&sandbox.worktree));
+    let journal_dir = sandbox.root.join("cache/run");
+    std::fs::create_dir_all(&journal_dir).unwrap();
+    let previous = journal_dir.join("previous.closeout.json");
+    let proof = serde_json::json!({
+        "schema": 1, "launch": "previous", "host": "claude", "session": "claude:sess-1",
+        "repository": sandbox.primary,
+        "removals": [{"primary": sandbox.primary,
+            "worktree": sandbox.worktree.canonicalize().unwrap(), "registration": sandbox.worktree.canonicalize().unwrap(),
+            "branch": "Feature/1", "head": git(&sandbox.worktree, &["rev-parse", "HEAD"]), "default": "main"}]
+    });
+    std::fs::write(&previous, proof.to_string()).unwrap();
+    git(&sandbox.primary, &["worktree", "remove", sandbox.worktree.to_str().unwrap()]);
+    git(&sandbox.primary, &["branch", "-d", "Feature/1"]);
+    let mut old = predecessor(&sandbox, "previous", "claude");
+    old["state"] = serde_json::json!("ended");
+    old["end_reason"] = serde_json::json!("closed");
+    let mut current = predecessor(&sandbox, "recovered-proof", "claude");
+    current["state"] = serde_json::json!("closing");
+    set_store_list(&sandbox.stubs, "launches", serde_json::json!([old, current]));
+    for (field, value) in [
+        ("session", serde_json::json!("claude:foreign")),
+        ("launch", serde_json::json!("foreign")),
+        ("host", serde_json::json!("codex")),
+    ] {
+        let mut foreign = proof.clone();
+        foreign[field] = value;
+        std::fs::write(&previous, foreign.to_string()).unwrap();
+        let refused = sweep_closeout(&sandbox);
+        assert_eq!(refused.status.code(), Some(1));
+        assert!(String::from_utf8_lossy(&refused.stdout).contains("cleanup journal"));
+        assert!(previous.exists());
+        assert!(!log(&sandbox, "stubs/agent-store.log").contains("release-worktree"));
+        assert!(!log(&sandbox, "stubs/tj-item.log").contains("--state Done"));
+    }
+    std::fs::write(&previous, proof.to_string()).unwrap();
+    let mut other_item = old.clone();
+    other_item["item"]["ref"] = serde_json::json!("github:github.com/acme/app:2");
+    set_store_list(&sandbox.stubs, "launches", serde_json::json!([other_item, current]));
+    let retained = sweep_closeout(&sandbox);
+    assert!(retained.status.success(), "{}", String::from_utf8_lossy(&retained.stdout));
+    assert!(previous.exists());
+    assert!(!log(&sandbox, "stubs/agent-store.log").contains("release-worktree"));
+    // Resume the original canonical goal; the other goal's proof was never consumed.
+    set_store_list(&sandbox.stubs, "launches", serde_json::json!([old, current]));
+    let failure = "agent-store-release-worktree-previous.json";
+    set_reply(&sandbox, failure, r#"{"ok":false,"error":{"message":"interrupted release"}}"#);
+    let interrupted = sweep_closeout(&sandbox);
+    assert_eq!(interrupted.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&interrupted.stdout).contains("interrupted release"));
+    assert!(!previous.exists());
+    let recovered = journal_dir.join("recovered-proof.closeout.json");
+    assert!(recovered.exists());
+    std::fs::remove_file(sandbox.stubs.join(failure)).unwrap();
+    set_reply(
+        &sandbox,
+        "agent-store-show.json",
+        &serde_json::json!({"ok":true,"data": {
+            "launch": {"launch_id": "recovered-again"}, "session": {"launch_id": "recovered-again"}
+        }})
+        .to_string(),
+    );
+    current["state"] = serde_json::json!("ended");
+    current["end_reason"] = serde_json::json!("closed");
+    let mut next = predecessor(&sandbox, "recovered-again", "claude");
+    next["state"] = serde_json::json!("closing");
+    set_store_list(&sandbox.stubs, "launches", serde_json::json!([old, current, next]));
+    let finished = sweep_closeout(&sandbox);
+    assert!(finished.status.success(), "{}", String::from_utf8_lossy(&finished.stdout));
+    assert!(!previous.exists() && !recovered.exists() && !journal_dir.join("recovered-again.closeout.json").exists());
+    let store = log(&sandbox, "stubs/agent-store.log");
+    assert_eq!(store.matches("release-worktree --session claude:sess-1 --launch-id previous --path ").count(), 2);
+    assert!(store.contains("end --launch-id recovered-again --reason closed"));
+    git(&sandbox.primary, &["worktree", "add", "-q", sandbox.worktree.to_str().unwrap(), "-b", "Feature/1"]);
+    let reused = sweep_closeout(&sandbox);
+    assert!(reused.status.success(), "{}", String::from_utf8_lossy(&reused.stdout));
+    assert!(sandbox.worktree.exists());
+}
+
 #[test]
 fn one_dirty_owned_worktree_keeps_every_worktree_and_the_agent_open() {
     let sandbox = sandbox();
@@ -1705,6 +1999,10 @@ fn retry_closeout(sandbox: &Sandbox, launch: &str) -> Output {
             "wrapper": {"pid": 0, "started_at": "2026-01-01T00:00:00Z"}
         }]),
     );
+    sweep_closeout(sandbox)
+}
+
+fn sweep_closeout(sandbox: &Sandbox) -> Output {
     Command::new(env!("CARGO_BIN_EXE_tj"))
         .arg("closeout")
         .envs(environment(sandbox))

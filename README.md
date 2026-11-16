@@ -260,9 +260,14 @@ a child session or a merge remains unfinished. Work with no item or PR finishes 
 An agent that is unsure carries on and the tab stays open. A refused check withdraws `tj done` and prints
 the reason; the agent runs it again once the reason is fixed.
 
-Before stopping anything, it checks every linked worktree recorded for the exact launch and native session, including roots created after launch and in other repositories. Each root must be registered, clean and integrated into its freshly fetched default branch; a merged item PR alone cannot authorize deletion. Worktrunk supplies the content checks for squash and rebase merges. Another session with live or unknown process ownership keeps the worktree open.
+Before stopping anything, it checks every linked worktree claimed by the exact native session for the
+current launch or earlier launches of the same work item, including roots in other repositories. Earlier
+wrappers must be provably stopped. Each root must be registered, clean and integrated into its freshly
+fetched default branch; a merged item PR alone cannot authorize deletion. Worktrunk supplies the content
+checks for squash and rebase merges. Live or unknown process ownership keeps the worktree open, and
+unmanaged claims require recovery or adoption before closeout.
 
-After stopping its own agent process tree, the wrapper repeats those checks and refuses changed ownership or content. Each worktree and branch must disappear before its ownership record is released. The item becomes Done and the launch closes only after all owned roots are removed. Primary checkouts remain. A missing or unrecorded ownership root requires recovery; cleanup never guesses ownership from a neighbouring folder or adopts legacy location metadata.
+After stopping its own agent process tree, the wrapper repeats those checks and refuses changed ownership or content. Each worktree and branch must disappear before its ownership record is released under its original launch. Cleanup journals preserve unfinished removals across repeated recoveries. The item becomes Done and the launch closes only after all of those roots are removed. Primary checkouts remain. A missing or unrecorded ownership root requires recovery; cleanup never guesses ownership from a neighbouring folder or adopts legacy location metadata.
 
 1. asks the agent to exit: a console break or SIGINT for Claude, a Ctrl+C keypress for Codex (through
    `tmux send-keys` on Linux);
