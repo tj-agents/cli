@@ -237,6 +237,10 @@ session `agent-store show --launch-id` binds to the launch; with none bound the 
 wrapper says so once. A resume that exits with an error leaves the tab open with the reason. Codex exposes no
 turn state to the update check, so a Codex tab takes an updated `tj` at its next start.
 
+To let already-running wrappers hand over safely, a successor accepts and ignores their retired
+`--ask-idle-seconds` argument. This upgrade exception requires `--successor`; fresh launches reject the
+argument, and new wrappers never forward it. It does not enable idle messages.
+
 It closes out only when one of these happens:
 
 - `tj done` was run, the turn that ran it ended, and the agent has stayed idle for about 10 minutes since with no
