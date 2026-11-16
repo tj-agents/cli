@@ -88,9 +88,11 @@ def _link(path: Path) -> bool:
 
 
 def pending(bin_dir: Path) -> str | None:
-    previous = _root(bin_dir).parent / ".previous"
-    if previous.exists() or _link(previous):
-        return f"interrupted PowerShell installation: {previous}"
+    root = _root(bin_dir)
+    previous = root.parent / ".previous"
+    for path in (previous, _cleanup_receipt(previous), _cleanup_receipt(root)):
+        if path.exists() or _link(path):
+            return f"interrupted PowerShell installation: {path}"
     return _current_pending(bin_dir)
 
 
@@ -155,8 +157,8 @@ def _extract(data: bytes, name: str, destination: Path) -> None:
             archive.extractall(destination, filter="data")
 
 
-def _assert_owned(root: Path) -> None:
-    receipt = tool_receipts.read(root / RECEIPT)
+def _assert_owned(root: Path, receipt_path: Path | None = None) -> None:
+    receipt = tool_receipts.read(receipt_path or root / RECEIPT)
     if receipt is None or any(not _safe_name(name) for name in receipt.hashes):
         raise PowerShellInstallError(
             f"Refusing to replace an unowned PowerShell directory: {root}"
@@ -215,6 +217,21 @@ def _locked(parent: Path) -> Iterator[None]:
                 fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
 
 
+def _cleanup_receipt(root: Path) -> Path:
+    return root.parent / f"{root.name}.cleanup-receipt"
+
+
+def _clear_marker(marker: Path) -> None:
+    if _link(marker):
+        raise PowerShellInstallError(f"Unsafe PowerShell cleanup receipt: {marker}")
+    if marker.exists():
+        if tool_receipts.read(marker) is None:
+            raise PowerShellInstallError(
+                f"Invalid PowerShell cleanup receipt: {marker}"
+            )
+        marker.unlink()
+
+
 def _remove_previous(previous: Path, parent: Path) -> None:
     if (
         _link(previous)
@@ -224,25 +241,55 @@ def _remove_previous(previous: Path, parent: Path) -> None:
         raise PowerShellInstallError(
             f"Unsafe previous PowerShell directory: {previous}"
         )
-    _assert_owned(previous)
+    marker = _cleanup_receipt(previous)
+    if _link(marker):
+        raise PowerShellInstallError(f"Unsafe PowerShell cleanup receipt: {marker}")
+    if not marker.exists():
+        _assert_owned(previous)
+        receipt = tool_receipts.read(previous / RECEIPT)
+        if receipt is None:
+            raise PowerShellInstallError(
+                f"Missing PowerShell ownership receipt: {previous}"
+            )
+        tool_receipts.write(marker, receipt)
+    _assert_owned(previous, marker)
     shutil.rmtree(previous)
+    marker.unlink()
 
 
 def _recover(bin_dir: Path, root: Path) -> None:
     previous = root.parent / ".previous"
+    previous_marker = _cleanup_receipt(previous)
+    root_marker = _cleanup_receipt(root)
+    if _link(previous_marker) or _link(root_marker):
+        raise PowerShellInstallError("Unsafe PowerShell cleanup receipt")
     if _link(previous):
         raise PowerShellInstallError(
             f"Unsafe previous PowerShell directory: {previous}"
         )
     if not previous.exists():
+        if previous_marker.exists() or root_marker.exists():
+            if _current_pending(bin_dir) is not None:
+                raise PowerShellInstallError(
+                    "Cannot finish interrupted PowerShell cleanup "
+                    "without a healthy runtime"
+                )
+            _clear_marker(previous_marker)
+            _clear_marker(root_marker)
         return
-    _assert_owned(previous)
+    _assert_owned(previous, previous_marker if previous_marker.exists() else None)
     if root.exists():
         if _current_pending(bin_dir) is None:
             _remove_previous(previous, root.parent)
+            _clear_marker(root_marker)
             return
         _remove_previous(root, root.parent)
+    if previous_marker.exists():
+        raise PowerShellInstallError(
+            "Cannot restore a partially removed PowerShell runtime"
+        )
     previous.rename(root)
+    _clear_marker(root_marker)
 
 
 def ensure(bin_dir: Path) -> Path:

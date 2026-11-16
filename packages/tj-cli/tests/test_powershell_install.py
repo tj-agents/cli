@@ -213,6 +213,47 @@ def test_recovers_previous_runtime_if_replacement_is_incomplete(
     assert powershell_install.pending(tmp_path) is None
 
 
+def test_recovers_cleanup_after_previous_receipt_was_removed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(host_os, "system", lambda: "Windows")
+    monkeypatch.setattr(host_os, "machine", lambda: "AMD64")
+    content = io.BytesIO()
+    with zipfile.ZipFile(content, "w") as archive:
+        archive.writestr("pwsh.exe", b"binary")
+        archive.writestr("lib/data", b"library")
+    data = content.getvalue()
+    monkeypatch.setitem(
+        powershell_install.ASSETS,
+        ("Windows", "x64"),
+        ("test.zip", hashlib.sha256(data).hexdigest()),
+    )
+    monkeypatch.setattr(
+        urllib.request, "urlopen", lambda url, timeout: io.BytesIO(data)
+    )
+    binary = powershell_install.ensure(tmp_path)
+    previous = binary.parent.parent / ".previous"
+    shutil.copytree(binary.parent, previous)
+    remove_tree = shutil.rmtree
+
+    def interrupted(path: Path, *args: object, **kwargs: object) -> None:
+        if Path(path) == previous:
+            (previous / powershell_install.RECEIPT).unlink()
+            (previous / "lib" / "data").unlink()
+            raise OSError("simulated crash during cleanup")
+        remove_tree(path)
+
+    monkeypatch.setattr(shutil, "rmtree", interrupted)
+    with pytest.raises(OSError, match="simulated crash"):
+        powershell_install.ensure(tmp_path)
+    monkeypatch.setattr(shutil, "rmtree", remove_tree)
+    assert powershell_install.pending(tmp_path) is not None
+    assert powershell_install.ensure(tmp_path) == binary
+    assert binary.read_bytes() == b"binary"
+    assert not previous.exists()
+    assert powershell_install.pending(tmp_path) is None
+
+
 def test_rejects_archive_traversal(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
