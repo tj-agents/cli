@@ -192,10 +192,11 @@ pub struct Claim {
 }
 
 fn item(row: &Value) -> Result<Option<String>> {
-    if row["item"].is_null() {
+    let value = row.get("item").context("agent-store launch is missing its item field")?;
+    if value.is_null() {
         return Ok(None);
     }
-    let reference = text(&row["item"], "ref")?;
+    let reference = text(value, "ref")?;
     if reference.trim().is_empty() {
         bail!("agent-store item has no canonical reference");
     }
@@ -409,5 +410,15 @@ mod tests {
             exact_binding(&data, &launch(), "codex:123e4567-e89b-12d3-a456-426614174000", 4, "2026-11-11T00:00:00Z")
                 .is_err()
         );
+    }
+
+    #[test]
+    fn canonical_item_distinguishes_unlinked_launches_from_missing_metadata() {
+        assert_eq!(super::item(&json!({"item": null})).unwrap(), None);
+        let reference = "github:github.com/acme/app:1";
+        assert_eq!(super::item(&json!({"item": {"ref": reference}})).unwrap(), Some(reference.to_owned()));
+        for row in [json!({}), json!({"item": {}}), json!({"item": {"ref": " "}})] {
+            assert!(super::item(&row).is_err(), "unknown work item must not be treated as unlinked: {row}");
+        }
     }
 }

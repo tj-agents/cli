@@ -380,7 +380,7 @@ fn bind(sandbox: &Sandbox, launch: &str, host: &str, closing: bool) {
     let show = sandbox.stubs.join("agent-store-show.json");
     let mut value = serde_json::json!({
         "ok": true, "data": {
-            "launch": {"launch_id": launch, "host": host, "session": format!("{host}:sess-1"), "state": "active"},
+            "launch": {"launch_id": launch, "host": host, "session": format!("{host}:sess-1"), "state": "active", "item": null},
             "session": {"session": format!("{host}:sess-1"), "native_id": "sess-1", "host": host,
                 "launch_id": launch, "worktree": sandbox.worktree, "state": "active"}
         }
@@ -1746,6 +1746,10 @@ fn recovered_preflight_refuses_live_unknown_unmanaged_and_unsafe_historical_clai
     incomplete["wrapper"] = serde_json::Value::Null;
     set_store_list(&sandbox.stubs, "launches", serde_json::json!([incomplete]));
     refused(&sandbox, &mut child, launch);
+    let mut missing_item = old.clone();
+    missing_item.as_object_mut().unwrap().remove("item");
+    set_store_list(&sandbox.stubs, "launches", serde_json::json!([missing_item]));
+    refused(&sandbox, &mut child, launch);
     set_store_list(&sandbox.stubs, "launches", serde_json::json!([old]));
 
     let mut unmanaged = claim.clone();
@@ -1782,6 +1786,7 @@ fn recovered_preflight_refuses_live_unknown_unmanaged_and_unsafe_historical_clai
         "historical launch wrapper is still alive",
         "invalid wrapper creation time",
         "historical launch identity is incomplete",
+        "agent-store launch is missing its item field",
         "unmanaged worktree claims; recovery/adoption required",
         "duplicate worktree ownership",
         "primary checkout",

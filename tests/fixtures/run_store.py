@@ -44,6 +44,9 @@ def prebound_reply(
             "host": value(arguments, "--host"),
             "title": value(arguments, "--title"),
             "cwd": value(arguments, "--cwd"),
+            "item": {"ref": value(arguments, "--item")}
+            if "--item" in arguments
+            else None,
             "wrapper": {
                 "pid": int(value(arguments, "--wrapper-pid")),
                 "started_at": value(arguments, "--wrapper-started-at"),
