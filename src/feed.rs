@@ -1,5 +1,5 @@
-//! A Codex session's feed: what other sessions post for it with `tj message`, since Codex has no native
-//! messaging. Nothing reaches the session's conversation until it runs `tj feed` itself.
+//! Session messages stay outside the conversation until the recipient reads its feed. A requested
+//! `tj feed --wait` can return a result through the host's native background tool completion.
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use serde_json::Value;
 
 use crate::{host::Host, paths};
@@ -49,6 +49,10 @@ pub(crate) enum PostError {
     Folder(#[source] io::Error),
     #[error("could not append to {}", .0.display())]
     Append(PathBuf, #[source] io::Error),
+    #[error("could not lock {}", .0.display())]
+    Lock(PathBuf, #[source] io::Error),
+    #[error("could not read {}", .0.display())]
+    Read(PathBuf, #[source] io::Error),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -81,9 +85,8 @@ impl Feed {
         Ok(Self { messages: folder.join(format!("{host}-{id}.jsonl")), read: folder.join(format!("{host}-{id}.read")) })
     }
 
-    /// Appends one message in a single write, so concurrent senders never interleave a line. On Unix the
-    /// folder and feed are readable only by you.
-    pub(crate) fn post(&self, message: &Value) -> Result<(), PostError> {
+    /// OS locks are released on process exit, including a crashed writer.
+    fn writer(&self) -> Result<File, PostError> {
         if let Some(folder) = self.messages.parent() {
             let mut builder = std::fs::DirBuilder::new();
             builder.recursive(true);
@@ -92,13 +95,58 @@ impl Feed {
             builder.create(folder).map_err(PostError::Folder)?;
         }
         let mut options = OpenOptions::new();
-        options.append(true).create(true);
+        options.read(true).append(true).create(true);
         #[cfg(unix)]
         std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
-        options
-            .open(&self.messages)
-            .and_then(|mut file| file.write_all(format!("{message}\n").as_bytes()))
-            .map_err(|error| PostError::Append(self.messages.clone(), error))
+        let mut file = options.open(&self.messages).map_err(|error| PostError::Append(self.messages.clone(), error))?;
+        fs2::FileExt::lock_exclusive(&file).map_err(|error| PostError::Lock(self.messages.clone(), error))?;
+        let mut recover = || -> io::Result<()> {
+            if file.metadata()?.len() > 0 {
+                file.seek(SeekFrom::End(-1))?;
+                let mut last = [0];
+                file.read_exact(&mut last)?;
+                if last[0] != b'\n' {
+                    file.write_all(b"\n")?;
+                    file.sync_data()?;
+                }
+            }
+            file.seek(SeekFrom::Start(0))?;
+            Ok(())
+        };
+        recover().map_err(|error| PostError::Append(self.messages.clone(), error))?;
+        Ok(file)
+    }
+
+    fn append(&self, file: &mut File, message: &Value) -> Result<(), PostError> {
+        let mut write = || -> io::Result<()> {
+            file.write_all(format!("{message}\n").as_bytes())?;
+            file.sync_data()
+        };
+        write().map_err(|error| PostError::Append(self.messages.clone(), error))
+    }
+
+    /// Every writer takes the same lock so event deduplication is atomic.
+    pub(crate) fn post(&self, message: &Value) -> Result<(), PostError> {
+        self.append(&mut self.writer()?, message)
+    }
+
+    /// One durable event per session, independent of launches, feed reads and later model turns.
+    /// Identity and content share one record so a crash cannot split delivery from its receipt.
+    pub(crate) fn post_once(&self, event: &Value, message: &Value) -> Result<bool, PostError> {
+        let mut file = self.writer()?;
+        let mut contents = Vec::new();
+        file.read_to_end(&mut contents).map_err(|error| PostError::Read(self.messages.clone(), error))?;
+        if String::from_utf8_lossy(&contents)
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .any(|line| line["event"] == *event)
+        {
+            return Ok(false);
+        }
+        let mut message = message.clone();
+        message["event"] = event.clone();
+        self.append(&mut file, &message)?;
+        Ok(true)
     }
 
     fn offset(&self) -> Result<u64, ReadError> {
@@ -120,6 +168,7 @@ impl Feed {
             }
             Err(error) => return Err(failed(error)),
         };
+        fs2::FileExt::lock_shared(&file).map_err(failed)?;
         let length = file.metadata().map_err(failed)?.len();
         let start = Some(self.offset()?).filter(|&start| start <= length).unwrap_or(0);
         let mut bytes = Vec::new();
@@ -152,16 +201,13 @@ fn show(message: &Value) {
             let name = message["name"].as_str().unwrap_or(from);
             println!("[{at}] {name} ({from}): {text}\n  reply: tj message {from} \"<text>\"");
         }
-        None => println!("[{at}] a terminal: {text}"),
+        None => println!("[{at}] {}: {text}", message["name"].as_str().unwrap_or("a terminal")),
     }
 }
 
 pub(crate) fn run(args: &Args) -> Result<ExitCode> {
-    let host = Host::current().context("tj feed reads the calling Codex session's own feed; run it from Codex")?;
-    if host == Host::Claude {
-        bail!("a Claude session receives tj message in its own inbox, so it has no feed; tj feed is for Codex");
-    }
-    let me = host.handle().context("tj feed needs CODEX_THREAD_ID to find this session's feed")?;
+    let host = Host::current().context("tj feed reads the calling session's own feed; run it from Claude or Codex")?;
+    let me = host.handle().context("tj feed needs the host's native session id to find this session's feed")?;
     let feed = Feed::new(&folder()?, &me)?;
     let deadline = Instant::now().checked_add(Duration::from_secs(args.timeout));
     loop {
@@ -186,5 +232,71 @@ pub(crate) fn run(args: &Args) -> Result<ExitCode> {
             return Ok(ExitCode::from(TIMED_OUT));
         }
         std::thread::sleep(POLL.min(left));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::Feed;
+
+    #[test]
+    fn an_event_stays_spent_after_reading_and_reopening_the_feed() {
+        let directory = tempfile::tempdir().unwrap();
+        let feed = Feed::new(directory.path(), "codex:session").unwrap();
+        let event = json!({"kind": "merged", "prs": ["one"]});
+        let message = json!({"text": "merged"});
+        assert!(feed.post_once(&event, &message).unwrap());
+        let unread = feed.unread().unwrap();
+        assert_eq!(unread.messages.len(), 1);
+        feed.mark(unread.end).unwrap();
+        let resumed = Feed::new(directory.path(), "codex:session").unwrap();
+        assert!(!resumed.post_once(&event, &message).unwrap());
+        assert!(resumed.unread().unwrap().messages.is_empty());
+        assert!(resumed.post_once(&json!({"kind": "merged", "prs": ["one", "two"]}), &message).unwrap());
+        assert_eq!(resumed.unread().unwrap().messages.len(), 1);
+    }
+
+    #[test]
+    fn simultaneous_writers_deliver_one_copy_of_an_event() {
+        let directory = tempfile::tempdir().unwrap();
+        let start = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let writers: Vec<_> = (0..8)
+            .map(|_| {
+                let start = start.clone();
+                let folder = directory.path().to_path_buf();
+                std::thread::spawn(move || {
+                    let feed = Feed::new(&folder, "claude:session").unwrap();
+                    start.wait();
+                    feed.post_once(&json!({"kind": "merged", "prs": ["one"]}), &json!({"text": "merged"})).unwrap()
+                })
+            })
+            .collect();
+        assert_eq!(writers.into_iter().map(|writer| writer.join().unwrap()).filter(|posted| *posted).count(), 1);
+        let feed = Feed::new(directory.path(), "claude:session").unwrap();
+        assert_eq!(feed.unread().unwrap().messages.len(), 1);
+    }
+
+    #[test]
+    fn a_crashed_write_with_a_complete_event_is_recovered_without_a_duplicate() {
+        let directory = tempfile::tempdir().unwrap();
+        let feed = Feed::new(directory.path(), "codex:session").unwrap();
+        let event = json!({"kind": "merged", "prs": ["one"]});
+        std::fs::write(&feed.messages, json!({"event": event, "text": "merged"}).to_string()).unwrap();
+        assert!(!feed.post_once(&event, &json!({"text": "merged"})).unwrap());
+        assert_eq!(feed.unread().unwrap().messages.len(), 1);
+    }
+
+    #[test]
+    fn a_torn_utf8_write_does_not_hide_later_messages() {
+        let directory = tempfile::tempdir().unwrap();
+        let feed = Feed::new(directory.path(), "codex:session").unwrap();
+        std::fs::write(&feed.messages, b"{\"text\":\"\xf0\x9f").unwrap();
+        assert!(feed.post_once(&json!({"kind": "merged"}), &json!({"text": "arrived"})).unwrap());
+        let unread = feed.unread().unwrap();
+        assert_eq!(unread.unreadable, 1);
+        assert_eq!(unread.messages.len(), 1);
+        assert_eq!(unread.messages[0]["text"], "arrived");
     }
 }

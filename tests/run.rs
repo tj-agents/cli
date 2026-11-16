@@ -93,7 +93,7 @@ fn sandbox() -> Sandbox {
     set_store_list(&stubs, "sessions", serde_json::json!([]));
     stub(&stubs, "tj-item", r#"{"prs":[],"all_merged":false}"#);
     stub(&stubs, "tj-prepare", "prepared");
-    stub(&stubs, "codex", "queued");
+    stub(&stubs, "codex", "unexpected prompt delivery");
     std::fs::copy(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/prepare.py"), stubs.join("prepare.py"))
         .unwrap();
     for folder in ["home", "cache"] {
@@ -125,6 +125,8 @@ fn environment(sandbox: &Sandbox) -> Vec<(&'static str, std::ffi::OsString)> {
         ("CODEX_HOME", sandbox.root.join("codex").into_os_string()),
         ("CODEX_THREAD_ID", std::ffi::OsString::new()),
         ("CODEX_SESSION_ID", std::ffi::OsString::new()),
+        ("CLAUDECODE", std::ffi::OsString::new()),
+        ("CLAUDE_CODE_SESSION_ID", std::ffi::OsString::new()),
         ("HOME", home.clone()),
         ("APPDATA", home.clone()),
         ("XDG_CONFIG_HOME", home),
@@ -321,21 +323,33 @@ fn wait_for_polls(sandbox: &Sandbox, file: &str, prefix: &str, count: usize) {
 
 /// Writes Claude's own status record for the running agent, as Claude Code does between turns.
 fn set_status(sandbox: &Sandbox, status: &str) {
+    set_status_at(sandbox, status, chrono::Utc::now());
+}
+
+fn set_status_at(sandbox: &Sandbox, status: &str, when: chrono::DateTime<chrono::Utc>) {
     let pid = log(sandbox, "dummy.log").lines().rev().find_map(|line| line.strip_prefix("pid ")).unwrap().to_owned();
     let sessions = sandbox.root.join("claude").join("sessions");
     std::fs::create_dir_all(&sessions).unwrap();
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis();
+    let now = when.timestamp_millis();
     let record = serde_json::json!({"pid": pid.parse::<u32>().unwrap(), "status": status, "statusUpdatedAt": now});
     std::fs::write(sessions.join(format!("{pid}.json")), record.to_string()).unwrap();
 }
 
 /// Starts or ends a turn the way each host records it: Claude's status record and the Codex thread's rollout.
 fn set_turn(sandbox: &Sandbox, idle: bool) {
-    set_status(sandbox, if idle { "idle" } else { "busy" });
+    set_turn_at(sandbox, idle, chrono::Utc::now());
+}
+
+fn set_turn_at(sandbox: &Sandbox, idle: bool, when: chrono::DateTime<chrono::Utc>) {
+    set_status_at(sandbox, if idle { "idle" } else { "busy" }, when);
+    set_codex_turn(sandbox, idle, when);
+}
+
+fn set_codex_turn(sandbox: &Sandbox, idle: bool, when: chrono::DateTime<chrono::Utc>) {
     let folder = sandbox.root.join("codex").join("sessions").join("2026").join("11").join("11");
     std::fs::create_dir_all(&folder).unwrap();
     let event = serde_json::json!({
-        "timestamp": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        "timestamp": when.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
         "type": "event_msg",
         "payload": {"type": if idle { "task_complete" } else { "task_started" }},
     });
@@ -434,6 +448,40 @@ fn assert_closed_out(sandbox: &Sandbox, output: &Output, launch: &str) {
     assert!(log(sandbox, "stubs/tj-item.log").contains(&format!("progress {ITEM} --state Done")));
 }
 
+fn feed_messages(sandbox: &Sandbox, host: &str) -> Vec<serde_json::Value> {
+    let text = log(sandbox, &format!("cache/feed/{host}-sess-1.jsonl"));
+    let Some((complete, _)) = text.rsplit_once('\n') else { return Vec::new() };
+    complete.lines().map(|line| serde_json::from_str(line).unwrap()).collect()
+}
+
+fn read_feed(sandbox: &Sandbox, host: &str) -> String {
+    let output = Command::new(env!("CARGO_BIN_EXE_tj"))
+        .arg("feed")
+        .envs(environment(sandbox))
+        .env("CLAUDECODE", if host == "claude" { "1" } else { "" })
+        .env("CLAUDE_CODE_SESSION_ID", if host == "claude" { "sess-1" } else { "" })
+        .env("CODEX_THREAD_ID", if host == "codex" { "sess-1" } else { "" })
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+fn assert_no_prompt_delivery(sandbox: &Sandbox) {
+    assert!(log(sandbox, "stubs/codex.log").is_empty(), "the native Codex CLI was invoked");
+    assert!(!sandbox.root.join("cache").join("bridge").exists(), "a Claude relay was created");
+    assert!(!log(sandbox, "dummy.log").contains("typed "), "text was typed into the agent");
+}
+
+fn assert_unfinished(sandbox: &Sandbox, launch: &str) {
+    assert!(sandbox.worktree.exists(), "unfinished worktree was removed");
+    assert!(!git(&sandbox.primary, &["branch", "--list", "Feature/1"]).is_empty());
+    assert!(!log(sandbox, "stubs/tj-item.log").contains("--state Done"));
+    let store = log(sandbox, "stubs/agent-store.log");
+    assert!(!store.contains(&format!("end --launch-id {launch} --reason closed")), "{store}");
+    assert!(!store.contains("release-worktree"), "{store}");
+}
+
 #[test]
 fn an_item_merged_before_the_session_started_never_stops_it() {
     let sandbox = sandbox();
@@ -450,60 +498,203 @@ fn an_item_merged_before_the_session_started_never_stops_it() {
 }
 
 #[test]
-fn a_merge_mid_session_asks_the_agent_once_and_only_its_done_closes_out() {
-    let sandbox = sandbox();
-    let keys = cfg!(windows);
-    let mut child = start(&sandbox, "merged-during", "codex", if keys { "keys" } else { "signal" }, "10");
-    wait_for_polls(&sandbox, "stubs/tj-item.log", "prs ", 1);
-    set_reply(&sandbox, "tj-item-prs.json", MERGED);
-    wait_for_polls(&sandbox, "stubs/codex.log", "queue --thread sess-1 --message", 1);
-    wait_for_polls(&sandbox, "stubs/agent-store.log", "show --launch-id merged-during", 8);
-    still_running(&mut child, Duration::from_millis(500));
-    assert!(sandbox.worktree.exists());
-    assert!(!log(&sandbox, "dummy.log").contains("graceful"), "the agent was stopped");
-    let asked = log(&sandbox, "stubs/codex.log");
-    assert_eq!(asked.lines().count(), 1, "{asked}");
-    assert!(asked.contains("tj done"), "{asked}");
-    done(&sandbox);
-    let output = finish(child, Duration::from_secs(60));
-    assert_closed_out(&sandbox, &output, "merged-during");
+fn merge_notices_reach_both_hosts_once_per_pr_set_despite_reads_polls_and_later_turns() {
+    for host in ["claude", "codex"] {
+        let sandbox = sandbox();
+        let launch = format!("merged-during-{host}");
+        let mut child = start_host(&sandbox, &launch, host);
+        set_turn(&sandbox, false);
+        wait_for_polls(&sandbox, "stubs/tj-item.log", "prs ", 1);
+        set_reply(
+            &sandbox,
+            "tj-item-prs.json",
+            r#"{"all_merged":true,"prs":[{"url":"https://example.com/pr/2"},{"url":"https://example.com/pr/1"},{"url":"https://example.com/pr/2"}]}"#,
+        );
+        wait_until("merge notice never reached the feed", || feed_messages(&sandbox, host).len() == 1);
+        let notice = &feed_messages(&sandbox, host)[0];
+        assert_eq!(notice["name"], "tj run");
+        assert!(notice["from"].is_null());
+        assert_eq!(notice["kind"], "merged");
+        assert!(notice["text"].as_str().unwrap().contains(ITEM));
+        assert_eq!(notice["event"]["item"], ITEM);
+        assert_eq!(notice["event"]["prs"], serde_json::json!(["https://example.com/pr/1", "https://example.com/pr/2"]));
+        assert!(feed_messages(&sandbox, if host == "claude" { "codex" } else { "claude" }).is_empty());
+        assert!(read_feed(&sandbox, host).contains("tj run: Every PR linked"));
+        for _ in 0..2 {
+            set_turn(&sandbox, false);
+            still_running(&mut child, Duration::from_secs(2));
+            set_turn(&sandbox, true);
+            still_running(&mut child, Duration::from_secs(2));
+        }
+        set_reply(
+            &sandbox,
+            "tj-item-prs.json",
+            r#"{"all_merged":true,"prs":[{"url":"https://example.com/pr/1","title":"renamed"},{"url":"https://example.com/pr/2"}]}"#,
+        );
+        let polls = log(&sandbox, "stubs/tj-item.log").lines().filter(|line| line.starts_with("prs ")).count();
+        wait_for_polls(&sandbox, "stubs/tj-item.log", "prs ", polls + 3);
+        assert_eq!(feed_messages(&sandbox, host).len(), 1);
+        assert_eq!(read_feed(&sandbox, host).trim(), "no unread messages");
+        assert_unfinished(&sandbox, &launch);
+        assert_no_prompt_delivery(&sandbox);
+        set_reply(
+            &sandbox,
+            "tj-item-prs.json",
+            r#"{"all_merged":true,"prs":[{"url":"https://example.com/pr/1"},{"url":"https://example.com/pr/2"},{"url":"https://example.com/pr/3"}]}"#,
+        );
+        wait_until("a new PR set never produced its own notice", || feed_messages(&sandbox, host).len() == 2);
+        let notices = feed_messages(&sandbox, host);
+        assert_ne!(notices[0]["event"], notices[1]["event"]);
+        assert!(read_feed(&sandbox, host).contains("Every PR linked"));
+        assert_no_prompt_delivery(&sandbox);
+        done(&sandbox);
+        let output = finish(child, Duration::from_secs(60));
+        assert_closed_out(&sandbox, &output, &launch);
+    }
 }
 
 #[test]
-fn an_idle_session_without_an_item_is_asked_once_per_turn_and_only_its_done_closes_out() {
+fn idle_sessions_never_generate_notices_or_prompts() {
+    for host in ["claude", "codex"] {
+        for has_item in [false, true] {
+            let sandbox = sandbox();
+            let launch = format!("idle-silent-{host}-{has_item}");
+            let keys = cfg!(windows) && host == "codex";
+            let mut arguments = run_arguments(&sandbox, &launch, host, if keys { "keys" } else { "signal" }, "10");
+            if !has_item {
+                let item = arguments.iter().position(|argument| argument == "--item").unwrap();
+                arguments.drain(item..item + 2);
+            }
+            set_codex_turn(&sandbox, false, chrono::Utc::now() - chrono::Duration::minutes(32));
+            let mut child = spawn(&sandbox, &arguments, &sandbox.root);
+            wait_for_log(&sandbox, if keys { "raw" } else { "agent " });
+            // Observe a busy turn before simulating a long idle interval.
+            set_turn_at(&sandbox, false, chrono::Utc::now() - chrono::Duration::minutes(32));
+            still_running(&mut child, Duration::from_secs(2));
+            set_turn_at(&sandbox, true, chrono::Utc::now() - chrono::Duration::minutes(31));
+            still_running(&mut child, Duration::from_secs(3));
+            assert!(feed_messages(&sandbox, host).is_empty());
+            assert_no_prompt_delivery(&sandbox);
+            assert_unfinished(&sandbox, &launch);
+            set_reply(&sandbox, "agent-store-show.json", CLOSING);
+            let output = finish(child, Duration::from_secs(60));
+            assert_eq!(output.status.code(), Some(0), "{}", String::from_utf8_lossy(&output.stderr));
+            assert!(!sandbox.worktree.exists());
+            if !has_item {
+                assert!(log(&sandbox, "stubs/tj-item.log").is_empty(), "a launch without an item queried the tracker");
+            }
+            assert_no_prompt_delivery(&sandbox);
+        }
+    }
+}
+
+#[test]
+fn the_idle_ask_option_is_removed() {
     let sandbox = sandbox();
-    let keys = cfg!(windows);
-    let mut arguments = run_arguments(&sandbox, "idle-ask", "codex", if keys { "keys" } else { "signal" }, "10");
-    let item = arguments.iter().position(|argument| argument == "--item").unwrap();
-    arguments.splice(item..item + 2, ["--ask-idle-seconds", "2"].map(str::to_owned));
-    let mut child = spawn(&sandbox, &arguments, &sandbox.root);
-    wait_for_log(&sandbox, if keys { "raw" } else { "agent " });
-    let asks = || log(&sandbox, "stubs/codex.log").lines().filter(|line| line.starts_with("queue ")).count();
-    let take_turn = || {
-        set_turn(&sandbox, false);
-        std::thread::sleep(Duration::from_secs(3));
-        set_turn(&sandbox, true);
-    };
-    set_turn(&sandbox, true);
-    // Long enough for the wrapper to find the rollout, which it looks up every 10 s until it exists.
-    still_running(&mut child, Duration::from_secs(12));
-    assert_eq!(asks(), 0, "an agent that has had no turn was asked");
-    take_turn();
-    wait_for_polls(&sandbox, "stubs/codex.log", "queue --thread sess-1 --message", 1);
-    assert!(log(&sandbox, "stubs/codex.log").contains("tj done"));
-    take_turn();
-    still_running(&mut child, Duration::from_secs(6));
-    assert_eq!(asks(), 1, "the agent's answer to the ask earned another ask");
-    take_turn();
-    wait_for_polls(&sandbox, "stubs/codex.log", "queue --thread sess-1 --message", 2);
-    assert!(!log(&sandbox, "dummy.log").contains("graceful"), "the agent was stopped");
-    done(&sandbox);
-    let output = finish(child, Duration::from_secs(60));
-    assert_eq!(output.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&output.stderr));
-    assert!(!sandbox.worktree.exists(), "the worktree is still there");
-    assert!(log(&sandbox, "stubs/agent-store.log").contains("end --launch-id idle-ask --reason closed"));
-    assert!(log(&sandbox, "stubs/tj-item.log").is_empty(), "a launch without an item queried the tracker");
-    assert_eq!(asks(), 2);
+    let output = Command::new(env!("CARGO_BIN_EXE_tj"))
+        .args(["run", "--ask-idle-seconds", "2", "--", "unused"])
+        .envs(environment(&sandbox))
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("unexpected argument '--ask-idle-seconds'"));
+    assert!(log(&sandbox, "stubs/agent-store.log").is_empty());
+}
+
+fn kill_dummy(sandbox: &Sandbox) {
+    let pid = log(sandbox, "dummy.log").lines().rev().find_map(|line| line.strip_prefix("pid ")).unwrap().to_owned();
+    let mut kill = if cfg!(windows) { Command::new("powershell.exe") } else { Command::new("kill") };
+    if cfg!(windows) {
+        kill.args(["-NoProfile", "-NonInteractive", "-Command", "Stop-Process", "-Id", &pid, "-Force"]);
+    } else {
+        kill.args(["-KILL", &pid]);
+    }
+    assert!(kill.output().unwrap().status.success());
+}
+
+#[test]
+fn merge_notice_identity_survives_successor_restarts_and_new_launches_of_the_same_session() {
+    for host in ["claude", "codex"] {
+        let sandbox = sandbox();
+        set_reply(&sandbox, "tj-item-prs.json", MERGED);
+        for (number, launch, successor) in
+            [(0, "original", false), (1, "original", true), (2, "new-launch", false), (3, "another-item", false)]
+        {
+            // A real new launch replaces the binding, while the native session and its feed persist.
+            if number >= 2 {
+                std::fs::remove_file(sandbox.stubs.join("agent-store-show.json")).unwrap();
+                std::fs::remove_file(sandbox.stubs.join("agent-store-worktrees.json")).unwrap();
+            }
+            let mut arguments = run_arguments(&sandbox, launch, host, "signal", "10");
+            if number == 2 {
+                let item = arguments.iter().position(|argument| argument == "--item").unwrap() + 1;
+                arguments[item] = "https://github.com/acme/app/issues/1".into();
+                set_reply(
+                    &sandbox,
+                    "tj-item-prs.json",
+                    &serde_json::json!({"ref": ITEM, "all_merged": true, "prs": [{"url": "u"}]}).to_string(),
+                );
+            }
+            if number == 3 {
+                let item = arguments.iter().position(|argument| argument == "--item").unwrap() + 1;
+                arguments[item] = "github:github.com/acme/app:2".into();
+                set_reply(
+                    &sandbox,
+                    "tj-item-prs.json",
+                    r#"{"ref":"github:github.com/acme/app:2","all_merged":true,"prs":[{"url":"u"}]}"#,
+                );
+            }
+            if successor {
+                let separator = arguments.iter().position(|argument| argument == "--").unwrap();
+                arguments.insert(separator, "--successor".into());
+            }
+            let starts = log(&sandbox, "dummy.log").lines().filter(|line| line.starts_with("pid ")).count();
+            let child = spawn(&sandbox, &arguments, &sandbox.root);
+            wait_for_polls(&sandbox, "dummy.log", "pid ", starts + 1);
+            let polls = log(&sandbox, "stubs/tj-item.log").lines().filter(|line| line.starts_with("prs ")).count();
+            wait_for_polls(&sandbox, "stubs/tj-item.log", "prs ", polls + 3);
+            assert_eq!(feed_messages(&sandbox, host).len(), if number == 3 { 2 } else { 1 });
+            let read = read_feed(&sandbox, host);
+            if number == 0 || number == 3 {
+                assert!(read.contains("tj run: Every PR linked"), "{read}");
+            } else {
+                assert_eq!(read.trim(), "no unread messages");
+            }
+            assert_unfinished(&sandbox, launch);
+            assert_no_prompt_delivery(&sandbox);
+            kill_dummy(&sandbox);
+            let output = finish(child, Duration::from_secs(60));
+            assert!(!output.status.success(), "the killed dummy unexpectedly succeeded");
+            assert_unfinished(&sandbox, launch);
+        }
+        assert_eq!(log(&sandbox, "stubs/agent-store.log").matches("launch --launch-id original --host").count(), 1);
+    }
+}
+
+#[test]
+fn incomplete_or_empty_pr_sets_never_produce_a_merge_notice() {
+    for host in ["claude", "codex"] {
+        let sandbox = sandbox();
+        let launch = format!("invalid-prs-{host}");
+        let child = start_host(&sandbox, &launch, host);
+        for reply in [
+            r#"{"all_merged":false,"prs":[{"url":"https://example.com/pr/1"}]}"#,
+            r#"{"all_merged":true,"prs":[]}"#,
+            r#"{"all_merged":true,"prs":[{}]}"#,
+            r#"{"all_merged":true,"prs":[{"url":"https://example.com/pr/1"},{"url":""}]}"#,
+            r#"{"all_merged":true,"prs":[{"url":"   "}]}"#,
+        ] {
+            set_reply(&sandbox, "tj-item-prs.json", reply);
+            let polls = log(&sandbox, "stubs/tj-item.log").lines().filter(|line| line.starts_with("prs ")).count();
+            wait_for_polls(&sandbox, "stubs/tj-item.log", "prs ", polls + 2);
+            assert!(feed_messages(&sandbox, host).is_empty(), "notice for {reply}");
+        }
+        set_reply(&sandbox, "tj-item-prs.json", MERGED);
+        wait_until("a valid merged PR set never produced a notice", || feed_messages(&sandbox, host).len() == 1);
+        assert_no_prompt_delivery(&sandbox);
+        done(&sandbox);
+        assert_closed_out(&sandbox, &finish(child, Duration::from_secs(60)), &launch);
+    }
 }
 
 #[test]
@@ -577,13 +768,13 @@ fn an_unrelated_worktree_binding_does_not_stop_or_clean_the_agent() {
 }
 
 #[test]
-fn an_orphaned_launch_cleans_its_bound_worktree_when_the_launch_directory_is_gone() {
-    for (host, state) in [("claude", "closing"), ("codex", "closing"), ("claude", "ended"), ("codex", "ended")] {
+fn an_explicitly_closing_orphan_cleans_its_bound_worktree_when_the_launch_directory_is_gone() {
+    for host in ["claude", "codex"] {
         let sandbox = sandbox();
         let launch = format!("orphan-{host}");
         let row = serde_json::json!({
             "launch_id": launch, "host": host, "title": "Orphan",
-            "worktree": sandbox.root.join("gone"), "state": state, "end_reason": "exited",
+            "worktree": sandbox.root.join("gone"), "state": "closing", "end_reason": "exited",
             "item": {"ref": ITEM},
             "wrapper": {"pid": 0, "started_at": "2026-01-01T00:00:00Z"}
         });
@@ -611,7 +802,6 @@ fn an_orphaned_launch_cleans_its_bound_worktree_when_the_launch_directory_is_gon
             .to_string(),
         );
         bind(&sandbox, &launch, host, true);
-        set_reply(&sandbox, "tj-item-prs.json", r#"{"prs":[{"url":"u","state":"merged"}],"all_merged":true}"#);
         let output = Command::new(env!("CARGO_BIN_EXE_tj"))
             .arg("closeout")
             .envs(environment(&sandbox))
@@ -622,6 +812,40 @@ fn an_orphaned_launch_cleans_its_bound_worktree_when_the_launch_directory_is_gon
         assert!(!sandbox.worktree.exists(), "the bound worktree is still there");
         assert!(git(&sandbox.primary, &["branch", "--list", "Feature/1"]).is_empty());
         assert!(log(&sandbox, "stubs/agent-store.log").contains(&format!("end --launch-id {launch} --reason closed")));
+    }
+}
+
+#[test]
+fn sweeping_merged_only_dead_launches_preserves_their_worktrees() {
+    for host in ["claude", "codex"] {
+        for state in ["active", "ended"] {
+            let sandbox = sandbox();
+            let launch = format!("merged-orphan-{host}-{state}");
+            bind(&sandbox, &launch, host, false);
+            set_store_list(
+                &sandbox.stubs,
+                "launches",
+                serde_json::json!([{
+                    "launch_id": launch, "host": host, "title": "Unfinished orphan",
+                    "worktree": sandbox.worktree, "state": state, "end_reason": "exited",
+                    "item": {"ref": ITEM},
+                    "wrapper": {"pid": 0, "started_at": "2026-01-01T00:00:00Z"}
+                }]),
+            );
+            set_reply(&sandbox, "tj-item-prs.json", MERGED);
+            let marks = sandbox.root.join("cache").join("run").join(&launch);
+            std::fs::create_dir_all(&marks).unwrap();
+            std::fs::write(marks.join("done"), "an unverifiable old completion mark").unwrap();
+            let output = Command::new(env!("CARGO_BIN_EXE_tj"))
+                .arg("closeout")
+                .envs(environment(&sandbox))
+                .current_dir(&sandbox.root)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+            assert_unfinished(&sandbox, &launch);
+            assert!(!String::from_utf8_lossy(&output.stdout).contains("closed     "));
+        }
     }
 }
 
@@ -705,23 +929,121 @@ fn a_shell_left_running_under_the_agent_keeps_done_waiting() {
 }
 
 #[test]
-fn an_agent_that_exits_after_done_closes_out_without_waiting() {
-    let sandbox = sandbox();
-    let child = start(&sandbox, "done-exit", "claude", "signal", "10");
-    set_turn(&sandbox, false);
-    std::thread::sleep(Duration::from_millis(50));
-    assert_eq!(in_agent(&sandbox, &["done"]).0, 0);
-    let pid = log(&sandbox, "dummy.log").lines().rev().find_map(|line| line.strip_prefix("pid ")).unwrap().to_owned();
-    let mut kill = if cfg!(windows) { Command::new("powershell.exe") } else { Command::new("kill") };
-    if cfg!(windows) {
-        kill.args(["-NoProfile", "-NonInteractive", "-Command", "Stop-Process", "-Id", &pid, "-Force"]);
-    } else {
-        kill.arg(&pid);
+fn a_forced_nonzero_exit_preserves_worktrees_even_after_explicit_done() {
+    for host in ["claude", "codex"] {
+        let sandbox = sandbox();
+        set_reply(&sandbox, "tj-item-prs.json", MERGED);
+        let launch = format!("done-failed-exit-{host}");
+        let child = start_host(&sandbox, &launch, host);
+        set_turn(&sandbox, false);
+        std::thread::sleep(Duration::from_millis(50));
+        let (code, stderr) = in_agent(&sandbox, &["done"]);
+        assert_eq!(code, 0, "tj done: {stderr}");
+        assert!(sandbox.root.join("cache").join("run").join(&launch).join("done").is_file());
+        kill_dummy(&sandbox);
+        let output = finish(child, Duration::from_secs(60));
+        assert!(!output.status.success());
+        assert_unfinished(&sandbox, &launch);
+        assert!(log(&sandbox, "stubs/agent-store.log").contains(&format!("end --launch-id {launch} --reason exited")));
     }
-    assert!(kill.output().unwrap().status.success());
-    let output = finish(child, Duration::from_secs(60));
-    assert!(!sandbox.worktree.exists(), "stderr: {}", String::from_utf8_lossy(&output.stderr));
-    assert!(log(&sandbox, "stubs/agent-store.log").contains("end --launch-id done-exit --reason closed"));
+}
+
+/// Keep the existing dummy's process tree and command environment, controlling only its natural exit.
+fn natural_exit(sandbox: &Sandbox, launch: &str, host: &str, mark_done: bool) -> Child {
+    const EXIT: &str = r#"
+import os, runpy, subprocess, sys, time
+from pathlib import Path
+fixture, mark_done = sys.argv[1], sys.argv[2] == "done"
+original_exit = sys.exit
+def exit_fixture(code=0):
+    if code != 3:
+        original_exit(code)
+    if mark_done:
+        result = subprocess.run([os.environ["DUMMY_TJ"], "done"], capture_output=True, text=True)
+        if result.returncode:
+            raise RuntimeError(result.stderr)
+    ready = Path(os.environ["DUMMY_LOG"]).with_name("exit-ready")
+    ready.touch()
+    while not ready.with_name("exit-now").exists():
+        time.sleep(0.05)
+    original_exit(0)
+sys.exit = exit_fixture
+sys.argv = [fixture, "exit"]
+runpy.run_path(fixture, run_name="__main__")
+"#;
+    set_codex_turn(sandbox, false, chrono::Utc::now());
+    let mut arguments = run_arguments(sandbox, launch, host, "exit", "10");
+    let idle = arguments.iter().position(|argument| argument == "--idle-seconds").unwrap() + 1;
+    arguments[idle] = "60".into();
+    let separator = arguments.iter().position(|argument| argument == "--").unwrap();
+    arguments.splice(
+        separator + 1..,
+        [
+            python().to_owned(),
+            "-c".into(),
+            EXIT.into(),
+            fixture().to_string_lossy().into_owned(),
+            if mark_done { "done".into() } else { "unfinished".into() },
+        ],
+    );
+    let child = spawn(sandbox, &arguments, &sandbox.root);
+    wait_for_log(sandbox, "pid ");
+    set_turn(sandbox, false);
+    wait_until("the dummy never prepared its natural exit", || sandbox.root.join("exit-ready").is_file());
+    // Host records have millisecond timestamps; a later state must be newer than the done mark.
+    std::thread::sleep(Duration::from_millis(50));
+    child
+}
+
+#[test]
+fn a_successful_natural_exit_with_valid_explicit_done_closes_out_without_the_idle_grace() {
+    for host in ["claude", "codex"] {
+        let sandbox = sandbox();
+        let launch = format!("successful-done-exit-{host}");
+        let child = natural_exit(&sandbox, &launch, host, true);
+        assert!(sandbox.root.join("cache").join("run").join(&launch).join("done").is_file());
+        set_turn(&sandbox, true);
+        std::fs::write(sandbox.root.join("exit-now"), "").unwrap();
+        assert_closed_out(&sandbox, &finish(child, Duration::from_secs(45)), &launch);
+    }
+}
+
+#[test]
+fn successful_exit_preserves_merged_worktrees_without_a_valid_unwithdrawn_done() {
+    for host in ["claude", "codex"] {
+        for completion in ["absent", "withdrawn", "unreadable"] {
+            let sandbox = sandbox();
+            set_reply(&sandbox, "tj-item-prs.json", MERGED);
+            let launch = format!("unfinished-exit-{host}-{completion}");
+            let child = natural_exit(&sandbox, &launch, host, completion != "absent");
+            match completion {
+                "absent" => set_turn(&sandbox, true),
+                "withdrawn" => set_turn(&sandbox, false),
+                "unreadable" => {
+                    if host == "claude" {
+                        let pid = log(&sandbox, "dummy.log")
+                            .lines()
+                            .find_map(|line| line.strip_prefix("pid "))
+                            .unwrap()
+                            .to_owned();
+                        std::fs::write(sandbox.root.join("claude").join("sessions").join(format!("{pid}.json")), "{")
+                            .unwrap();
+                    } else {
+                        let folder = sandbox.root.join("codex").join("sessions").join("2026").join("11").join("11");
+                        std::fs::write(folder.join("rollout-2026-11-11T00-00-00-sess-1.jsonl"), "{").unwrap();
+                    }
+                }
+                _ => unreachable!("only the completion states above are tested"),
+            }
+            std::fs::write(sandbox.root.join("exit-now"), "").unwrap();
+            let output = finish(child, Duration::from_secs(60));
+            assert_eq!(output.status.code(), Some(0), "{}", String::from_utf8_lossy(&output.stderr));
+            assert_unfinished(&sandbox, &launch);
+            assert!(
+                log(&sandbox, "stubs/agent-store.log").contains(&format!("end --launch-id {launch} --reason exited"))
+            );
+        }
+    }
 }
 
 #[test]
@@ -922,7 +1244,7 @@ fn a_launch_is_open_while_its_agent_runs_and_closed_once_it_exits() {
 }
 
 #[test]
-fn an_agent_that_exits_after_delivery_cleans_its_owned_worktrees() {
+fn a_failed_exit_preserves_merged_worktrees_without_an_explicit_completion_signal() {
     for host in ["claude", "codex"] {
         let sandbox = sandbox();
         set_reply(&sandbox, "tj-item-prs.json", r#"{"prs":[{"url":"u","state":"merged"}],"all_merged":true}"#);
@@ -933,12 +1255,9 @@ fn an_agent_that_exits_after_delivery_cleans_its_owned_worktrees() {
         let child = spawn(&sandbox, &arguments, &sandbox.root);
         let output = finish(child, Duration::from_secs(60));
         assert_eq!(output.status.code(), Some(3), "{}", String::from_utf8_lossy(&output.stderr));
-        assert!(!sandbox.worktree.exists());
-        assert!(git(&sandbox.primary, &["branch", "--list", "Feature/1"]).is_empty());
+        assert_unfinished(&sandbox, &launch);
         let store = log(&sandbox, "stubs/agent-store.log");
-        assert!(store.contains(&format!("end --launch-id {launch} --reason closed")), "{store}");
-        assert!(!store.contains("--reason exited"), "{store}");
-        assert!(log(&sandbox, "stubs/tj-item.log").contains("--state Done"));
+        assert!(store.contains(&format!("end --launch-id {launch} --reason exited")), "{store}");
     }
 }
 
