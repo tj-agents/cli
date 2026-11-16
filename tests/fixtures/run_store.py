@@ -6,6 +6,8 @@ from typing import TypedDict
 
 class Claim(TypedDict):
     path: str
+    session: str
+    launch_id: str | None
 
 
 class Data(TypedDict, total=False):
@@ -90,22 +92,46 @@ def main() -> None:
         if reply_path.exists()
         else {"ok": True, "data": {}}
     )
+    if "--launch-id" in arguments:
+        specific = (
+            root / f"agent-store-{command}-{value(arguments, '--launch-id')}.json"
+        )
+        if specific.exists():
+            reply = json.loads(specific.read_text(encoding="utf-8"))
     prebound = prebound_reply(root, command, arguments, reply)
     if prebound is not None:
         reply = prebound
     released_path = root / "released.json"
-    released: list[str] = (
+    released: list[Claim] = (
         json.loads(released_path.read_text(encoding="utf-8"))
         if released_path.exists()
         else []
     )
     if command == "release-worktree" and reply["ok"]:
-        released.append(arguments[arguments.index("--path") + 1])
+        released.append(
+            Claim(
+                path=value(arguments, "--path"),
+                session=value(arguments, "--session"),
+                launch_id=value(arguments, "--launch-id"),
+            )
+        )
         released_path.write_text(json.dumps(released), encoding="utf-8")
         reply = {"ok": True, "data": {"released": True}}
     if command == "worktrees" and reply["ok"]:
+        launch_id = (
+            value(arguments, "--launch-id") if "--launch-id" in arguments else None
+        )
         reply["data"]["worktrees"] = [
-            row for row in reply["data"]["worktrees"] if row["path"] not in released
+            row
+            for row in reply["data"]["worktrees"]
+            if row["session"] == value(arguments, "--session")
+            and row["launch_id"] == launch_id
+            and not any(
+                row["path"] == claim["path"]
+                and row["session"] == claim["session"]
+                and row["launch_id"] == claim["launch_id"]
+                for claim in released
+            )
         ]
     print(json.dumps(reply))
 

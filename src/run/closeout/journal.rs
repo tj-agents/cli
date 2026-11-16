@@ -7,13 +7,14 @@ use serde_json::{Value, json};
 use super::{Launch, Plan, Removal};
 
 pub(super) struct Journal {
+    pub(super) launch_id: String,
     pub(super) session: String,
     pub(super) repository: PathBuf,
     pub(super) removals: Vec<Removal>,
 }
 
-fn path(launch: &Launch) -> Result<PathBuf> {
-    Ok(super::super::marks(&launch.id)?.with_extension("closeout.json"))
+fn path(launch_id: &str) -> Result<PathBuf> {
+    Ok(super::super::marks(launch_id)?.with_extension("closeout.json"))
 }
 
 fn text<'a>(value: &'a Value, field: &str) -> Result<&'a str> {
@@ -29,7 +30,7 @@ fn absolute(value: &Value, field: &str) -> Result<PathBuf> {
 }
 
 pub(super) fn read(launch: &Launch) -> Result<Option<Journal>> {
-    let bytes = match std::fs::read(path(launch)?) {
+    let bytes = match std::fs::read(path(&launch.id)?) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error).context("cannot read cleanup journal"),
@@ -54,6 +55,7 @@ pub(super) fn read(launch: &Launch) -> Result<Option<Journal>> {
         })
         .collect::<Result<Vec<_>>>()?;
     Ok(Some(Journal {
+        launch_id: launch.id.clone(),
         session: text(&value, "session")?.to_owned(),
         repository: absolute(&value, "repository")?,
         removals,
@@ -61,7 +63,7 @@ pub(super) fn read(launch: &Launch) -> Result<Option<Journal>> {
 }
 
 pub(super) fn write(launch: &Launch, plan: &Plan) -> Result<()> {
-    let path = path(launch)?;
+    let path = path(&launch.id)?;
     std::fs::create_dir_all(path.parent().context("cleanup journal has no parent")?)?;
     let removals: Vec<_> = plan
         .removals
@@ -85,6 +87,10 @@ pub(super) fn write(launch: &Launch, plan: &Plan) -> Result<()> {
     std::fs::rename(&temporary, &path).context("cannot commit cleanup journal")
 }
 
-pub(super) fn clear(launch: &Launch) -> Result<()> {
-    std::fs::remove_file(path(launch)?).context("cannot clear completed cleanup journal")
+pub(super) fn clear(launch_id: &str) -> Result<()> {
+    match std::fs::remove_file(path(launch_id)?) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).context("cannot clear completed cleanup journal"),
+    }
 }
