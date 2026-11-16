@@ -13,6 +13,12 @@ commit starts `tj plugins update --host <host>` in the background; output goes t
 `<cache>/update/<host>.log`. The same commit is retried after ten minutes if convergence did not
 publish it.
 
+If the lightweight GitHub probe cannot connect, it hands verification to the existing native plugin
+updater in the background. The host still starts. These unverified attempts share the ten-minute retry
+window across tabs and wrapper restarts; a newly verified changed commit can still start immediately.
+Only a successful native convergence publishes an installed revision. The update log records a safe
+transport category and the native updater's result, rather than a repeated terminal warning.
+
 For Codex sessions using an existing shared daemon outside `tj run`, Agent starts a daemon-scoped
 observer during installation or SessionStart. One observer holds a per-daemon lock and shares the
 per-host check coordination with `tj run`; it watches the publication file and requests the same
