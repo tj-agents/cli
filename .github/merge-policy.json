@@ -1,5 +1,5 @@
 {
-  "requires_approval": true,
+  "requires_approval": false,
   "required_checks": [
     "test (ubuntu-latest)",
     "test (windows-latest)"
