@@ -237,6 +237,10 @@ session `agent-store show --launch-id` binds to the launch; with none bound the 
 wrapper says so once. A resume that exits with an error leaves the tab open with the reason. Codex exposes no
 turn state to the update check, so a Codex tab takes an updated `tj` at its next start.
 
+To let already-running wrappers hand over safely, a successor accepts and ignores their retired
+`--ask-idle-seconds` argument. This upgrade exception requires `--successor`; fresh launches reject the
+argument, and new wrappers never forward it. It does not enable idle messages.
+
 It closes out only when one of these happens:
 
 - `tj done` was run, the turn that ran it ended, and the agent has stayed idle for about 10 minutes since with no
@@ -246,17 +250,13 @@ It closes out only when one of these happens:
   record never closes. While `tj done` stands, the tab applies no update;
 - `agent-store` marks the launch or its session `closing`, which is what `tj closeout REF` does.
 
-A merged PR never stops a session: an item can be merged before its session starts or while it still has
-work. The first time `tj item prs` (checked every two minutes) reports every PR for the item merged, the
-wrapper asks the agent once, through its Claude relay or Codex queue, to run `tj done` if nothing is left.
+A merged PR never completes a session: an item can be merged while the session still has work. Every two
+minutes the wrapper checks `tj item prs`. When all PRs have merged, it records a notification in the bound
+session's feed. The item and sorted PR URLs identify that event durably, so later polls, turns, feed reads,
+wrapper restarts and launches of the same session do not repeat it. A newly merged PR set gets a new event.
 
-Work needs no item or PR to finish, so the wrapper also asks an idle agent. It follows the host's turns
-throughout, and once the host has stayed idle for about 30 minutes after a turn it saw, with no shell
-running under it and no `tj done` standing, it asks the agent the same way. A tab that has had no turn is
-never asked, nor is one whose wrapper restarted for an update until its next turn. The first turn that
-starts after an ask is the answer, so the wrapper asks again only after a later turn, and a failed ask waits
-for one too. An agent waiting on a reply from the user, a child session or a merge is not finished. Whether
-the work is done is the agent's call; idleness alone never closes a tab.
+Idleness generates no messages or model turns. An agent waiting on a reply from the user, an approval,
+a child session or a merge remains unfinished. Work with no item or PR finishes through `tj done` too.
 
 An agent that is unsure carries on and the tab stays open. A refused check withdraws `tj done` and prints
 the reason; the agent runs it again once the reason is fixed.
@@ -273,13 +273,18 @@ After stopping its own agent process tree, the wrapper repeats those checks and 
 5. exits 0, so Windows Terminal (`closeOnExit` default) or tmux closes the tab.
 
 Helpers run hidden through `tj_hook` on Windows, and in their own session on Linux, so they never touch the
-agent's console. If the agent exits by itself, nothing is left running, so the wrapper also cleans up when `tj done` still stands or every PR for the item has merged. Otherwise it ends the launch and keeps the unfinished worktrees. It preserves the agent's exit code. `tj closeout` also inspects ended launches whose cleanup has not completed.
+agent's console. If the agent exits successfully by itself with a readable host record and `tj done`
+still standing, the wrapper can clean up immediately. A failed exit preserves unfinished worktrees.
+An explicit closing request also authorizes cleanup, subject to the same ownership and content checks.
+Otherwise the wrapper ends the launch and keeps the worktrees, preserving the exit code. A dead-wrapper
+sweep requires explicit closing or an existing cleanup journal: a leftover completion mark cannot prove
+that no later turn withdrew it. Merged PRs alone do not authorize cleanup.
 
 ## `tj message` and `tj feed`: messaging between sessions
 
 ```text
-tj message <title|host:id> <text>   message another session: a Claude session's inbox, a Codex session's feed
-tj feed                             in a Codex session: show its unread messages, once, with how to reply
+tj message <title|host:id> <text>   post a message to another Claude or Codex session's feed
+tj feed                             show this session's unread messages, once, with how to reply
 tj feed --wait [--timeout <secs>]   in a Codex session: block until a message arrives (default 12 hours); exit 1 if none did
 ```
 
@@ -287,29 +292,23 @@ The target is looked up with `agent-store sessions --title` (or `agent-store sho
 exactly one session that has not ended. The caller is the Claude session when `CLAUDECODE=1`, otherwise the
 Codex thread in `CODEX_THREAD_ID`; a message from neither is shown as from a terminal.
 
-A Claude target receives the message natively. Each Claude session gets a relay from the cli plugin's async
-`SessionStart` hook, `tj bridge`, which lives until the session exits. It listens on a loopback port and records
-the port and a random secret in `<cache>/bridge/<session-id>.json`, readable only by you. `tj message` hands the
-text to that relay, which posts it to `CLAUDE_CODE_MESSAGING_SOCKET` with an auth line holding
-`CLAUDE_CODE_MESSAGING_TOKEN`, so the session verifies it as its own child's message and starts a turn even in
-`bypassPermissions` mode. The text opens with who sent it and the `tj message` command to reply. A Claude
-session without a relay is an error; nothing is stored for it. `tj run`'s close-out notice uses the same relay.
+Both hosts receive messages in `<cache>/feed/<host>-<id>.jsonl`, with `<host>-<id>.read` holding the byte
+offset already shown. Writers use an OS file lock and flush complete records; a torn last line is separated
+before the next append. On Unix the folder and feeds are readable only by you. Unreadable lines are
+reported and passed over. Sender host, handle and title stay with the message and its reply command.
 
-A Codex target's native queue (`codex queue`) does not yet deliver reliably: an interrupted thread can hold a
-queued message indefinitely, and an embedded thread is out of the shared daemon's reach. So the message goes to
-its feed, `<cache>/feed/codex-<id>.jsonl`: one
-JSON message per line appended in a single write, with `codex-<id>.read` holding the byte offset already shown.
-On Unix the folder and feeds are readable only by you. A line that is not JSON, such as one torn by a killed
-sender, is reported and passed over. The Codex session reads it with `tj feed`; a Codex parent waiting on a child
-runs `tj feed --wait` as a background command, so the child's message returns through its own task notification.
-`tj feed` refuses in a Claude session. `tj run`'s close-out notice reaches a Codex session through `codex queue`.
+Delivery does not submit user input, invoke a host queue or start a model turn. A session reads `tj feed`
+when useful. When awaiting a result, it can run `tj feed --wait` through its host's background-command tool
+so the result returns through that tool's native completion. Posting to a feed by itself proves storage,
+not rendering or an unsolicited wake. Claude's peer inbox starts a turn when idle, so it is unsuitable for
+this prompt-free transport; see its [native delivery contract](https://code.claude.com/docs/en/cross-session-messaging#message-delivery).
 
 ## Configuration
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `TJ_F_ROOT` | `~/projects`, then `~/source/repos` | where `f` searches |
-| `TJ_CACHE_DIR` | OS cache folder + `/tj` | where `cr` keeps its index, `tj done` its marks, `tj update` the published updates, `tj run` its update check, each Codex session its feed and each Claude relay its endpoint |
+| `TJ_CACHE_DIR` | OS cache folder + `/tj` | where `cr` keeps its index, `tj done` its marks, `tj update` the published updates, `tj run` its update check and each session its feed |
 | `TJ_BIN_DIR` | `~/.local/bin` / `%LOCALAPPDATA%\Programs\tj` | where the installer puts `tj` and `tj_hook` |
 | `CLAUDE_CONFIG_DIR` | `~/.claude` | Claude Code's config folder, as Claude Code itself reads it |
 | `CODEX_HOME` | `~/.codex` | Codex's config folder, as Codex itself reads it |
@@ -412,7 +411,7 @@ run changes anything. A successful current `main` commit automatically publishes
 | `src/process.rs` and `src/process/` | native command execution and Windows process containment |
 | `packages/tj-cli/src/tj_cli/process/` | the Python API for the native launcher |
 | `src/run/` | `tj run`, `tj done`, `tj update` and `tj closeout` |
-| `src/message.rs`, `src/feed.rs`, `src/bridge.rs` | `tj message`, `tj feed` and the Claude session relay |
+| `src/message.rs`, `src/feed.rs` | `tj message`, `tj feed` and durable notification identity |
 | `src/process/agent.rs` and `src/process/agent/` | the agent's job or process group, per-host stop, tree kill |
 | `src/f.rs` | folder walk, match scoring, picker |
 | `src/cr/parse.rs` | reading Claude and Codex transcripts into searchable text and turns |
