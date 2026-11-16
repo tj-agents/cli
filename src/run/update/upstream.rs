@@ -1,4 +1,5 @@
 use std::fs::{self, OpenOptions};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Stdio};
 use std::thread::JoinHandle;
@@ -29,6 +30,8 @@ pub(crate) enum CheckError {
     Commit,
     #[error("could not start tj-plugins")]
     Spawn(#[source] std::io::Error),
+    #[error("could not record the background update check")]
+    Record(#[source] std::io::Error),
 }
 
 struct State {
@@ -124,7 +127,26 @@ fn spawn(host: Host, cwd: &Path, log: &Path) -> Result<Child, CheckError> {
     Ok(child)
 }
 
-fn check(state: &State, host: Host, cwd: &Path, url: &str) -> Result<Option<(String, Child)>, CheckError> {
+/// Exceptions can contain credentials or proxy URLs; record only a safe transport category.
+fn record_probe_failure(log: &Path, error: &ureq::Error) -> Result<(), CheckError> {
+    let category = match error {
+        ureq::Error::Timeout(_) => "timeout",
+        ureq::Error::HostNotFound => "DNS",
+        ureq::Error::Tls(_) | ureq::Error::Rustls(_) => "TLS",
+        ureq::Error::Io(_) | ureq::Error::ConnectionFailed => "connection",
+        ureq::Error::InvalidProxyUrl | ureq::Error::ConnectProxyFailed(_) => "proxy",
+        _ => "request",
+    };
+    let mut file = OpenOptions::new().create(true).append(true).open(log).map_err(CheckError::Record)?;
+    writeln!(
+        file,
+        "{} GitHub probe unavailable ({category}); delegating verification to the native updater",
+        chrono::Local::now().format("%Y-%m-%d %H:%M:%S")
+    )
+    .map_err(CheckError::Record)
+}
+
+fn check(state: &State, host: Host, cwd: &Path, url: &str) -> Result<Option<(Option<String>, Child)>, CheckError> {
     let now = SystemTime::now();
     if modified(&state.checked).is_some_and(|at| recent(at, now, CHECKED_FOR)) {
         return Ok(None);
@@ -136,13 +158,28 @@ fn check(state: &State, host: Host, cwd: &Path, url: &str) -> Result<Option<(Str
     }
     let _ = fs::write(&state.checked, "");
     let published = fs::read_to_string(&state.published).unwrap_or_default();
-    let answer = request(url, converged(&published))?;
+    let answer = match request(url, converged(&published)) {
+        Ok(answer) => answer,
+        Err(CheckError::Request(error)) => {
+            // The native updater already handles unknown freshness through its configured credentials
+            // and native marketplace refresh. A failed fast probe must not prevent that recovery.
+            if modified(&state.started).is_some_and(|at| recent(at, now, RETRY_AFTER)) {
+                return Ok(None);
+            }
+            record_probe_failure(&state.log, &error)?;
+            let child = spawn(host, cwd, &state.log)?;
+            // Empty means an unverified attempt, not a requested or successfully installed SHA.
+            let _ = fs::write(&state.started, "");
+            return Ok(Some((None, child)));
+        }
+        Err(error) => return Err(error),
+    };
     let previous = fs::read_to_string(&state.started).unwrap_or_default();
     let started = modified(&state.started).map(|at| (previous.trim(), at));
     let Some(sha) = install(answer, started, now) else { return Ok(None) };
     let child = spawn(host, cwd, &state.log)?;
     let _ = fs::write(&state.started, &sha);
-    Ok(Some((format!("tj-agents changed upstream; updating {} plugins in the background", host.name()), child)))
+    Ok(Some((Some(format!("tj-agents changed upstream; updating {} plugins in the background", host.name())), child)))
 }
 
 /// Checks once, off the launch's critical path, whether tj-agents moved past what this host last installed, and
@@ -152,7 +189,7 @@ pub(crate) fn start(host: Host, cwd: &Path, url: String) -> Option<JoinHandle<Re
     let cwd = cwd.to_path_buf();
     Some(std::thread::spawn(move || {
         check(&state, host, &cwd, &url).map(|update| {
-            update.map(|(message, mut child)| {
+            update.and_then(|(message, mut child)| {
                 std::thread::spawn(move || child.wait());
                 message
             })
@@ -201,7 +238,7 @@ pub(crate) fn start_owned(
 mod tests {
     use std::time::{Duration, UNIX_EPOCH};
 
-    use super::{Answer, CheckError, OwnedUpdate, TIMEOUT, converged, install, recent, request};
+    use super::{Answer, CheckError, OwnedUpdate, TIMEOUT, converged, install, recent, record_probe_failure, request};
 
     const SHA: &str = "3f0578aa4000485aa25477e36592978fa5fa750f";
 
@@ -255,5 +292,17 @@ mod tests {
         assert!(matches!(result, Err(CheckError::Request(_))), "{result:?}");
         assert!(started.elapsed() < TIMEOUT + Duration::from_millis(500), "{:?}", started.elapsed());
         drop(listener);
+    }
+
+    #[test]
+    fn probe_diagnostics_do_not_record_credentials_from_transport_errors() {
+        let directory = tempfile::tempdir().unwrap();
+        let log = directory.path().join("update.log");
+        let error = ureq::Error::ConnectProxyFailed("Authorization: secret-token".to_owned());
+        record_probe_failure(&log, &error).unwrap();
+        let diagnostic = std::fs::read_to_string(log).unwrap();
+        assert!(diagnostic.contains("proxy"));
+        assert!(!diagnostic.contains("secret-token"));
+        assert!(!diagnostic.contains("Authorization"));
     }
 }
