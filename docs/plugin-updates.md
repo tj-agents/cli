@@ -2,7 +2,7 @@
 
 The `tj-agents/marketplace` repository pins plugin revisions. Its generated host marketplaces
 describe those pins to Claude Code and Codex. Agent owns native marketplace and plugin installation;
-this CLI owns detection of a new marketplace commit and delivery to running `tj run` wrappers.
+this CLI owns detection of a new marketplace commit and delivery to running sessions.
 
 In a repository selecting a `@tj-agents` plugin, `tj run` checks the marketplace at launch and while
 the tab remains open. It sends a conditional request for the `main` commit, comparing it with the
@@ -12,6 +12,14 @@ hour. A one-second network timeout keeps the check off the session's supervision
 commit starts `tj plugins update --host <host>` in the background; output goes to
 `<cache>/update/<host>.log`. The same commit is retried after ten minutes if convergence did not
 publish it.
+
+For Codex sessions using an existing shared daemon outside `tj run`, Agent starts a daemon-scoped
+observer during installation or SessionStart. One observer holds a per-daemon lock and shares the
+per-host check coordination with `tj run`; it watches the publication file and requests the same
+app-server reload. It attaches only to an existing daemon and does not create a session or service.
+It exits on daemon disconnect or when no threads remain loaded. If a thread arrives during shutdown,
+the observer resumes or a subsequent start acquires ownership. An embedded `--no-daemon` session is
+outside this observer's reach.
 
 Agent's plugin update checks the configured marketplaces, fetches changed ones and brings the host's
 installed plugins to their pins. It checks repository standards, updates the Agent command runtime and,

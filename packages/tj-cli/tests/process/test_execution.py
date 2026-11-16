@@ -697,6 +697,36 @@ def test_preserve_descendants_releases_hidden_background_child_after_root_exit(
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows launcher job ownership")
+@pytest.mark.parametrize("preserve", [False, True])
+def test_process_run_preserve_controls_nested_launcher_lifetime(
+    native_launcher: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    preserve: bool,
+) -> None:
+    monkeypatch.setenv(
+        "PATH", str(native_launcher.parent) + os.pathsep + os.environ["PATH"]
+    )
+    report = tmp_path / "nested-child.json"
+    command = [
+        str(native_launcher),
+        *_background_command(report, 0, 0.3, preserve=True),
+    ]
+    result = process.run(command, preserve_descendants=preserve, timeout=30)
+    assert result.returncode == 0
+    child = _wait_for_record(report)
+    pid = child["pid"]
+    assert isinstance(pid, int)
+    try:
+        if preserve:
+            assert _alive(pid)
+        else:
+            _wait_for_exit(pid)
+    finally:
+        _stop_background(pid)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows launcher job ownership")
 def test_preserve_descendants_cancellation_kills_the_owned_tree(
     native_launcher: Path, tmp_path: Path
 ) -> None:
