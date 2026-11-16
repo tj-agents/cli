@@ -1,14 +1,11 @@
-use std::io::{BufRead, BufReader, Write};
-use std::net::TcpStream;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Output, Stdio};
+use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
 const CODEX_CHILD: &str = "019a0000-0000-7000-8000-00000000c0de";
 const CLAUDE_PEER: &str = "4d86b5f2-0000-4000-8000-00000000c1a0";
-const TOKEN: &str = "test-token";
 
 const HOST_VARIABLES: [&str; 8] = [
     "CLAUDECODE",
@@ -25,28 +22,6 @@ struct Sandbox {
     _directory: tempfile::TempDir,
     root: PathBuf,
     stubs: PathBuf,
-    background: Vec<Child>,
-}
-
-impl Drop for Sandbox {
-    fn drop(&mut self) {
-        for child in &mut self.background {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-    }
-}
-
-fn python() -> &'static str {
-    if cfg!(windows) { "python" } else { "python3" }
-}
-
-fn wait_for(what: &str, mut done: impl FnMut() -> bool) {
-    let deadline = Instant::now() + Duration::from_secs(20);
-    while !done() {
-        assert!(Instant::now() < deadline, "timed out waiting for {what}");
-        std::thread::sleep(Duration::from_millis(100));
-    }
 }
 
 fn agent_store_stub(directory: &Path) {
@@ -85,7 +60,7 @@ fn sandbox(sessions: &[Value]) -> Sandbox {
     if let Some(first) = sessions.first() {
         std::fs::write(stubs.join("agent-store-show.json"), reply(json!({"session": first}))).unwrap();
     }
-    Sandbox { _directory: directory, root, stubs, background: Vec::new() }
+    Sandbox { _directory: directory, root, stubs }
 }
 
 impl Sandbox {
@@ -118,68 +93,6 @@ impl Sandbox {
             .map(|line| serde_json::from_str(line).unwrap())
             .collect()
     }
-
-    fn inbox_address(&self) -> String {
-        if cfg!(windows) {
-            format!(r"\\.\pipe\LOCAL\tj-test-{}", self.root.file_name().unwrap().to_string_lossy())
-        } else {
-            self.root.join("inbox.sock").to_string_lossy().into_owned()
-        }
-    }
-
-    fn start_inbox(&mut self) -> String {
-        let address = self.inbox_address();
-        let ready = self.root.join("inbox.ready");
-        let child = Command::new(python())
-            .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests").join("fixtures").join("fake_inbox.py"))
-            .args([address.as_str(), &self.root.join("inbox.capture").to_string_lossy(), &ready.to_string_lossy()])
-            .spawn()
-            .unwrap();
-        self.background.push(child);
-        wait_for("the fake inbox", || ready.exists());
-        address
-    }
-
-    fn inbox(&self) -> Vec<Value> {
-        std::fs::read_to_string(self.root.join("inbox.capture"))
-            .unwrap_or_default()
-            .lines()
-            .map(|line| serde_json::from_str(line).unwrap())
-            .collect()
-    }
-
-    fn endpoint(&self) -> PathBuf {
-        self.root.join("cache").join("bridge").join(format!("{CLAUDE_PEER}.json"))
-    }
-
-    fn start_bridge(&mut self, inbox: &str) {
-        let child = self
-            .command(
-                &["bridge"],
-                &[
-                    ("CLAUDE_CODE_MESSAGING_SOCKET", inbox),
-                    ("CLAUDE_CODE_MESSAGING_TOKEN", TOKEN),
-                    ("CLAUDE_CODE_SESSION_ID", CLAUDE_PEER),
-                ],
-            )
-            .stdin(Stdio::null())
-            .spawn()
-            .unwrap();
-        self.background.push(child);
-        let endpoint = self.endpoint();
-        wait_for("the relay endpoint", || endpoint.exists());
-    }
-
-    /// Sends `text` to the relay with the secret `secret` picks from its endpoint record, and returns the reply.
-    fn relay(&self, secret: impl Fn(&Value) -> Value, text: &str) -> String {
-        let endpoint: Value = serde_json::from_slice(&std::fs::read(self.endpoint()).unwrap()).unwrap();
-        let port = u16::try_from(endpoint["port"].as_u64().unwrap()).unwrap();
-        let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
-        writeln!(stream, "{}", json!({"secret": secret(&endpoint), "text": text})).unwrap();
-        let mut reply = String::new();
-        BufReader::new(stream).read_line(&mut reply).unwrap();
-        reply
-    }
 }
 
 fn stdout(output: &Output) -> String {
@@ -197,55 +110,32 @@ const AS_CLAUDE_PEER: [(&str, &str); 2] = [("CLAUDECODE", "1"), ("CLAUDE_CODE_SE
 const AS_CODEX_CHILD: [(&str, &str); 1] = [("CODEX_THREAD_ID", CODEX_CHILD)];
 
 #[test]
-fn a_message_to_a_codex_session_lands_in_its_feed_with_the_sender() {
-    let sandbox = sandbox(&[session("codex", CODEX_CHILD, "Phase 3b", "active")]);
-    let output = sandbox.tj(&["message", "Phase 3b", "rebase on main"], &FROM_CLAUDE);
-    assert!(output.status.success(), "{}", stderr(&output));
-    assert!(stdout(&output).contains("posted to Phase 3b's feed; it reads it when it runs tj feed"));
-    let posted = sandbox.posted(&format!("codex-{CODEX_CHILD}.jsonl"));
-    assert_eq!(posted.len(), 1);
-    assert_eq!(posted[0]["from"], "claude:c1a0de00");
-    assert_eq!(posted[0]["name"], "cli 82");
-    assert_eq!(posted[0]["text"], "rebase on main");
-}
-
-#[test]
-fn a_message_to_a_claude_session_reaches_its_native_inbox_from_either_host() {
-    let mut sandbox = sandbox(&[session("claude", CLAUDE_PEER, "tj-agents-c2", "active")]);
-    let inbox = sandbox.start_inbox();
-    sandbox.start_bridge(&inbox);
-    for caller in [&FROM_CLAUDE[..], &FROM_CODEX[..]] {
-        let output = sandbox.tj(&["message", "tj-agents-c2", "PR 56 is ready"], caller);
-        assert!(output.status.success(), "{}", stderr(&output));
-        assert!(stdout(&output).contains("delivered to tj-agents-c2's inbox"));
+fn either_host_posts_to_either_hosts_feed_preserving_the_sender() {
+    for (host, id, recipient) in
+        [("claude", CLAUDE_PEER, &AS_CLAUDE_PEER[..]), ("codex", CODEX_CHILD, &AS_CODEX_CHILD[..])]
+    {
+        let sandbox = sandbox(&[session(host, id, "Peer", "active")]);
+        for caller in [&FROM_CLAUDE[..], &FROM_CODEX[..]] {
+            let output = sandbox.tj(&["message", "Peer", "PR 56 is ready"], caller);
+            assert!(output.status.success(), "{}", stderr(&output));
+            assert!(stdout(&output).contains("posted to Peer's feed; it reads it when it runs tj feed"));
+        }
+        let posted = sandbox.posted(&format!("{host}-{id}.jsonl"));
+        assert_eq!(posted.len(), 2);
+        for (message, from, name) in
+            [(&posted[0], "claude:c1a0de00", "cli 82"), (&posted[1], "codex:019a-parent", "agent 92")]
+        {
+            assert_eq!(message["from"], from);
+            assert_eq!(message["name"], name);
+            assert_eq!(message["text"], "PR 56 is ready");
+        }
+        let read = sandbox.tj(&["feed"], recipient);
+        assert!(read.status.success(), "{}", stderr(&read));
+        let shown = stdout(&read);
+        assert!(shown.contains("cli 82 (claude:c1a0de00): PR 56 is ready"), "{shown}");
+        assert!(shown.contains("agent 92 (codex:019a-parent): PR 56 is ready"), "{shown}");
+        assert!(!sandbox.root.join("cache").join("bridge").exists());
     }
-    wait_for("the inbox to record both messages", || sandbox.inbox().len() == 4);
-    let lines = sandbox.inbox();
-    assert_eq!(lines[0], json!({"type": "auth", "token": TOKEN}));
-    assert_eq!(
-        lines[1]["message"]["content"],
-        "[tj message from cli 82; reply with: tj message claude:c1a0de00 \"<text>\"] PR 56 is ready"
-    );
-    assert_eq!(
-        lines[3]["message"]["content"],
-        "[tj message from agent 92; reply with: tj message codex:019a-parent \"<text>\"] PR 56 is ready"
-    );
-    assert!(!sandbox.root.join("cache").join("feed").exists());
-}
-
-#[test]
-fn a_claude_session_without_a_relay_is_an_error() {
-    let sandbox = sandbox(&[session("claude", CLAUDE_PEER, "tj-agents-c2", "active")]);
-    let output = sandbox.tj(&["message", "tj-agents-c2", "hi"], &FROM_CODEX);
-    assert_eq!(output.status.code(), Some(2));
-    assert!(stderr(&output).contains("has no message relay"), "{}", stderr(&output));
-}
-
-#[test]
-fn feed_refuses_a_claude_session() {
-    let output = sandbox(&[]).tj(&["feed"], &AS_CLAUDE_PEER);
-    assert_eq!(output.status.code(), Some(2));
-    assert!(stderr(&output).contains("a Claude session receives tj message in its own inbox"));
 }
 
 #[test]
@@ -258,17 +148,23 @@ fn a_handle_is_looked_up_with_show() {
 
 #[test]
 fn feed_shows_unread_messages_once_with_a_reply_route() {
-    let sandbox = sandbox(&[session("codex", CODEX_CHILD, "Phase 3b", "active")]);
-    sandbox.tj(&["message", "Phase 3b", "PR 56 is ready"], &FROM_CODEX);
-    let first = sandbox.tj(&["feed"], &AS_CODEX_CHILD);
-    assert!(first.status.success(), "{}", stderr(&first));
-    let shown = stdout(&first);
-    assert!(shown.contains("agent 92 (codex:019a-parent): PR 56 is ready"), "{shown}");
-    assert!(shown.contains("reply: tj message codex:019a-parent \"<text>\""), "{shown}");
-    assert_eq!(stdout(&sandbox.tj(&["feed"], &AS_CODEX_CHILD)).trim(), "no unread messages");
-    sandbox.tj(&["message", "Phase 3b", "merged"], &FROM_CODEX);
-    let next = stdout(&sandbox.tj(&["feed"], &AS_CODEX_CHILD));
-    assert!(next.contains("merged") && !next.contains("PR 56"), "{next}");
+    for (host, id, recipient) in
+        [("claude", CLAUDE_PEER, &AS_CLAUDE_PEER[..]), ("codex", CODEX_CHILD, &AS_CODEX_CHILD[..])]
+    {
+        let sandbox = sandbox(&[session(host, id, "Phase 3b", "active")]);
+        let sent = sandbox.tj(&["message", "Phase 3b", "PR 56 is ready"], &FROM_CODEX);
+        assert!(sent.status.success(), "{}", stderr(&sent));
+        let first = sandbox.tj(&["feed"], recipient);
+        assert!(first.status.success(), "{}", stderr(&first));
+        let shown = stdout(&first);
+        assert!(shown.contains("agent 92 (codex:019a-parent): PR 56 is ready"), "{shown}");
+        assert!(shown.contains("reply: tj message codex:019a-parent \"<text>\""), "{shown}");
+        assert_eq!(stdout(&sandbox.tj(&["feed"], recipient)).trim(), "no unread messages");
+        let sent = sandbox.tj(&["message", "Phase 3b", "merged"], &FROM_CODEX);
+        assert!(sent.status.success(), "{}", stderr(&sent));
+        let next = stdout(&sandbox.tj(&["feed"], recipient));
+        assert!(next.contains("merged") && !next.contains("PR 56"), "{next}");
+    }
 }
 
 #[test]
@@ -292,19 +188,26 @@ fn a_partly_written_line_waits_for_its_newline() {
 
 #[test]
 fn feed_wait_returns_when_a_message_arrives() {
-    let sandbox = sandbox(&[session("codex", CODEX_CHILD, "Phase 3b", "active")]);
-    let waiting = sandbox
-        .command(&["feed", "--wait", "--timeout", "60"], &AS_CODEX_CHILD)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .spawn()
-        .unwrap();
-    std::thread::sleep(Duration::from_millis(500));
-    sandbox.tj(&["message", "Phase 3b", "finished: PR 12"], &FROM_CLAUDE);
-    let started = Instant::now();
-    let output = waiting.wait_with_output().unwrap();
-    assert!(started.elapsed() < Duration::from_secs(30));
-    assert!(stdout(&output).contains("cli 82 (claude:c1a0de00): finished: PR 12"));
+    for (host, id, recipient) in
+        [("claude", CLAUDE_PEER, &AS_CLAUDE_PEER[..]), ("codex", CODEX_CHILD, &AS_CODEX_CHILD[..])]
+    {
+        let sandbox = sandbox(&[session(host, id, "Phase 3b", "active")]);
+        let waiting = sandbox
+            .command(&["feed", "--wait", "--timeout", "60"], recipient)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(500));
+        let sent = sandbox.tj(&["message", "Phase 3b", "finished: PR 12"], &FROM_CLAUDE);
+        assert!(sent.status.success(), "{}", stderr(&sent));
+        let started = Instant::now();
+        let output = waiting.wait_with_output().unwrap();
+        assert!(started.elapsed() < Duration::from_secs(30));
+        assert!(output.status.success(), "{}", stderr(&output));
+        assert!(stdout(&output).contains("cli 82 (claude:c1a0de00): finished: PR 12"));
+    }
 }
 
 #[test]
@@ -361,7 +264,7 @@ fn a_session_on_an_unknown_host_is_refused() {
 fn feed_needs_a_calling_session() {
     let output = sandbox(&[]).tj(&["feed"], &[]);
     assert_eq!(output.status.code(), Some(2));
-    assert!(stderr(&output).contains("tj feed reads the calling Codex session's own feed"));
+    assert!(stderr(&output).contains("tj feed reads the calling session's own feed"));
 }
 
 #[test]
@@ -377,33 +280,59 @@ fn ended_and_ambiguous_titles_are_refused() {
 }
 
 #[test]
-fn the_relay_posts_to_its_session_inbox_with_its_token() {
-    let mut sandbox = sandbox(&[]);
-    let inbox = sandbox.start_inbox();
-    sandbox.start_bridge(&inbox);
-    let reply = sandbox.relay(|endpoint| endpoint["secret"].clone(), "[tj run] every PR has merged");
-    assert!(reply.contains(r#""ok":true"#), "{reply}");
-    wait_for("the inbox to record the notice", || sandbox.inbox().len() == 2);
-    let lines = sandbox.inbox();
-    assert_eq!(lines[0], json!({"type": "auth", "token": TOKEN}));
-    assert_eq!(lines[1]["type"], "user");
-    assert_eq!(lines[1]["message"]["content"], "[tj run] every PR has merged");
-}
-
-#[test]
-fn a_relay_refuses_a_caller_without_its_secret() {
-    let mut sandbox = sandbox(&[]);
-    let inbox = sandbox.start_inbox();
-    sandbox.start_bridge(&inbox);
-    let reply = sandbox.relay(|_| json!("guess"), "hi");
-    assert!(reply.contains("wrong relay secret"));
-    assert!(sandbox.inbox().is_empty());
-}
-
-#[test]
-fn the_bridge_hook_is_a_no_op_outside_claude() {
+fn the_bridge_command_is_removed() {
     let sandbox = sandbox(&[]);
-    let output = sandbox.tj(&["bridge"], &FROM_CODEX);
-    assert!(output.status.success());
+    let output = sandbox.command(&["bridge"], &FROM_CODEX).env("PATH", &sandbox.stubs).output().unwrap();
+    assert!(!output.status.success());
+    assert!(stderr(&output).contains("`tj bridge` is not a tj command"), "{}", stderr(&output));
     assert!(!sandbox.root.join("cache").join("bridge").exists());
+}
+
+#[test]
+fn concurrent_senders_preserve_every_message_after_a_torn_line() {
+    for (host, id, recipient) in
+        [("claude", CLAUDE_PEER, &AS_CLAUDE_PEER[..]), ("codex", CODEX_CHILD, &AS_CODEX_CHILD[..])]
+    {
+        let sandbox = sandbox(&[session(host, id, "Peer", "active")]);
+        let feed = sandbox.feed(&format!("{host}-{id}.jsonl"));
+        std::fs::create_dir_all(feed.parent().unwrap()).unwrap();
+        std::fs::write(&feed, "{\"text\":\"torn").unwrap();
+        let messages: Vec<_> =
+            (0..12).map(|number| format!("message {number}: {}\nsecond line", "payload ".repeat(1024))).collect();
+        let children: Vec<_> = messages
+            .iter()
+            .enumerate()
+            .map(|(number, text)| {
+                let sender = if number % 2 == 0 { &FROM_CLAUDE[..] } else { &FROM_CODEX[..] };
+                sandbox
+                    .command(&["message", "Peer", text], sender)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .unwrap()
+            })
+            .collect();
+        for child in children {
+            let output = child.wait_with_output().unwrap();
+            assert!(output.status.success(), "{}", stderr(&output));
+        }
+        let lines = std::fs::read_to_string(&feed).unwrap();
+        assert_eq!(lines.lines().count(), messages.len() + 1);
+        let posted: Vec<Value> = lines.lines().skip(1).map(|line| serde_json::from_str(line).unwrap()).collect();
+        assert_eq!(posted.len(), messages.len());
+        for (number, text) in messages.iter().enumerate() {
+            let matches: Vec<_> = posted.iter().filter(|message| message["text"] == text.as_str()).collect();
+            assert_eq!(matches.len(), 1, "message {number} was lost or duplicated");
+            assert_eq!(matches[0]["from"], if number % 2 == 0 { "claude:c1a0de00" } else { "codex:019a-parent" });
+        }
+        let output = sandbox.tj(&["feed"], recipient);
+        assert!(output.status.success(), "{}", stderr(&output));
+        let shown = stdout(&output);
+        assert!(shown.contains("passed over 1 line(s) in the feed that were not JSON"));
+        for number in 0..messages.len() {
+            assert_eq!(shown.matches(&format!("message {number}: ")).count(), 1);
+        }
+        assert_eq!(stdout(&sandbox.tj(&["feed"], recipient)).trim(), "no unread messages");
+    }
 }

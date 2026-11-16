@@ -21,6 +21,7 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 clap = { version = "4", features = ["derive"] }
 dirs = "6"
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+fs2 = "0.4"
 getrandom = "0.4"
 rayon = "1"
 regex = "1"
