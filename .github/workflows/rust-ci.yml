@@ -43,6 +43,28 @@ jobs:
       - run: cargo clippy --all-targets --locked -- -D warnings
       - run: cargo test --locked
 
+      - name: Verify managed PowerShell (Linux x64)
+        if: runner.os == 'Linux' && runner.arch == 'X64'
+        shell: bash
+        run: |
+          set -euo pipefail
+          PYTHONPATH=packages/tj-cli/src python - <<'PY'
+          import os
+          import subprocess
+          from pathlib import Path
+          from tj_cli import powershell_install
+
+          bin_dir = Path(os.environ['RUNNER_TEMP']) / 'managed-powershell-smoke'
+          executable = powershell_install.ensure(bin_dir)
+          result = subprocess.run(
+              [str(executable), '-NoProfile', '-NonInteractive', '-Command', "'tj-powershell-ok'"],
+              check=True, capture_output=True, text=True,
+          )
+          assert result.stdout.strip() == 'tj-powershell-ok'
+          assert powershell_install.pending(bin_dir) is None
+          assert powershell_install.ensure(bin_dir) == executable
+          PY
+
       # The installer must succeed, and a second run must find nothing left to change.
       - name: Install twice (Linux)
         if: runner.os == 'Linux'

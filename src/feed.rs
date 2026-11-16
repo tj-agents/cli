@@ -99,7 +99,7 @@ impl Feed {
         #[cfg(unix)]
         std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
         let mut file = options.open(&self.messages).map_err(|error| PostError::Append(self.messages.clone(), error))?;
-        fs2::FileExt::lock_exclusive(&file).map_err(|error| PostError::Lock(self.messages.clone(), error))?;
+        fs4::FileExt::lock(&file).map_err(|error| PostError::Lock(self.messages.clone(), error))?;
         let mut recover = || -> io::Result<()> {
             if file.metadata()?.len() > 0 {
                 file.seek(SeekFrom::End(-1))?;
@@ -168,7 +168,7 @@ impl Feed {
             }
             Err(error) => return Err(failed(error)),
         };
-        fs2::FileExt::lock_shared(&file).map_err(failed)?;
+        fs4::FileExt::lock_shared(&file).map_err(failed)?;
         let length = file.metadata().map_err(failed)?.len();
         let start = Some(self.offset()?).filter(|&start| start <= length).unwrap_or(0);
         let mut bytes = Vec::new();

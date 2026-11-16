@@ -140,7 +140,14 @@ def reply(source: BinaryIO, target: BinaryIO, log: Path, message: dict) -> None:
     write(target, frame(Opcode.CONTINUATION, payload[split:]))
 
 
-def proxy(source: BinaryIO, target: BinaryIO, log: Path, scenario: str) -> None:
+def proxy(
+    source: BinaryIO,
+    target: BinaryIO,
+    log: Path,
+    scenario: str,
+    publication: Path | None,
+    shutdown: Path | None,
+) -> None:
     if scenario == "stuck-launcher":
         child = subprocess.Popen([sys.executable, __file__, "hold-open"])
         append(log, {"descendant": child.pid})
@@ -149,6 +156,7 @@ def proxy(source: BinaryIO, target: BinaryIO, log: Path, scenario: str) -> None:
     upgrade(source, target, log, scenario)
     if scenario in {"silent-upgrade", "reject-upgrade", "bad-accept"}:
         return
+    observer_reads = 0
     while True:
         try:
             message = receive(source)
@@ -177,6 +185,33 @@ def proxy(source: BinaryIO, target: BinaryIO, log: Path, scenario: str) -> None:
         if scenario == "silent-initialize" or method == "test/timeout":
             source.read()
             return
+        if (
+            scenario in {"observer", "observer-disconnect"}
+            and method == "thread/loaded/list"
+        ):
+            observer_reads += 1
+            if scenario == "observer-disconnect" and observer_reads > 1:
+                return
+            if observer_reads == 1:
+                assert publication is not None
+                publication.write_text("new-revision", encoding="utf-8")
+            reply(
+                source,
+                target,
+                log,
+                {
+                    "id": request["id"],
+                    "result": {"data": ["thread"] if observer_reads == 1 else []},
+                },
+            )
+            continue
+        if scenario == "observer-live" and method == "thread/loaded/list":
+            assert shutdown is not None
+            loaded = [] if shutdown.exists() else ["thread"]
+            reply(
+                source, target, log, {"id": request["id"], "result": {"data": loaded}}
+            )
+            continue
         if method in {"test/close", "test/close-delayed", "test/close-hold"}:
             write(target, frame(Opcode.CLOSE, b"\x03\xe8"))
             if method == "test/close-delayed":
@@ -219,6 +254,8 @@ def main() -> None:
         sys.stdout.buffer,
         log,
         os.environ.get("FAKE_CODEX_SCENARIO", "normal"),
+        Path(os.environ["FAKE_OBSERVER_PUBLICATION"]) if "FAKE_OBSERVER_PUBLICATION" in os.environ else None,
+        Path(os.environ["FAKE_OBSERVER_SHUTDOWN"]) if "FAKE_OBSERVER_SHUTDOWN" in os.environ else None,
     )
 
 

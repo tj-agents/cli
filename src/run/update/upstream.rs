@@ -1,6 +1,6 @@
 use std::fs::{self, OpenOptions};
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
+use std::process::{Child, Stdio};
 use std::thread::JoinHandle;
 use std::time::{Duration, SystemTime};
 
@@ -110,10 +110,10 @@ fn request(url: &str, etag: Option<&str>) -> Result<Answer, CheckError> {
     }
 }
 
-fn spawn(host: Host, cwd: &Path, log: &Path) -> Result<(), CheckError> {
+fn spawn(host: Host, cwd: &Path, log: &Path) -> Result<Child, CheckError> {
     let log = OpenOptions::new().create(true).append(true).open(log).map_err(CheckError::Spawn)?;
     let errors = log.try_clone().map_err(CheckError::Spawn)?;
-    let mut child = crate::run::hidden("tj-plugins")
+    let child = crate::run::hidden("tj-plugins")
         .args(["update", "--host", host.name()])
         .current_dir(cwd)
         .stdin(Stdio::null())
@@ -121,11 +121,10 @@ fn spawn(host: Host, cwd: &Path, log: &Path) -> Result<(), CheckError> {
         .stderr(errors)
         .spawn()
         .map_err(CheckError::Spawn)?;
-    std::thread::spawn(move || child.wait());
-    Ok(())
+    Ok(child)
 }
 
-fn check(state: &State, host: Host, cwd: &Path, url: &str) -> Result<Option<String>, CheckError> {
+fn check(state: &State, host: Host, cwd: &Path, url: &str) -> Result<Option<(String, Child)>, CheckError> {
     let now = SystemTime::now();
     if modified(&state.checked).is_some_and(|at| recent(at, now, CHECKED_FOR)) {
         return Ok(None);
@@ -141,9 +140,9 @@ fn check(state: &State, host: Host, cwd: &Path, url: &str) -> Result<Option<Stri
     let previous = fs::read_to_string(&state.started).unwrap_or_default();
     let started = modified(&state.started).map(|at| (previous.trim(), at));
     let Some(sha) = install(answer, started, now) else { return Ok(None) };
-    spawn(host, cwd, &state.log)?;
+    let child = spawn(host, cwd, &state.log)?;
     let _ = fs::write(&state.started, &sha);
-    Ok(Some(format!("tj-agents changed upstream; updating {} plugins in the background", host.name())))
+    Ok(Some((format!("tj-agents changed upstream; updating {} plugins in the background", host.name()), child)))
 }
 
 /// Checks once, off the launch's critical path, whether tj-agents moved past what this host last installed, and
@@ -151,16 +150,75 @@ fn check(state: &State, host: Host, cwd: &Path, url: &str) -> Result<Option<Stri
 pub(crate) fn start(host: Host, cwd: &Path, url: String) -> Option<JoinHandle<Result<Option<String>, CheckError>>> {
     let state = State::new(&paths::cache_dir().ok()?, host);
     let cwd = cwd.to_path_buf();
-    Some(std::thread::spawn(move || check(&state, host, &cwd, &url)))
+    Some(std::thread::spawn(move || {
+        check(&state, host, &cwd, &url).map(|update| {
+            update.map(|(message, mut child)| {
+                std::thread::spawn(move || child.wait());
+                message
+            })
+        })
+    }))
+}
+
+/// An updater owned by the daemon observer; dropping it ends its whole process tree.
+pub(crate) struct OwnedUpdate(Child);
+
+impl OwnedUpdate {
+    pub(crate) fn finished(&mut self) -> bool {
+        self.0.try_wait().is_ok_and(|status| status.is_some())
+    }
+}
+
+impl Drop for OwnedUpdate {
+    fn drop(&mut self) {
+        if self.finished() {
+            return;
+        }
+        #[cfg(unix)]
+        if let Ok(raw) = i32::try_from(self.0.id())
+            && let Some(group) = rustix::process::Pid::from_raw(raw)
+        {
+            let _ = rustix::process::kill_process_group(group, rustix::process::Signal::KILL);
+        }
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+pub(crate) fn start_owned(
+    host: Host,
+    cwd: &Path,
+    url: String,
+) -> Option<JoinHandle<Result<Option<OwnedUpdate>, CheckError>>> {
+    let state = State::new(&paths::cache_dir().ok()?, host);
+    let cwd = cwd.to_path_buf();
+    Some(std::thread::spawn(move || {
+        check(&state, host, &cwd, &url).map(|update| update.map(|(_, child)| OwnedUpdate(child)))
+    }))
 }
 
 #[cfg(test)]
 mod tests {
     use std::time::{Duration, UNIX_EPOCH};
 
-    use super::{Answer, CheckError, TIMEOUT, converged, install, recent, request};
+    use super::{Answer, CheckError, OwnedUpdate, TIMEOUT, converged, install, recent, request};
 
     const SHA: &str = "3f0578aa4000485aa25477e36592978fa5fa750f";
+
+    #[test]
+    fn owned_updater_is_terminated_when_the_observer_exits() {
+        let python = if cfg!(windows) { "python" } else { "python3" };
+        let child = std::process::Command::new(python)
+            .args(["-c", "import time; time.sleep(60)"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        drop(OwnedUpdate(child));
+        assert!(tj_cli::process::agent::started_at(pid).unwrap().is_none());
+    }
 
     #[test]
     fn the_converged_commit_is_the_published_revision_when_it_is_a_sha() {
