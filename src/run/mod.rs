@@ -81,6 +81,10 @@ pub struct Args {
     /// Continues this launch in a replaced tj binary: the launch, its marks and its conversation already exist.
     #[arg(long, hide = true)]
     successor: bool,
+    // Already-running wrappers include this in their handover command. Accept it only during that
+    // upgrade; it has no behavior and new wrappers never forward it.
+    #[arg(long = "ask-idle-seconds", hide = true, requires = "successor")]
+    _retired_ask_idle_seconds: Option<u64>,
     /// The agent's command line.
     #[arg(last = true, required = true)]
     agent: Vec<OsString>,
@@ -675,6 +679,7 @@ mod tests {
             input_idle_seconds: 2,
             update_url: String::new(),
             successor: false,
+            _retired_ask_idle_seconds: None,
             agent,
         }
     }

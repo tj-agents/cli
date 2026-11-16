@@ -589,7 +589,7 @@ fn idle_sessions_never_generate_notices_or_prompts() {
 }
 
 #[test]
-fn the_idle_ask_option_is_removed() {
+fn fresh_launches_reject_the_retired_idle_ask_option() {
     let sandbox = sandbox();
     let output = Command::new(env!("CARGO_BIN_EXE_tj"))
         .args(["run", "--ask-idle-seconds", "2", "--", "unused"])
@@ -597,7 +597,9 @@ fn the_idle_ask_option_is_removed() {
         .output()
         .unwrap();
     assert_eq!(output.status.code(), Some(2));
-    assert!(String::from_utf8_lossy(&output.stderr).contains("unexpected argument '--ask-idle-seconds'"));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("required arguments were not provided"), "{stderr}");
+    assert!(stderr.contains("--successor"), "{stderr}");
     assert!(log(&sandbox, "stubs/agent-store.log").is_empty());
 }
 
@@ -646,7 +648,9 @@ fn merge_notice_identity_survives_successor_restarts_and_new_launches_of_the_sam
             }
             if successor {
                 let separator = arguments.iter().position(|argument| argument == "--").unwrap();
-                arguments.insert(separator, "--successor".into());
+                // This is the handover command emitted by already-running wrappers. A zero interval
+                // also proves that accepting the retired argument does not restore idle prompts.
+                arguments.splice(separator..separator, ["--ask-idle-seconds", "0", "--successor"].map(str::to_owned));
             }
             let starts = log(&sandbox, "dummy.log").lines().filter(|line| line.starts_with("pid ")).count();
             let child = spawn(&sandbox, &arguments, &sandbox.root);
