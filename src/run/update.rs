@@ -1,6 +1,7 @@
 mod claude;
 mod codex;
 pub(crate) mod gate;
+pub(crate) mod observer;
 pub(crate) mod successor;
 pub(crate) mod upstream;
 mod watch;

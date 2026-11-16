@@ -8,6 +8,7 @@ use std::ptr::{null, null_mut};
 
 use windows_sys::Win32::Foundation::{
     DUPLICATE_SAME_ACCESS, DuplicateHandle, ERROR_CANT_ACCESS_FILE, HANDLE, INVALID_HANDLE_VALUE, WAIT_FAILED,
+    WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::System::Console::{
     AllocConsole, GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
@@ -17,11 +18,74 @@ use windows_sys::Win32::System::JobObjects::{
     JobObjectExtendedLimitInformation, SetInformationJobObject,
 };
 use windows_sys::Win32::System::Threading::{
-    CREATE_NEW_CONSOLE, CreateProcessW, DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess,
-    GetExitCodeProcess, GetStartupInfoW, INFINITE, InitializeProcThreadAttributeList,
+    CREATE_NEW_CONSOLE, CREATE_NO_WINDOW, CreateProcessW, DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT,
+    GetCurrentProcess, GetExitCodeProcess, GetStartupInfoW, INFINITE, InitializeProcThreadAttributeList,
     PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROC_THREAD_ATTRIBUTE_JOB_LIST, PROCESS_INFORMATION, STARTF_USESHOWWINDOW,
-    STARTF_USESTDHANDLES, STARTUPINFOEXW, UpdateProcThreadAttribute, WaitForSingleObject,
+    STARTF_USESTDHANDLES, STARTUPINFOEXW, STARTUPINFOW, TerminateProcess, UpdateProcThreadAttribute,
+    WaitForSingleObject,
 };
+
+pub(super) struct Background(OwnedHandle);
+
+impl Background {
+    pub(super) fn running(&self) -> io::Result<bool> {
+        match unsafe { WaitForSingleObject(self.0.as_raw_handle(), 0) } {
+            WAIT_TIMEOUT => Ok(true),
+            WAIT_OBJECT_0 => Ok(false),
+            _ => Err(io::Error::last_os_error()),
+        }
+    }
+
+    pub(super) fn kill(&self) -> io::Result<()> {
+        if !self.running()? {
+            return Ok(());
+        }
+        if unsafe { TerminateProcess(self.0.as_raw_handle(), 1) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        match unsafe { WaitForSingleObject(self.0.as_raw_handle(), 3_000) } {
+            WAIT_OBJECT_0 => Ok(()),
+            WAIT_TIMEOUT => Err(io::Error::new(io::ErrorKind::TimedOut, "background process did not exit")),
+            _ => Err(io::Error::last_os_error()),
+        }
+    }
+}
+
+pub(super) fn background(arguments: &[OsString], cwd: &std::path::Path) -> io::Result<Background> {
+    let Some(program) = arguments.first() else {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "no executable given"));
+    };
+    if !std::path::Path::new(program).is_absolute() {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "background executable must be absolute"));
+    }
+    let executable = wide(program)?;
+    let mut command = command_line(arguments)?;
+    let directory = wide(cwd.as_os_str())?;
+    unsafe {
+        let mut startup: STARTUPINFOW = zeroed();
+        startup.cb = size_of::<STARTUPINFOW>() as u32;
+        startup.dwFlags = STARTF_USESHOWWINDOW | STARTF_USESTDHANDLES;
+        startup.wShowWindow = 0;
+        let mut process: PROCESS_INFORMATION = zeroed();
+        if CreateProcessW(
+            executable.as_ptr(),
+            command.as_mut_ptr(),
+            null(),
+            null(),
+            0,
+            CREATE_NO_WINDOW,
+            null(),
+            directory.as_ptr(),
+            &startup,
+            &mut process,
+        ) == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        drop(OwnedHandle::from_raw_handle(process.hThread));
+        Ok(Background(OwnedHandle::from_raw_handle(process.hProcess)))
+    }
+}
 
 pub(super) struct AttributeList(pub(super) Vec<usize>);
 

@@ -73,7 +73,13 @@ impl Server {
         Self::connect_command(command, REQUEST_TIMEOUT)
     }
 
-    fn connect_command(command: Command, request_timeout: Duration) -> Result<Self, Error> {
+    pub(crate) fn connect_socket(socket: &std::path::Path) -> Result<Self, Error> {
+        let mut command = host_command("codex").map_err(Error::Host)?;
+        command.args(["app-server", "proxy", "--sock"]).arg(socket);
+        Self::connect_command(command, Duration::from_secs(3))
+    }
+
+    pub(crate) fn connect_command(command: Command, request_timeout: Duration) -> Result<Self, Error> {
         #[cfg(windows)]
         let command = contained_command(command)?;
         #[cfg(unix)]
