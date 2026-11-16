@@ -261,6 +261,9 @@ pub fn require_managed_claims(session: &str) -> Result<()> {
 
 /// Historical launch rows retain their binding when this native session registers a new launch.
 pub fn predecessors(launch: &Launch, owner: &Ownership) -> Result<Vec<Row>> {
+    let Some(current_item) = owner.item.as_deref() else {
+        return Ok(Vec::new());
+    };
     let data = call(&["launches"])?;
     let rows = data["launches"].as_array().context("agent-store launches returned no list")?;
     let mut predecessors: Vec<Row> = Vec::new();
@@ -273,7 +276,7 @@ pub fn predecessors(launch: &Launch, owner: &Ownership) -> Result<Vec<Row>> {
         if value["host"].as_str() != Some(launch.host.name()) {
             bail!("historical launch host does not match its session");
         }
-        if item(value)? != owner.item {
+        if item(value)?.as_deref() != Some(current_item) {
             continue;
         }
         let predecessor = row(value).context("historical launch identity is incomplete")?;
