@@ -3,6 +3,18 @@ use std::process::{Command, ExitCode};
 
 use anyhow::{Context, Result, bail};
 
+use crate::host::Host;
+
+#[derive(clap::Args)]
+pub(crate) struct HostArgs {
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+    pub(crate) arguments: Vec<OsString>,
+}
+
+pub(crate) fn host(host: Host, args: HostArgs) -> Result<ExitCode> {
+    run(std::iter::once(OsString::from(host.name())).chain(args.arguments).collect())
+}
+
 pub fn run(arguments: Vec<OsString>) -> Result<ExitCode> {
     let Some((name, rest)) = arguments.split_first() else {
         bail!("missing subcommand");

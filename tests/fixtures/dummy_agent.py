@@ -50,13 +50,17 @@ def run_commands() -> None:
     lines = commands.read_text(encoding="utf-8").splitlines()
     for number, line in enumerate(lines[done:], start=done):
         command = json.loads(line)
-        if command[0] == "shell":
+        if isinstance(command, list) and command[0] == "shell":
             shell(command[1] == "start")
             ran.write_text(str(number + 1), encoding="utf-8")
             note(f"ran {number} 0 ")
             continue
+        arguments = command if isinstance(command, list) else command["arguments"]
         result = subprocess.run(
-            [os.environ["DUMMY_TJ"], *command], capture_output=True, text=True
+            [os.environ["DUMMY_TJ"], *arguments],
+            capture_output=True,
+            input=None if isinstance(command, list) else command.get("input"),
+            text=True,
         )
         ran.write_text(str(number + 1), encoding="utf-8")
         note(f"ran {number} {result.returncode} {result.stderr.strip()}")
