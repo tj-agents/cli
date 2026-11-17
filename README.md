@@ -230,6 +230,12 @@ repository settings untouched. Drift reports an explicit `tj prepare --host <hos
 command. Preparation failures warn and allow the provider to start, but missing lifecycle evidence leaves
 completion unverified. Install and enable Agent in that repository for managed completion.
 
+Work-item launches accept a full tracker reference or URL. A bare id such as `461` or `#461` is resolved
+by `tj-item --cwd WORKTREE reference ID` using that project's tracker profile before a launch is recorded
+or an agent starts. `tj closeout ID` uses the current directory's profile before attempting closeout.
+A missing profile or failed resolution stops the command; a Git code remote never selects a tracker.
+Recovery and binary handover carry the resolved reference with the original agent arguments.
+
 ### Completion, waits and keep-open
 
 Run these commands from the managed agent's own tool process:

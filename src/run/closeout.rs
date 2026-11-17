@@ -7,7 +7,7 @@ use serde_json::{Value, json};
 
 use super::{Launch, hidden, lifecycle, store};
 use crate::completion::{State, Step};
-use crate::{feed, paths};
+use crate::{feed, item_cli, paths};
 
 mod journal;
 
@@ -34,6 +34,7 @@ fn repository(launch: &Launch) -> Result<PathBuf> {
 
 pub fn notify(launch: &Launch) -> Result<()> {
     let Some(item) = &launch.item else { return Ok(()) };
+    let item = item.as_str();
     let output = hidden("tj-item")
         .args(["prs", item])
         .current_dir(repository(launch)?)
@@ -464,6 +465,7 @@ pub fn finish(launch: &Launch, plan: Plan, closing: &lifecycle::Closing) -> Resu
     if !closing.recorded(Step::Tracker)? {
         closing.attempt(Step::Tracker, || {
             if let Some(item) = &launch.item {
+                let item = item.as_str();
                 let output = hidden("tj-item")
                     .args(["progress", item, "--state", "Done"])
                     .current_dir(&plan.repository)
@@ -474,7 +476,13 @@ pub fn finish(launch: &Launch, plan: Plan, closing: &lifecycle::Closing) -> Resu
                     bail!("tj item progress {item}: {}", String::from_utf8_lossy(&output.stderr).trim());
                 }
             }
-            closing.record(Step::Tracker, &format!("tracker-done:{}", launch.item.as_deref().unwrap_or("no-work-item")))
+            closing.record(
+                Step::Tracker,
+                &format!(
+                    "tracker-done:{}",
+                    launch.item.as_ref().map_or("no-work-item", crate::domain::item::Reference::as_str)
+                ),
+            )
         })?;
     }
     closing.check()?;
@@ -501,8 +509,10 @@ pub struct Args {
 }
 
 pub fn run(args: Args) -> Result<ExitCode> {
+    let cwd = std::env::current_dir()?;
+    let item = args.item.as_deref().map(|value| item_cli::reference(value, &cwd, hidden("tj-item"))).transpose()?;
     let mut failed = false;
-    for row in store::launches(args.item.as_deref())? {
+    for row in store::launches(item.as_ref())? {
         match wrapper_alive(&row) {
             Ok(true) => continue,
             Ok(false) => {}
@@ -514,11 +524,11 @@ pub fn run(args: Args) -> Result<ExitCode> {
         }
         let launch = &row.launch;
         let started = !matches!(journal::read(launch), Ok(None));
-        let selected = args.item.is_some() || row.closing || started;
+        let selected = item.is_some() || row.closing || started;
         let result = (|| -> Result<bool> {
             let store = match lifecycle::for_recovery(&launch.id) {
                 Ok(Some(store)) => store,
-                Ok(None) if args.item.is_none() => return Ok(false),
+                Ok(None) if item.is_none() => return Ok(false),
                 Ok(None) => bail!("native session belongs to a newer launch; resume that session to finish this work"),
                 Err(_) if !selected => return Ok(false),
                 Err(error) => return Err(error),
