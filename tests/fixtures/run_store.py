@@ -84,11 +84,84 @@ def prebound_reply(
     return {"ok": True, "data": Data(launch=launch, session=native)}
 
 
+def record_launch(root: Path, arguments: list[str]) -> None:
+    """Persist the reciprocal active binding registered by a managed wrapper."""
+    show_path = root / "agent-store-show.json"
+    if show_path.exists():
+        show = json.loads(show_path.read_text(encoding="utf-8"))
+    else:
+        show = {"ok": True, "data": {"launch": {}, "session": {}}}
+    launch = show["data"]["launch"]
+    host = value(arguments, "--host")
+    launch_id = value(arguments, "--launch-id")
+    session = launch.get("session", f"{host}:sess-1")
+    launch.update(
+        {
+            "launch_id": launch_id,
+            "host": host,
+            "title": value(arguments, "--title"),
+            "cwd": value(arguments, "--cwd"),
+            "session": session,
+            "state": "active",
+            "item": {"ref": value(arguments, "--item")}
+            if "--item" in arguments
+            else None,
+            "parent": value(arguments, "--parent") if "--parent" in arguments else None,
+            "wrapper": {
+                "pid": int(value(arguments, "--wrapper-pid")),
+                "started_at": value(arguments, "--wrapper-started-at"),
+            },
+        }
+    )
+    native = show["data"].get("session")
+    if not native:
+        native_id = session.split(":", maxsplit=1)[1]
+        native = {
+            "session": session,
+            "native_id": native_id,
+            "host": host,
+            "launch_id": launch_id,
+            "worktree": value(arguments, "--worktree"),
+            "state": "active",
+        }
+        show["data"]["session"] = native
+    show_path.write_text(json.dumps(show), encoding="utf-8")
+
+    launches_path = root / "agent-store-launches.json"
+    launches = json.loads(launches_path.read_text(encoding="utf-8"))
+    rows = [
+        row for row in launches["data"]["launches"] if row["launch_id"] != launch_id
+    ]
+    rows.append(
+        {
+            **launch,
+            "worktree": value(arguments, "--worktree"),
+            "created_at": value(arguments, "--wrapper-started-at"),
+        }
+    )
+    launches["data"]["launches"] = rows
+    launches_path.write_text(json.dumps(launches), encoding="utf-8")
+
+
 def main() -> None:
     root = Path(__file__).parent
     command, *arguments = sys.argv[1:]
     with (root / "agent-store.log").open("a", encoding="utf-8") as log:
         log.write(" ".join(sys.argv[1:]) + "\n")
+    if command == "show" and arguments and ":" in arguments[0]:
+        handle = arguments[0].replace(":", "-")
+        session_path = root / f"agent-store-show-{handle}.json"
+        if session_path.is_file():
+            session_reply = json.loads(session_path.read_text(encoding="utf-8"))
+            print(
+                json.dumps(
+                    {
+                        "ok": session_reply["ok"],
+                        "data": Data(session=session_reply["data"].get("session")),
+                    }
+                )
+            )
+            return
     reply_path = root / f"agent-store-{command}.json"
     reply: Reply = (
         json.loads(reply_path.read_text(encoding="utf-8"))
@@ -104,6 +177,8 @@ def main() -> None:
     prebound = prebound_reply(root, command, arguments, reply)
     if prebound is not None:
         reply = prebound
+    elif command == "launch" and reply["ok"]:
+        record_launch(root, arguments)
     released_path = root / "released.json"
     released: list[Claim] = (
         json.loads(released_path.read_text(encoding="utf-8"))

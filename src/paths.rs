@@ -27,6 +27,14 @@ pub fn cache_dir() -> Result<PathBuf> {
     Ok(dirs::cache_dir().context("cannot determine the cache directory")?.join("tj"))
 }
 
+/// Durable result receipts are application state, separate from disposable indexes and caches.
+pub fn state_dir() -> Result<PathBuf> {
+    if let Some(dir) = env_dir("TJ_STATE_DIR") {
+        return Ok(dir);
+    }
+    Ok(dirs::data_local_dir().context("cannot determine the application data directory")?.join("tj"))
+}
+
 /// A path as a comparable string: forward slashes, no trailing slash, and case-folded on Windows
 /// where the filesystem is case-insensitive. Git, the shell and transcripts disagree on all three.
 pub fn norm(path: &str) -> String {
