@@ -427,6 +427,7 @@ fn set_status(sandbox: &Sandbox, status: &str) {
 }
 
 fn set_status_at(sandbox: &Sandbox, status: &str, when: chrono::DateTime<chrono::Utc>) {
+    wait_for_log(sandbox, "pid ");
     let pid = log(sandbox, "dummy.log").lines().rev().find_map(|line| line.strip_prefix("pid ")).unwrap().to_owned();
     let sessions = sandbox.root.join("claude").join("sessions");
     std::fs::create_dir_all(&sessions).unwrap();
@@ -606,7 +607,8 @@ fn assert_unfinished(sandbox: &Sandbox, launch: &str) {
 fn codex_final_result_reaches_its_parent_once_and_has_a_durable_receipt() {
     let sandbox = sandbox();
     let launch = "codex-parent-result";
-    let mut arguments = run_arguments(&sandbox, launch, "codex", "signal", "10");
+    let keys = cfg!(windows);
+    let mut arguments = run_arguments(&sandbox, launch, "codex", if keys { "keys" } else { "signal" }, "10");
     let separator = arguments.iter().position(|argument| argument == "--").unwrap();
     arguments.splice(separator..separator, ["--parent", "codex:parent-1"].map(str::to_owned));
     let show = sandbox.stubs.join("agent-store-show.json");
@@ -624,9 +626,9 @@ fn codex_final_result_reaches_its_parent_once_and_has_a_durable_receipt() {
         .to_string(),
     );
     let child = spawn(&sandbox, &arguments, &sandbox.root);
-    wait_for_log(&sandbox, "agent ");
-    done(&sandbox);
+    wait_for_log(&sandbox, if keys { "raw" } else { "pid " });
     assert_eq!(in_agent(&sandbox, &["hold"]).0, 0);
+    done(&sandbox);
     let messages = || {
         log(&sandbox, "cache/feed/codex-parent-1.jsonl")
             .lines()
