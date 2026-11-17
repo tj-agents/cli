@@ -67,6 +67,14 @@ fn sandbox(sessions: &[Value]) -> Sandbox {
 }
 
 impl Sandbox {
+    fn sessions(&self, sessions: &[Value]) {
+        std::fs::write(
+            self.stubs.join("agent-store-sessions.json"),
+            json!({"schema_version":1, "ok":true, "data":{"title":"x", "sessions":sessions}}).to_string(),
+        )
+        .unwrap();
+    }
+
     fn command(&self, arguments: &[&str], caller: &[(&str, &str)]) -> Command {
         let path = std::env::join_paths(
             std::iter::once(self.stubs.clone()).chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
@@ -207,7 +215,7 @@ fn claude_routes_through_its_native_adapter_and_retries_keep_the_original_receip
     assert_eq!(serde_json::from_slice::<Value>(&retry.stdout).unwrap(), receipt);
     let changed = sandbox.tj(&["message", "Peer", "changed", "--request-id", "stable"], &FROM_CLAUDE);
     assert_eq!(changed.status.code(), Some(2));
-    assert!(stderr(&changed).contains("changes the original recipient or content"));
+    assert!(stderr(&changed).contains("changes the recorded recipient, transport, content or kind"));
     assert!(adapter.requests.try_recv().is_err());
     assert!(!sandbox.root.join("cache/feed").exists());
 }
@@ -254,6 +262,12 @@ fn missing_or_crashed_native_adapters_do_not_resend_or_switch_transport() {
     let retry = sandbox.tj(&arguments, &FROM_CLAUDE);
     assert_eq!(retry.status.code(), Some(2));
     assert!(stderr(&retry).contains("delivery is unknown"));
+    sandbox.sessions(&[session("codex", CODEX_CHILD, "Peer", "active")]);
+    let redirected = sandbox.tj(&arguments, &FROM_CLAUDE);
+    assert_eq!(redirected.status.code(), Some(2));
+    assert!(stderr(&redirected).contains("changes the recorded recipient"));
+    assert!(!sandbox.root.join("cache/feed").exists());
+    sandbox.sessions(&[session("claude", CLAUDE_PEER, "Peer", "active")]);
     let restarted = NativeAdapter::start(&sandbox);
     assert!(restarted.requests.recv_timeout(Duration::from_millis(300)).is_err());
     assert!(!sandbox.root.join("cache/feed").exists());
@@ -267,8 +281,153 @@ fn feed_retries_preserve_one_copy_and_refuse_changed_content() {
     assert!(sandbox.tj(&arguments, &FROM_CODEX).status.success());
     let changed = sandbox.tj(&["message", "Peer", "changed", "--request-id", "stable"], &FROM_CODEX);
     assert_eq!(changed.status.code(), Some(2));
-    assert!(stderr(&changed).contains("changes the original sender or content"));
+    assert!(stderr(&changed).contains("changes the recorded recipient, transport, content or kind"));
     assert_eq!(sandbox.posted(&format!("codex-{CODEX_CHILD}.jsonl")).len(), 1);
+}
+
+#[test]
+fn feed_request_retries_refuse_reused_titles_within_and_across_providers() {
+    for initial_host in ["codex", "claude"] {
+        for replacement_host in ["codex", "claude"] {
+            let original = session(initial_host, "original", "Peer", "active");
+            let sandbox = sandbox(std::slice::from_ref(&original));
+            let arguments = ["message", "Peer", "private result", "--request-id", "stable"];
+            let sent = sandbox.tj(&arguments, &FROM_CODEX);
+            assert!(sent.status.success(), "{}", stderr(&sent));
+            sandbox.sessions(&[
+                session(initial_host, "original", "Peer", "ended"),
+                session(replacement_host, "replacement", "Peer", "active"),
+            ]);
+            let retry = sandbox.tj(&arguments, &FROM_CODEX);
+            assert_eq!(retry.status.code(), Some(2), "{}", stdout(&retry));
+            assert!(stderr(&retry).contains("changes the recorded recipient"));
+            assert!(!sandbox.feed(&format!("{replacement_host}-replacement.jsonl")).exists());
+            // A subsequent process can still retry the original binding without duplicating delivery.
+            sandbox.sessions(&[original]);
+            let retry = sandbox.tj(&arguments, &FROM_CODEX);
+            assert!(retry.status.success(), "{}", stderr(&retry));
+            assert_eq!(sandbox.posted(&format!("{initial_host}-original.jsonl")).len(), 1);
+        }
+    }
+}
+
+#[test]
+fn native_receipts_cannot_be_redirected_to_a_feed_by_reusing_a_title() {
+    for native in [
+        json!({"isDelivered":true}),
+        json!({"isDelivered":false,"reason":"Permission was denied"}),
+        json!({"error":"Native delivery is unknown"}),
+    ] {
+        let original = session("claude", CLAUDE_PEER, "Peer", "active");
+        let sandbox = sandbox(std::slice::from_ref(&original));
+        let adapter = NativeAdapter::start(&sandbox);
+        let arguments = ["message", "Peer", "private result", "--request-id", "stable"];
+        let sending =
+            sandbox.command(&arguments, &FROM_CLAUDE).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+        native_receipt(&sandbox, &adapter.request(), &native);
+        let output = sending.wait_with_output().unwrap();
+        let receipt: Value = serde_json::from_slice(&output.stdout).unwrap();
+        sandbox.sessions(&[
+            session("claude", CLAUDE_PEER, "Peer", "ended"),
+            session("codex", CODEX_CHILD, "Peer", "active"),
+        ]);
+        let retry = sandbox.tj(&arguments, &FROM_CLAUDE);
+        assert_eq!(retry.status.code(), Some(2), "{}", stdout(&retry));
+        assert!(stderr(&retry).contains("changes the recorded recipient"));
+        assert!(!sandbox.root.join("cache/feed").exists());
+        // Even after the adapter exits, exact retries return its original receipt rather than resending.
+        drop(adapter);
+        sandbox.sessions(&[original]);
+        let retry = sandbox.tj(&arguments, &FROM_CLAUDE);
+        assert_eq!(retry.status.code(), output.status.code(), "{}", stderr(&retry));
+        assert_eq!(serde_json::from_slice::<Value>(&retry.stdout).unwrap(), receipt);
+    }
+}
+
+#[test]
+fn a_feed_request_cannot_switch_to_native_when_its_title_changes_provider() {
+    let sandbox = sandbox(&[session("codex", CODEX_CHILD, "Peer", "active")]);
+    let adapter = NativeAdapter::start(&sandbox);
+    let arguments = ["message", "Peer", "private result", "--request-id", "stable"];
+    let sent = sandbox.tj(&arguments, &FROM_CLAUDE);
+    assert!(sent.status.success(), "{}", stderr(&sent));
+    sandbox.sessions(&[session("claude", CLAUDE_PEER, "Peer", "active")]);
+    // Keep the CLI child bounded even if a regression queues a native send and waits for its receipt.
+    let mut retry =
+        sandbox.command(&arguments, &FROM_CLAUDE).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+    match adapter.requests.recv_timeout(Duration::from_secs(1)) {
+        Ok(request) => {
+            native_receipt(&sandbox, &request, &json!({"isDelivered":true}));
+            let output = retry.wait_with_output().unwrap();
+            panic!("retry switched to native: {}", stdout(&output));
+        }
+        Err(mpsc::RecvTimeoutError::Timeout) => {}
+        Err(error) => panic!("native adapter ended unexpectedly: {error}"),
+    }
+    let deadline = Instant::now() + Duration::from_secs(8);
+    while retry.try_wait().unwrap().is_none() {
+        if Instant::now() >= deadline {
+            let _ = retry.kill();
+            let _ = retry.wait();
+            panic!("binding refusal did not return");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let output = retry.wait_with_output().unwrap();
+    assert_eq!(output.status.code(), Some(2), "{}", stdout(&output));
+    assert!(stderr(&output).contains("changes the recorded recipient"));
+    assert_eq!(sandbox.posted(&format!("codex-{CODEX_CHILD}.jsonl")).len(), 1);
+    assert!(adapter.requests.try_recv().is_err());
+}
+
+#[test]
+fn torn_or_malformed_request_bindings_refuse_dispatch_after_a_process_restart() {
+    for damage in ["{\"schema\":1", "{}\n", "not json\n"] {
+        let sandbox = sandbox(&[session("codex", CODEX_CHILD, "Peer", "active")]);
+        let arguments = ["message", "Peer", "private result", "--request-id", "stable"];
+        let sent = sandbox.tj(&arguments, &FROM_CODEX);
+        assert!(sent.status.success(), "{}", stderr(&sent));
+        let journal = sandbox.root.join("state/messages/bindings.jsonl");
+        let intact = std::fs::read_to_string(&journal).unwrap();
+        let damaged = format!("{intact}{damage}");
+        std::fs::write(&journal, &damaged).unwrap();
+        let retry = sandbox.tj(&arguments, &FROM_CODEX);
+        assert_eq!(retry.status.code(), Some(2));
+        assert!(stderr(&retry).contains("message binding journal"));
+        sandbox.sessions(&[session("claude", CLAUDE_PEER, "Peer", "active")]);
+        let fresh = sandbox.tj(&["message", "Peer", "another result", "--request-id", "fresh"], &FROM_CODEX);
+        assert_eq!(fresh.status.code(), Some(2));
+        assert!(stderr(&fresh).contains("message binding journal"));
+        assert!(!sandbox.feed(&format!("claude-{CLAUDE_PEER}.jsonl")).exists());
+        assert_eq!(sandbox.posted(&format!("codex-{CODEX_CHILD}.jsonl")).len(), 1);
+        assert_eq!(std::fs::read_to_string(&journal).unwrap(), damaged);
+    }
+}
+
+#[test]
+fn concurrent_request_retries_deliver_one_copy_per_source() {
+    let sandbox = sandbox(&[session("codex", CODEX_CHILD, "Peer", "active")]);
+    let children: Vec<_> = (0..8)
+        .map(|index| {
+            let caller = if index % 2 == 0 { &FROM_CODEX[..] } else { &FROM_CLAUDE[..] };
+            sandbox
+                .command(&["message", "Peer", "private result", "--request-id", "stable"], caller)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap()
+        })
+        .collect();
+    for child in children {
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success(), "{}", stderr(&output));
+    }
+    let posted = sandbox.posted(&format!("codex-{CODEX_CHILD}.jsonl"));
+    assert_eq!(posted.len(), 2);
+    for source in ["codex:019a-parent", "claude:c1a0de00"] {
+        assert_eq!(posted.iter().filter(|message| message["from"] == source).count(), 1);
+    }
 }
 
 #[test]
@@ -437,6 +596,9 @@ fn only_the_owner_can_read_a_feed() {
     let feed = sandbox.feed(&format!("codex-{CODEX_CHILD}.jsonl"));
     assert_eq!(mode(&feed), 0o600);
     assert_eq!(mode(feed.parent().unwrap()), 0o700);
+    let bindings = sandbox.root.join("state/messages/bindings.jsonl");
+    assert_eq!(mode(&bindings), 0o600);
+    assert_eq!(mode(bindings.parent().unwrap()), 0o700);
 }
 
 #[test]

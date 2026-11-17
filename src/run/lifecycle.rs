@@ -1,6 +1,7 @@
 //! CLI boundary for native evidence, explicit disposition, and durable result receipts.
 
 use std::io::{self, Read};
+use std::path::Path;
 use std::process::ExitCode;
 
 use anyhow::{Context, Result, bail};
@@ -103,25 +104,34 @@ fn inherit_hold(current_store: &Store) -> Result<()> {
     }
     let data = store::call(&["launches"])?;
     let rows = data["launches"].as_array().context("agent-store launches returned no list")?;
+    inherit_recorded_hold(current_store, rows, &paths::state_dir()?.join("completion"))
+}
+
+fn inherit_recorded_hold(current_store: &Store, rows: &[Value], root: &Path) -> Result<()> {
     let current = rows
         .iter()
         .find(|row| row["launch_id"].as_str() == Some(current_store.identity().launch_id()))
         .context("current launch is absent from launch history")?;
     let created = text(current, "created_at")?;
-    let previous = rows
+    let mut previous: Vec<_> = rows
         .iter()
         .filter(|row| {
             row["session"].as_str() == Some(current_store.identity().session_handle())
                 && row["launch_id"].as_str() != Some(current_store.identity().launch_id())
                 && row["created_at"].as_str().is_some_and(|at| at < created)
         })
-        .max_by_key(|row| row["created_at"].as_str());
-    let Some(previous) = previous else { return Ok(()) };
-    let identity = Identity::new(text(previous, "launch_id")?, current_store.identity().session_handle())?;
-    let prior = Store::open(paths::state_dir()?.join("completion"), identity).load()?;
-    if prior.is_some_and(|record| record.held_open()) {
-        let event = EventId::new("inherited-hold")?;
-        current_store.transition(|record| if record.revision() == 0 { record.set_hold(event) } else { Ok(()) })?;
+        .collect();
+    previous.sort_by_key(|row| std::cmp::Reverse(row["created_at"].as_str()));
+    for previous in previous {
+        let identity = Identity::new(text(previous, "launch_id")?, current_store.identity().session_handle())?;
+        // A resume can bind and crash before its first native turn. It has no recorded hold decision.
+        let Some(prior) = Store::open(root, identity).load()? else { continue };
+        if prior.held_open() {
+            let event = EventId::new("inherited-hold")?;
+            current_store.transition(|record| if record.revision() == 0 { record.set_hold(event) } else { Ok(()) })?;
+        }
+        // A recorded release is authoritative; do not resurrect an older hold.
+        break;
     }
     Ok(())
 }
@@ -391,6 +401,52 @@ pub fn native_event() -> Result<ExitCode> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn interrupted_resumes_preserve_the_last_recorded_hold_decision() {
+        for released in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let identity = |launch| Identity::new(launch, "codex:session").unwrap();
+            let held = Store::open(root.path(), identity("held"));
+            held.transition(|record| record.set_hold(EventId::new("hold").unwrap())).unwrap();
+            if released {
+                let released = Store::open(root.path(), identity("released"));
+                released.transition(|record| record.release_hold(EventId::new("release").unwrap())).unwrap();
+            }
+            let rows = vec![
+                json!({"launch_id":"interrupted", "session":"codex:session", "created_at":"2026-11-17T03:00:00Z"}),
+                json!({"launch_id":"current", "session":"codex:session", "created_at":"2026-11-17T04:00:00Z"}),
+                json!({"launch_id":"held", "session":"codex:session", "created_at":"2026-11-17T01:00:00Z"}),
+                json!({"launch_id":"released", "session":"codex:session", "created_at":"2026-11-17T02:00:00Z"}),
+            ];
+            let current = Store::open(root.path(), identity("current"));
+            inherit_recorded_hold(&current, &rows, root.path()).unwrap();
+            assert_eq!(current.load().unwrap().is_some_and(|record| record.held_open()), !released);
+            // The next native turn must retain the inherited disposition.
+            let event = json!({"session":"codex:session", "turn":"turn", "event":"start", "pending":null});
+            assert_eq!(apply(&current, &event).unwrap().held_open(), !released);
+        }
+    }
+
+    #[test]
+    fn malformed_previous_completion_cannot_silently_release_a_hold() {
+        let root = tempfile::tempdir().unwrap();
+        let held = Store::open(root.path(), Identity::new("held", "codex:session").unwrap());
+        held.transition(|record| record.set_hold(EventId::new("hold").unwrap())).unwrap();
+        let path = std::fs::read_dir(root.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| path.extension().is_some_and(|extension| extension == "json"))
+            .unwrap();
+        std::fs::write(path, "{torn").unwrap();
+        let current = Store::open(root.path(), Identity::new("current", "codex:session").unwrap());
+        let rows = vec![
+            json!({"launch_id":"held", "session":"codex:session", "created_at":"2026-11-17T01:00:00Z"}),
+            json!({"launch_id":"current", "session":"codex:session", "created_at":"2026-11-17T02:00:00Z"}),
+        ];
+        assert!(inherit_recorded_hold(&current, &rows, root.path()).is_err());
+        assert!(current.load().unwrap().is_none());
+    }
 
     #[test]
     fn native_events_keep_waits_and_reject_foreign_or_conflicting_results() {

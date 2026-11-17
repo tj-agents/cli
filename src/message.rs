@@ -4,8 +4,9 @@ use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 
 use crate::feed::{self, Feed};
-use crate::{host::Host, run::store};
+use crate::{host::Host, paths, run::store};
 
+mod binding;
 pub(crate) mod bridge;
 
 #[derive(clap::Args)]
@@ -90,7 +91,16 @@ pub(crate) fn send(
         bail!("{} runs on {}, which tj message cannot reach", target.name(), target.host);
     }
     crate::completion::Identity::new("message", target.handle())?;
-    if target.host == "claude" && from.is_some_and(|source| source.starts_with("claude:")) {
+    let native = target.host == "claude" && from.is_some_and(|source| source.starts_with("claude:"));
+    let transport = if native { "native" } else { "feed" };
+    binding::bind(
+        &paths::state_dir()?.join("messages"),
+        &json!({
+            "schema":1, "source":from, "event":event, "target":target.handle(),
+            "transport":transport, "text":text, "kind":kind,
+        }),
+    )?;
+    if native {
         return bridge::send(from.context("native message needs a source session")?, &target.handle(), text, event);
     }
     let at = chrono::Local::now().format("%Y-%m-%d %H:%M").to_string();
