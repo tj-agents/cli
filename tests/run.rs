@@ -389,11 +389,12 @@ fn lifecycle(sandbox: &Sandbox, turn: &str, event: &str, report: Option<&str>, p
 /// The agent's final native response: start the turn, request finish, then provide its nonempty report.
 fn done(sandbox: &Sandbox) {
     let turn = format!("turn-{}", log(sandbox, "commands").lines().count());
+    set_turn(sandbox, false);
     lifecycle(sandbox, &turn, "start", None, None);
     let (code, stderr) = in_agent(sandbox, &["finish"]);
     assert_eq!(code, 0, "tj finish: {stderr}");
-    lifecycle(sandbox, &turn, "end", Some("Final result"), None);
     set_turn(sandbox, true);
+    lifecycle(sandbox, &turn, "end", Some("Final result"), None);
 }
 
 fn refused(sandbox: &Sandbox, child: &mut Child, launch: &str) {
@@ -1723,6 +1724,17 @@ fn only_the_tabs_own_agent_can_request_finish() {
     let wrapper =
         log(&sandbox, "dummy.log").lines().find_map(|line| line.strip_prefix("wrapper ").map(str::to_owned)).unwrap();
     let (pid, started_at) = wrapper.split_once(' ').unwrap();
+    lifecycle(&sandbox, "owned-turn", "start", None, None);
+    let receipt = || {
+        Command::new(env!("CARGO_BIN_EXE_tj"))
+            .args(["receipt", "--launch", "owned"])
+            .envs(environment(&sandbox))
+            .current_dir(&sandbox.root)
+            .output()
+            .unwrap()
+    };
+    let before = receipt();
+    assert!(before.status.success(), "{}", String::from_utf8_lossy(&before.stderr));
     let foreign = |arguments: &[&str]| {
         Command::new(env!("CARGO_BIN_EXE_tj"))
             .args(arguments)
@@ -1736,7 +1748,9 @@ fn only_the_tabs_own_agent_can_request_finish() {
     let refused = foreign(&["finish"]);
     assert!(!refused.status.success(), "an unrelated process was accepted as the tab's agent: {refused:?}");
     assert!(String::from_utf8_lossy(&refused.stderr).contains("requires the managed session's own agent process"));
-    assert!(!sandbox.root.join("state").join("completion").exists(), "a process outside the tab requested finish");
+    let after = receipt();
+    assert!(after.status.success(), "{}", String::from_utf8_lossy(&after.stderr));
+    assert_eq!(after.stdout, before.stdout, "a process outside the tab changed the completion record");
     assert!(foreign(&["launch"]).stdout.is_empty());
     assert_eq!(in_agent(&sandbox, &["launch"]).0, 0);
     done(&sandbox);
@@ -2297,7 +2311,12 @@ fn recovered_predecessor_journal_survives_another_recovery_and_retires_consumed_
         serde_json::from_str(&log(&sandbox, "stubs/agent-store-show.json")).unwrap();
     current_binding["data"]["launch"] = current.clone();
     set_reply(&sandbox, "agent-store-show-recovered-proof.json", &current_binding.to_string());
-    let finished = sweep_closeout(&sandbox);
+    let finished = Command::new(env!("CARGO_BIN_EXE_tj"))
+        .args(["closeout", ITEM])
+        .envs(environment(&sandbox))
+        .current_dir(&sandbox.root)
+        .output()
+        .unwrap();
     assert!(finished.status.success(), "{}", String::from_utf8_lossy(&finished.stdout));
     assert!(!previous.exists() && !recovered.exists() && !journal_dir.join("recovered-again.closeout.json").exists());
     let store = log(&sandbox, "stubs/agent-store.log");
@@ -2486,7 +2505,7 @@ fn recovery_without_a_journal_keeps_live_or_unverified_native_sessions() {
 fn native_daemon_idle_grace_finishes_when_the_provider_unloads() {
     let sandbox = sandbox();
     let launch = "native-exit-grace";
-    let child = start(&sandbox, launch, "codex", "keys", "3");
+    let child = start(&sandbox, launch, "codex", if cfg!(windows) { "keys" } else { "signal" }, "3");
     let state = |state| serde_json::json!({"session":"codex:sess-1", "launch_id":launch, "state":state}).to_string();
     set_reply(&sandbox, "tj-session-liveness.json", &state("live"));
     done(&sandbox);

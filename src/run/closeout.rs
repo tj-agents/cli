@@ -528,8 +528,7 @@ pub fn run(args: Args) -> Result<ExitCode> {
         let result = (|| -> Result<bool> {
             let store = match lifecycle::for_recovery(&launch.id) {
                 Ok(Some(store)) => store,
-                Ok(None) if item.is_none() => return Ok(false),
-                Ok(None) => bail!("native session belongs to a newer launch; resume that session to finish this work"),
+                Ok(None) => return Ok(false),
                 Err(_) if !selected => return Ok(false),
                 Err(error) => return Err(error),
             };
