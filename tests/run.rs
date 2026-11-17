@@ -617,8 +617,7 @@ fn item_reference_launch_uses_the_effective_project_and_keeps_agent_arguments() 
     let output = finish(spawn(&sandbox, &arguments, &sandbox.root), Duration::from_secs(30));
     assert_eq!(output.status.code(), Some(3), "{}", String::from_utf8_lossy(&output.stderr));
     let resolution = log(&sandbox, "stubs/tj-item.log");
-    assert!(resolution.contains(&format!("{} reference #461", sandbox.worktree.display())), "{resolution}");
-    assert!(resolution.starts_with("--cwd "), "{resolution}");
+    assert_item_resolution(&resolution, &sandbox.worktree, "#461");
     let stored = log(&sandbox, "stubs/agent-store.log");
     assert!(stored.contains(&format!("--item {reference}")), "{stored}");
     assert!(!stored.contains("--item #461"));
@@ -639,10 +638,23 @@ fn item_reference_closeout_resolves_once_before_marking_and_querying() {
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
     let resolution = log(&sandbox, "stubs/tj-item.log");
     assert_eq!(resolution.lines().count(), 1);
-    assert!(resolution.contains(&format!("{} reference 461", sandbox.worktree.display())), "{resolution}");
+    assert_item_resolution(&resolution, &sandbox.worktree, "461");
     let stored = log(&sandbox, "stubs/agent-store.log");
     assert!(stored.contains(&format!("mark-closing --item {reference}")), "{stored}");
     assert!(stored.contains(&format!("launches --item {reference}")), "{stored}");
+}
+
+fn assert_item_resolution(log: &str, cwd: &Path, item: &str) {
+    let suffix = format!(" reference {item}");
+    let directory = log
+        .lines()
+        .next()
+        .and_then(|line| line.strip_prefix("--cwd "))
+        .and_then(|line| line.strip_suffix(suffix.as_str()))
+        .unwrap_or_else(|| panic!("unexpected item reference command: {log}"));
+    // Windows batch %* retains the path's surrounding quotes; Unix $* does not.
+    let directory = directory.strip_prefix('"').and_then(|text| text.strip_suffix('"')).unwrap_or(directory);
+    assert_eq!(Path::new(directory), cwd, "{log}");
 }
 
 #[test]
