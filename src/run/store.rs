@@ -167,11 +167,6 @@ fn state(row: &Value) -> Option<&str> {
     row["state"].as_str()
 }
 
-pub fn closing(launch_id: &str) -> Result<bool> {
-    let data = call(&["show", "--launch-id", launch_id])?;
-    Ok(state(&data["launch"]) == Some("closing") || state(&data["session"]) == Some("closing"))
-}
-
 pub fn bound_session(launch_id: &str) -> Result<Option<String>> {
     let data = call(&["show", "--launch-id", launch_id])?;
     Ok(data["session"]["native_id"].as_str().filter(|id| !id.is_empty()).map(str::to_owned))
@@ -311,14 +306,11 @@ pub fn set_open(launch_id: &str, open: bool) -> Result<()> {
     call(&["set-open", "--launch-id", launch_id, "--open", if open { "true" } else { "false" }]).map(drop)
 }
 
-pub fn mark_closing(item: &str) -> Result<()> {
-    call(&["mark-closing", "--item", item]).map(drop)
-}
-
 pub struct Row {
     pub launch: Launch,
     pub closing: bool,
     pub ended: bool,
+    pub closed: bool,
     pub wrapper_pid: u32,
     pub wrapper_started_at: String,
 }
@@ -330,7 +322,7 @@ pub fn launches(item: Option<&str>) -> Result<Vec<Row>> {
     }
     let data = call(&arguments)?;
     let rows = data["launches"].as_array().context("agent-store launches returned no list")?;
-    Ok(rows.iter().filter(|row| row["end_reason"].as_str() != Some("closed")).filter_map(row).collect())
+    Ok(rows.iter().filter_map(row).collect())
 }
 
 fn row(value: &Value) -> Option<Row> {
@@ -345,6 +337,7 @@ fn row(value: &Value) -> Option<Row> {
         },
         closing: state(value) == Some("closing"),
         ended: state(value) == Some("ended"),
+        closed: value["end_reason"].as_str() == Some("closed"),
         wrapper_pid: u32::try_from(value["wrapper"]["pid"].as_u64()?).ok()?,
         wrapper_started_at: text(&value["wrapper"]["started_at"])?,
     })

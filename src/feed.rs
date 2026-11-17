@@ -53,6 +53,8 @@ pub(crate) enum PostError {
     Lock(PathBuf, #[source] io::Error),
     #[error("could not read {}", .0.display())]
     Read(PathBuf, #[source] io::Error),
+    #[error("message retry changes the original sender or content")]
+    Conflict,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -125,22 +127,20 @@ impl Feed {
         write().map_err(|error| PostError::Append(self.messages.clone(), error))
     }
 
-    /// Every writer takes the same lock so event deduplication is atomic.
-    pub(crate) fn post(&self, message: &Value) -> Result<(), PostError> {
-        self.append(&mut self.writer()?, message)
-    }
-
     /// One durable event per session, independent of launches, feed reads and later model turns.
     /// Identity and content share one record so a crash cannot split delivery from its receipt.
     pub(crate) fn post_once(&self, event: &Value, message: &Value) -> Result<bool, PostError> {
         let mut file = self.writer()?;
         let mut contents = Vec::new();
         file.read_to_end(&mut contents).map_err(|error| PostError::Read(self.messages.clone(), error))?;
-        if String::from_utf8_lossy(&contents)
+        if let Some(previous) = String::from_utf8_lossy(&contents)
             .lines()
             .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-            .any(|line| line["event"] == *event)
+            .find(|line| line["event"] == *event)
         {
+            if ["from", "text", "kind"].iter().any(|field| previous[field] != message[field]) {
+                return Err(PostError::Conflict);
+            }
             return Ok(false);
         }
         let mut message = message.clone();
@@ -253,6 +253,7 @@ mod tests {
         feed.mark(unread.end).unwrap();
         let resumed = Feed::new(directory.path(), "codex:session").unwrap();
         assert!(!resumed.post_once(&event, &message).unwrap());
+        assert!(resumed.post_once(&event, &json!({"text": "changed"})).is_err());
         assert!(resumed.unread().unwrap().messages.is_empty());
         assert!(resumed.post_once(&json!({"kind": "merged", "prs": ["one", "two"]}), &message).unwrap());
         assert_eq!(resumed.unread().unwrap().messages.len(), 1);
