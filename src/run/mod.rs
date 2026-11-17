@@ -18,7 +18,9 @@ use anyhow::{Context, Result, bail};
 use tj_cli::process::agent::{self, Agent, Stop};
 
 use crate::completion::{Record, State, Store};
+use crate::domain::item;
 use crate::host::Host;
+use crate::item_cli;
 use crate::paths;
 
 impl Host {
@@ -40,7 +42,7 @@ pub struct Launch {
     pub host: Host,
     pub title: String,
     pub cwd: PathBuf,
-    pub item: Option<String>,
+    pub item: Option<item::Reference>,
 }
 
 #[derive(clap::Args)]
@@ -57,7 +59,7 @@ pub struct Args {
     /// Original invocation directory, so relative native arguments retain their meaning.
     #[arg(long)]
     command_cwd: Option<PathBuf>,
-    /// Work item reference, for example `github:github.com/acme/app:461`.
+    /// Full work item reference or URL, or a bare id resolved by the working directory's tracker profile.
     #[arg(long)]
     item: Option<String>,
     /// Identifies this launch in agent-store; the launcher waits for the row it names. Generated when omitted.
@@ -191,13 +193,14 @@ fn default_title(cwd: &Path) -> String {
 
 fn launch(args: &Args) -> Result<Launch> {
     let cwd = std::path::absolute(args.cwd.clone().map_or_else(std::env::current_dir, Ok)?)?;
+    let item = args.item.as_deref().map(|value| item_cli::reference(value, &cwd, hidden("tj-item"))).transpose()?;
     let program = &args.agent[0];
     let Some(host) = args.host.or_else(|| Host::from_program(program)) else {
         bail!("pass --host: {} is neither claude nor codex", program.to_string_lossy());
     };
     let title = args.title.clone().unwrap_or_else(|| default_title(&cwd));
     let id = args.launch_id.clone().map_or_else(generated_id, Ok)?;
-    Ok(Launch { id, host, title, cwd, item: args.item.clone() })
+    Ok(Launch { id, host, title, cwd, item })
 }
 
 struct PreboundSession {
@@ -431,7 +434,7 @@ fn successor_arguments(args: &Args, launch: &Launch, agent: Vec<OsString>) -> Ve
         arguments.extend([OsString::from("--command-cwd"), directory.clone().into_os_string()]);
     }
     if let Some(item) = &launch.item {
-        arguments.extend(["--item", item].map(OsString::from));
+        arguments.extend(["--item", item.as_str()].map(OsString::from));
     }
     let seconds = [
         ("--poll-seconds", args.poll_seconds),
@@ -499,9 +502,9 @@ fn mark_closed(launch_id: &str) {
 }
 
 pub fn run(args: Args) -> Result<ExitCode> {
-    agent::prepare_wrapper().context("could not prepare the console")?;
     let launch = launch(&args)?;
     let prebound = prebound_session(&args, &launch)?;
+    agent::prepare_wrapper().context("could not prepare the console")?;
     let id = launch.id.clone();
     let closed = launch.id.clone();
     agent::on_tab_closed(Box::new(move || mark_closed(&closed)));
@@ -771,6 +774,29 @@ mod tests {
 
     fn launch() -> Launch {
         Launch { id: "launch".to_owned(), host: Host::Codex, title: "Tab".to_owned(), cwd: cwd(), item: None }
+    }
+
+    #[test]
+    fn item_reference_survives_handover_with_the_entire_resume_command() {
+        let mut launch = launch();
+        launch.item = Some(crate::domain::item::Reference::parse("azure-devops:dev.azure.com/contoso:461").unwrap());
+        let agent = vec![
+            executable(),
+            "--remote".into(),
+            "unix://".into(),
+            "resume".into(),
+            "123e4567-e89b-12d3-a456-426614174000".into(),
+            "--".into(),
+            "--literal prompt".into(),
+        ];
+        let mut args = prebound_args(agent.clone());
+        args.item = Some("#461".into());
+        let successor = super::successor_arguments(&args, &launch, agent.clone());
+        let item = successor.iter().position(|arg| arg == "--item").unwrap() + 1;
+        assert_eq!(successor[item], launch.item.as_ref().unwrap().as_str());
+        let separator = successor.iter().position(|arg| arg == "--").unwrap();
+        assert_eq!(&successor[separator + 1..], agent);
+        assert!(successor.iter().any(|arg| arg == "--successor"));
     }
 
     #[test]
