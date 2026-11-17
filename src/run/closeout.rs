@@ -6,7 +6,7 @@ use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 
 use super::{Launch, hidden, store};
-use crate::{feed, paths};
+use crate::{feed, item_cli, paths};
 
 mod journal;
 
@@ -33,6 +33,7 @@ fn repository(launch: &Launch) -> Result<PathBuf> {
 
 pub fn notify(launch: &Launch) -> Result<()> {
     let Some(item) = &launch.item else { return Ok(()) };
+    let item = item.as_str();
     let output = hidden("tj-item")
         .args(["prs", item])
         .current_dir(repository(launch)?)
@@ -400,6 +401,7 @@ pub fn finish(launch: &Launch, plan: Plan) -> Result<()> {
         bail!("owned worktrees remain after cleanup; recovery required");
     }
     if let Some(item) = &launch.item {
+        let item = item.as_str();
         let output = hidden("tj-item")
             .args(["progress", item, "--state", "Done"])
             .current_dir(&plan.repository)
@@ -432,11 +434,13 @@ pub struct Args {
 }
 
 pub fn run(args: Args) -> Result<ExitCode> {
-    if let Some(item) = &args.item {
+    let cwd = std::env::current_dir()?;
+    let item = args.item.as_deref().map(|value| item_cli::reference(value, &cwd, hidden("tj-item"))).transpose()?;
+    if let Some(item) = &item {
         store::mark_closing(item)?;
     }
     let mut failed = false;
-    for row in store::launches(args.item.as_deref())? {
+    for row in store::launches(item.as_ref())? {
         match wrapper_alive(&row) {
             Ok(true) => continue,
             Ok(false) => {}
@@ -448,7 +452,7 @@ pub fn run(args: Args) -> Result<ExitCode> {
         }
         let launch = &row.launch;
         let started = !matches!(journal::read(launch), Ok(None));
-        let swept = args.item.is_some() || row.closing || started;
+        let swept = item.is_some() || row.closing || started;
         if !swept {
             continue;
         }

@@ -37,7 +37,7 @@ fn stub(directory: &Path, name: &str, fallback: &str) {
         directory.join(format!("{name}.cmd")),
         format!(
             "@echo off\r\necho %*>>\"%~dp0{name}.log\"\r\n\
-             if exist \"%~dp0{name}-%1.failed\" exit /b 1\r\n\
+             if exist \"%~dp0{name}-%1.failed\" (type \"%~dp0{name}-%1.failed\" 1>&2 & exit /b 1)\r\n\
              if exist \"%~dp0{name}-%1.json\" (type \"%~dp0{name}-%1.json\") else (echo {fallback})\r\n\
              if \"{name}\"==\"tj-prepare\" python \"%~dp0prepare.py\"\r\n"
         ),
@@ -51,7 +51,7 @@ fn stub(directory: &Path, name: &str, fallback: &str) {
             &path,
             format!(
                 "#!/bin/sh\nhere=\"$(dirname \"$0\")\"\necho \"$*\" >> \"$here/{name}.log\"\n\
-                 if [ -f \"$here/{name}-$1.failed\" ]; then exit 1; fi\n\
+                 if [ -f \"$here/{name}-$1.failed\" ]; then cat \"$here/{name}-$1.failed\" >&2; exit 1; fi\n\
                  if [ -f \"$here/{name}-$1.json\" ]; then cat \"$here/{name}-$1.json\"; else echo '{fallback}'; fi\n\
                  if [ '{name}' = 'tj-prepare' ]; then exec python3 \"$here/prepare.py\"; fi\n"
             ),
@@ -602,6 +602,120 @@ fn fresh_launches_reject_the_retired_idle_ask_option() {
     assert!(stderr.contains("required arguments were not provided"), "{stderr}");
     assert!(stderr.contains("--successor"), "{stderr}");
     assert!(log(&sandbox, "stubs/agent-store.log").is_empty());
+}
+
+#[test]
+fn item_reference_launch_uses_the_effective_project_and_keeps_agent_arguments() {
+    let sandbox = sandbox();
+    git(&sandbox.primary, &["remote", "set-url", "origin", "https://github.com/acme/app.git"]);
+    let reference = "azure-devops:dev.azure.com/contoso:461";
+    stub(&sandbox.stubs, "tj-item", &serde_json::json!({"ref": reference}).to_string());
+    let mut arguments = run_arguments(&sandbox, "azure-item", "claude", "exit", "10");
+    let item = arguments.iter().position(|arg| arg == "--item").unwrap() + 1;
+    arguments[item] = "#461".into();
+    arguments.extend(["--remote", "unix://", "prompt with spaces"].map(str::to_owned));
+    let output = finish(spawn(&sandbox, &arguments, &sandbox.root), Duration::from_secs(30));
+    assert_eq!(output.status.code(), Some(3), "{}", String::from_utf8_lossy(&output.stderr));
+    let resolution = log(&sandbox, "stubs/tj-item.log");
+    assert_item_resolution(&resolution, &sandbox.worktree, "#461");
+    let stored = log(&sandbox, "stubs/agent-store.log");
+    assert!(stored.contains(&format!("--item {reference}")), "{stored}");
+    assert!(!stored.contains("--item #461"));
+    assert!(log(&sandbox, "dummy.log").contains("args --remote unix:// prompt with spaces"));
+}
+
+#[test]
+fn item_reference_closeout_resolves_once_before_marking_and_querying() {
+    let sandbox = sandbox();
+    let reference = "azure-devops:dev.azure.com/contoso:461";
+    stub(&sandbox.stubs, "tj-item", &serde_json::json!({"ref": reference}).to_string());
+    let output = Command::new(env!("CARGO_BIN_EXE_tj"))
+        .args(["closeout", "461"])
+        .envs(environment(&sandbox))
+        .current_dir(&sandbox.worktree)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let resolution = log(&sandbox, "stubs/tj-item.log");
+    assert_eq!(resolution.lines().count(), 1);
+    assert_item_resolution(&resolution, &sandbox.worktree, "461");
+    let stored = log(&sandbox, "stubs/agent-store.log");
+    assert!(stored.contains(&format!("mark-closing --item {reference}")), "{stored}");
+    assert!(stored.contains(&format!("launches --item {reference}")), "{stored}");
+}
+
+fn assert_item_resolution(log: &str, cwd: &Path, item: &str) {
+    let suffix = format!(" reference {item}");
+    let directory = log
+        .lines()
+        .next()
+        .and_then(|line| line.strip_prefix("--cwd "))
+        .and_then(|line| line.strip_suffix(suffix.as_str()))
+        .unwrap_or_else(|| panic!("unexpected item reference command: {log}"));
+    // Windows batch %* retains the path's surrounding quotes; Unix $* does not.
+    let directory = directory.strip_prefix('"').and_then(|text| text.strip_suffix('"')).unwrap_or(directory);
+    assert_eq!(Path::new(directory), cwd, "{log}");
+}
+
+#[test]
+fn item_reference_failures_never_start_or_close_a_session() {
+    for (input, reply) in [
+        ("461", None),
+        ("461", Some("not JSON")),
+        ("461", Some(r#"{"ref":"461"}"#)),
+        ("461", Some(r#"{"ref":42}"#)),
+        ("461", Some(r#"{"ref":"https://[invalid"}"#)),
+        ("461", Some("{}")),
+        ("https://[invalid", Some("{}")),
+        ("url:https://[invalid", Some("{}")),
+    ] {
+        let sandbox = sandbox();
+        if let Some(reply) = reply {
+            stub(&sandbox.stubs, "tj-item", reply);
+        } else {
+            std::fs::write(sandbox.stubs.join("tj-item---cwd.failed"), "unknown tracker profile").unwrap();
+        }
+        let mut launch = run_arguments(&sandbox, "refused-item", "claude", "exit", "10");
+        let item = launch.iter().position(|arg| arg == "--item").unwrap() + 1;
+        launch[item] = input.into();
+        let title = launch.iter().position(|arg| arg == "--title").unwrap();
+        launch.drain(title..title + 2);
+        for arguments in [launch, vec!["closeout".into(), input.into()]] {
+            let output = finish(spawn(&sandbox, &arguments, &sandbox.root), Duration::from_secs(30));
+            assert_eq!(output.status.code(), Some(2));
+            let error = String::from_utf8_lossy(&output.stderr);
+            assert!(error.contains("tj item reference"), "{error}");
+            if reply.is_none() {
+                assert!(error.contains("unknown tracker profile"), "{error}");
+            }
+            assert!(log(&sandbox, "stubs/agent-store.log").is_empty());
+            assert!(log(&sandbox, "stubs/tj-prepare.log").is_empty());
+            assert!(log(&sandbox, "dummy.log").is_empty());
+        }
+    }
+}
+
+#[test]
+fn item_reference_qualified_values_need_no_project_profile() {
+    for reference in [
+        "azure-devops:dev.azure.com/contoso:461",
+        "https://dev.azure.com/Contoso/_workitems/edit/461",
+        "https://tracker.example/items/APP-12",
+        "url:https://tracker.example/items/APP-12",
+    ] {
+        let sandbox = sandbox();
+        std::fs::write(sandbox.stubs.join("tj-item---cwd.failed"), "unknown tracker profile").unwrap();
+        let output = Command::new(env!("CARGO_BIN_EXE_tj"))
+            .args(["closeout", reference])
+            .envs(environment(&sandbox))
+            .current_dir(&sandbox.root)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        assert!(log(&sandbox, "stubs/tj-item.log").is_empty());
+        let stored = log(&sandbox, "stubs/agent-store.log");
+        assert!(stored.contains(&format!("mark-closing --item {reference}")), "{stored}");
+    }
 }
 
 fn kill_dummy(sandbox: &Sandbox) {
