@@ -5,6 +5,7 @@ use anyhow::{Context, Result, bail};
 use serde_json::Value;
 
 use super::{Launch, hidden};
+use crate::domain::item;
 use crate::host::Host;
 use crate::paths;
 
@@ -40,7 +41,7 @@ pub fn launch(launch: &Launch, parent: Option<&str>, wrapper_pid: u32, wrapper_s
         wrapper_started_at,
     ];
     if let Some(item) = &launch.item {
-        arguments.extend(["--item", item]);
+        arguments.extend(["--item", item.as_str()]);
     }
     if let Some(parent) = parent {
         arguments.extend(["--parent", parent]);
@@ -182,7 +183,7 @@ pub struct Ownership {
     pub session: String,
     pub claims: Vec<Claim>,
     pub location: Option<PathBuf>,
-    pub item: Option<String>,
+    pub item: Option<item::Reference>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -191,16 +192,13 @@ pub struct Claim {
     pub path: PathBuf,
 }
 
-fn item(row: &Value) -> Result<Option<String>> {
+fn item(row: &Value) -> Result<Option<item::Reference>> {
     let value = row.get("item").context("agent-store launch is missing its item field")?;
     if value.is_null() {
         return Ok(None);
     }
     let reference = text(value, "ref")?;
-    if reference.trim().is_empty() {
-        bail!("agent-store item has no canonical reference");
-    }
-    Ok(Some(reference.to_owned()))
+    item::Reference::parse(reference).map(Some).context("agent-store item has no valid reference")
 }
 
 pub fn ownership(launch: &Launch) -> Result<Ownership> {
@@ -261,7 +259,7 @@ pub fn require_managed_claims(session: &str) -> Result<()> {
 
 /// Historical launch rows retain their binding when this native session registers a new launch.
 pub fn predecessors(launch: &Launch, owner: &Ownership) -> Result<Vec<Row>> {
-    let Some(current_item) = owner.item.as_deref() else {
+    let Some(current_item) = owner.item.as_ref() else {
         return Ok(Vec::new());
     };
     let data = call(&["launches"])?;
@@ -276,7 +274,7 @@ pub fn predecessors(launch: &Launch, owner: &Ownership) -> Result<Vec<Row>> {
         if value["host"].as_str() != Some(launch.host.name()) {
             bail!("historical launch host does not match its session");
         }
-        if item(value)?.as_deref() != Some(current_item) {
+        if item(value)?.as_ref() != Some(current_item) {
             continue;
         }
         let predecessor = row(value).context("historical launch identity is incomplete")?;
@@ -311,8 +309,8 @@ pub fn set_open(launch_id: &str, open: bool) -> Result<()> {
     call(&["set-open", "--launch-id", launch_id, "--open", if open { "true" } else { "false" }]).map(drop)
 }
 
-pub fn mark_closing(item: &str) -> Result<()> {
-    call(&["mark-closing", "--item", item]).map(drop)
+pub fn mark_closing(item: &item::Reference) -> Result<()> {
+    call(&["mark-closing", "--item", item.as_str()]).map(drop)
 }
 
 pub struct Row {
@@ -323,10 +321,10 @@ pub struct Row {
     pub wrapper_started_at: String,
 }
 
-pub fn launches(item: Option<&str>) -> Result<Vec<Row>> {
+pub fn launches(item: Option<&item::Reference>) -> Result<Vec<Row>> {
     let mut arguments = vec!["launches"];
     if let Some(item) = item {
-        arguments.extend(["--item", item]);
+        arguments.extend(["--item", item.as_str()]);
     }
     let data = call(&arguments)?;
     let rows = data["launches"].as_array().context("agent-store launches returned no list")?;
@@ -341,7 +339,7 @@ fn row(value: &Value) -> Option<Row> {
             host: Host::from_name(value["host"].as_str()?)?,
             title: text(&value["title"]).unwrap_or_default(),
             cwd: PathBuf::from(text(&value["worktree"]).or_else(|| text(&value["cwd"]))?),
-            item: text(&value["item"]["ref"]),
+            item: value["item"]["ref"].as_str().map(item::Reference::parse).transpose().ok()?,
         },
         closing: state(value) == Some("closing"),
         ended: state(value) == Some("ended"),
@@ -419,7 +417,13 @@ mod tests {
     fn canonical_item_distinguishes_unlinked_launches_from_missing_metadata() {
         assert_eq!(super::item(&json!({"item": null})).unwrap(), None);
         let reference = "github:github.com/acme/app:1";
-        assert_eq!(super::item(&json!({"item": {"ref": reference}})).unwrap(), Some(reference.to_owned()));
+        assert_eq!(
+            super::item(&json!({"item": {"ref": reference}}))
+                .unwrap()
+                .as_ref()
+                .map(crate::domain::item::Reference::as_str),
+            Some(reference)
+        );
         for row in [json!({}), json!({"item": {}}), json!({"item": {"ref": " "}})] {
             assert!(super::item(&row).is_err(), "unknown work item must not be treated as unlinked: {row}");
         }

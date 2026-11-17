@@ -1,5 +1,4 @@
 pub mod closeout;
-mod item;
 pub mod owner;
 pub(crate) mod store;
 mod tj_agents;
@@ -17,7 +16,9 @@ use std::time::{Duration, Instant, SystemTime};
 use anyhow::{Context, Result, bail};
 use tj_cli::process::agent::{self, Agent, Stop};
 
+use crate::domain::item;
 use crate::host::Host;
+use crate::item_cli;
 use crate::paths;
 
 impl Host {
@@ -39,7 +40,7 @@ pub struct Launch {
     pub host: Host,
     pub title: String,
     pub cwd: PathBuf,
-    pub item: Option<String>,
+    pub item: Option<item::Reference>,
 }
 
 #[derive(clap::Args)]
@@ -186,7 +187,7 @@ fn default_title(cwd: &Path) -> String {
 
 fn launch(args: &Args) -> Result<Launch> {
     let cwd = std::path::absolute(args.cwd.clone().map_or_else(std::env::current_dir, Ok)?)?;
-    let item = args.item.as_deref().map(|value| item::reference(value, &cwd)).transpose()?;
+    let item = args.item.as_deref().map(|value| item_cli::reference(value, &cwd, hidden("tj-item"))).transpose()?;
     let program = &args.agent[0];
     let Some(host) = args.host.or_else(|| Host::from_program(program)) else {
         bail!("pass --host: {} is neither claude nor codex", program.to_string_lossy());
@@ -399,7 +400,7 @@ fn successor_arguments(args: &Args, launch: &Launch, agent: Vec<OsString>) -> Ve
         ["run", "--host", launch.host.name(), "--title", &launch.title, "--cwd"].map(OsString::from).to_vec();
     arguments.push(launch.cwd.clone().into_os_string());
     if let Some(item) = &launch.item {
-        arguments.extend(["--item", item].map(OsString::from));
+        arguments.extend(["--item", item.as_str()].map(OsString::from));
     }
     let seconds = [
         ("--poll-seconds", args.poll_seconds),
@@ -701,7 +702,7 @@ mod tests {
     #[test]
     fn item_reference_survives_handover_with_the_entire_resume_command() {
         let mut launch = launch();
-        launch.item = Some("azure-devops:dev.azure.com/contoso:461".into());
+        launch.item = Some(crate::domain::item::Reference::parse("azure-devops:dev.azure.com/contoso:461").unwrap());
         let agent = vec![
             executable(),
             "--remote".into(),
@@ -715,7 +716,7 @@ mod tests {
         args.item = Some("#461".into());
         let successor = super::successor_arguments(&args, &launch, agent.clone());
         let item = successor.iter().position(|arg| arg == "--item").unwrap() + 1;
-        assert_eq!(successor[item], launch.item.as_deref().unwrap());
+        assert_eq!(successor[item], launch.item.as_ref().unwrap().as_str());
         let separator = successor.iter().position(|arg| arg == "--").unwrap();
         assert_eq!(&successor[separator + 1..], agent);
         assert!(successor.iter().any(|arg| arg == "--successor"));
