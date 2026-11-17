@@ -1,11 +1,13 @@
 mod app_server;
 mod cr;
+mod domain;
 mod external;
 mod f;
 mod feed;
 mod fzf;
 mod host;
 mod init;
+mod item_cli;
 mod message;
 mod paths;
 mod run;
