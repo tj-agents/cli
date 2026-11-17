@@ -659,7 +659,16 @@ fn assert_item_resolution(log: &str, cwd: &Path, item: &str) {
 
 #[test]
 fn item_reference_failures_never_start_or_close_a_session() {
-    for reply in [None, Some("not JSON"), Some(r#"{"ref":"461"}"#), Some("{}")] {
+    for (input, reply) in [
+        ("461", None),
+        ("461", Some("not JSON")),
+        ("461", Some(r#"{"ref":"461"}"#)),
+        ("461", Some(r#"{"ref":42}"#)),
+        ("461", Some(r#"{"ref":"https://[invalid"}"#)),
+        ("461", Some("{}")),
+        ("https://[invalid", Some("{}")),
+        ("url:https://[invalid", Some("{}")),
+    ] {
         let sandbox = sandbox();
         if let Some(reply) = reply {
             stub(&sandbox.stubs, "tj-item", reply);
@@ -668,10 +677,10 @@ fn item_reference_failures_never_start_or_close_a_session() {
         }
         let mut launch = run_arguments(&sandbox, "refused-item", "claude", "exit", "10");
         let item = launch.iter().position(|arg| arg == "--item").unwrap() + 1;
-        launch[item] = "461".into();
+        launch[item] = input.into();
         let title = launch.iter().position(|arg| arg == "--title").unwrap();
         launch.drain(title..title + 2);
-        for arguments in [launch, vec!["closeout".into(), "461".into()]] {
+        for arguments in [launch, vec!["closeout".into(), input.into()]] {
             let output = finish(spawn(&sandbox, &arguments, &sandbox.root), Duration::from_secs(30));
             assert_eq!(output.status.code(), Some(2));
             let error = String::from_utf8_lossy(&output.stderr);
