@@ -208,6 +208,12 @@ the host defaults to the executable's name, the folder to the current one, the t
 worktree folder's name (suffixed `-2`, `-3`… while an open launch holds it) and the launch id to a random one.
 The executable must be the native `claude` or `codex`, not an npm `.cmd` shim.
 
+`--item` accepts a full tracker reference or URL unchanged. A bare id such as `461` or `#461` is resolved
+by `tj-item --cwd WORKTREE reference ID` using that project's tracker profile before a launch is recorded
+or an agent starts. `tj closeout ID` uses the current directory's profile before marking anything closing.
+A missing profile or failed resolution stops the command; a Git code remote never selects a tracker.
+Recovery and binary handover carry the resolved reference with the original agent arguments.
+
 `--session codex:UUID` binds a pre-created Codex thread before the native process starts. It requires an
 explicit `--host codex` and an absolute native command in the exact form
 `codex --cd WORKTREE resume UUID [-- PROMPT]`. The delimiter is required when a prompt is supplied, so

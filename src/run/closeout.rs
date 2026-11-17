@@ -5,7 +5,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 
-use super::{Launch, hidden, store};
+use super::{Launch, hidden, item, store};
 use crate::{feed, paths};
 
 mod journal;
@@ -432,11 +432,12 @@ pub struct Args {
 }
 
 pub fn run(args: Args) -> Result<ExitCode> {
-    if let Some(item) = &args.item {
+    let item = args.item.as_deref().map(|value| item::reference(value, &std::env::current_dir()?)).transpose()?;
+    if let Some(item) = &item {
         store::mark_closing(item)?;
     }
     let mut failed = false;
-    for row in store::launches(args.item.as_deref())? {
+    for row in store::launches(item.as_deref())? {
         match wrapper_alive(&row) {
             Ok(true) => continue,
             Ok(false) => {}
@@ -448,7 +449,7 @@ pub fn run(args: Args) -> Result<ExitCode> {
         }
         let launch = &row.launch;
         let started = !matches!(journal::read(launch), Ok(None));
-        let swept = args.item.is_some() || row.closing || started;
+        let swept = item.is_some() || row.closing || started;
         if !swept {
             continue;
         }
