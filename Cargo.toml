@@ -3,7 +3,7 @@ name = "tj-cli"
 version = "0.2.0"
 edition = "2024"
 rust-version = "1.85"
-description = "Fast cross-platform shell tools for agentic programming: cr (resume Claude/Codex sessions), f (fuzzy cd) and run (the tab-owning agent wrapper)."
+description = "Managed Claude Code and Codex sessions with native terminal interfaces, completion receipts, session search and shell navigation."
 repository = "https://github.com/tj-agents/cli"
 publish = false
 

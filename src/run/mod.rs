@@ -1,4 +1,5 @@
 pub mod closeout;
+pub mod lifecycle;
 pub mod owner;
 pub(crate) mod store;
 mod tj_agents;
@@ -16,6 +17,7 @@ use std::time::{Duration, Instant, SystemTime};
 use anyhow::{Context, Result, bail};
 use tj_cli::process::agent::{self, Agent, Stop};
 
+use crate::completion::{Record, State, Store};
 use crate::domain::item;
 use crate::host::Host;
 use crate::item_cli;
@@ -54,6 +56,9 @@ pub struct Args {
     /// The worktree the agent works in, by default the current folder. Only a linked worktree is removed at closeout.
     #[arg(long)]
     cwd: Option<PathBuf>,
+    /// Original invocation directory, so relative native arguments retain their meaning.
+    #[arg(long)]
+    command_cwd: Option<PathBuf>,
     /// Full work item reference or URL, or a bare id resolved by the working directory's tracker profile.
     #[arg(long)]
     item: Option<String>,
@@ -68,10 +73,12 @@ pub struct Args {
     session: Option<String>,
     #[arg(long, hide = true, default_value_t = 120)]
     poll_seconds: u64,
-    #[arg(long, hide = true, default_value_t = 600)]
+    #[arg(long, hide = true, default_value_t = 10)]
     idle_seconds: u64,
     #[arg(long, hide = true, default_value_t = 10)]
     grace_seconds: u64,
+    #[arg(long, hide = true, default_value_t = 90)]
+    native_exit_seconds: u64,
     #[arg(long, hide = true, default_value_t = 30)]
     restart_grace_seconds: u64,
     #[arg(long, hide = true, default_value_t = 2)]
@@ -83,10 +90,6 @@ pub struct Args {
     /// Continues this launch in a replaced tj binary: the launch, its marks and its conversation already exist.
     #[arg(long, hide = true)]
     successor: bool,
-    // Already-running wrappers include this in their handover command. Accept it only during that
-    // upgrade; it has no behavior and new wrappers never forward it.
-    #[arg(long = "ask-idle-seconds", hide = true, requires = "successor")]
-    _retired_ask_idle_seconds: Option<u64>,
     /// The agent's command line.
     #[arg(last = true, required = true)]
     agent: Vec<OsString>,
@@ -99,7 +102,7 @@ pub fn hidden(program: &str) -> Command {
     command
 }
 
-fn preparation(launch: &Launch, arguments: &[OsString]) -> Result<()> {
+fn preparation(launch: &Launch, directory: &Path, arguments: &[OsString]) -> Result<()> {
     let arguments = arguments[1..]
         .iter()
         .map(|argument| argument.to_str().context("host arguments must be UTF-8 for standards preparation"))
@@ -107,9 +110,9 @@ fn preparation(launch: &Launch, arguments: &[OsString]) -> Result<()> {
     let input = serde_json::to_vec(&arguments)?;
     let mut child = hidden("tj-prepare")
         .args(["--host", launch.host.name(), "--cwd"])
-        .arg(&launch.cwd)
+        .arg(directory)
         .arg("--arguments-stdin")
-        .current_dir(&launch.cwd)
+        .current_dir(directory)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
@@ -125,12 +128,15 @@ fn preparation(launch: &Launch, arguments: &[OsString]) -> Result<()> {
     if !output.status.success() {
         bail!("tj-prepare {}: {}", output.status, String::from_utf8_lossy(&output.stderr).trim());
     }
+    if !output.stderr.is_empty() {
+        eprint!("{}", String::from_utf8_lossy(&output.stderr));
+    }
     Ok(())
 }
 
-fn prepare(launch: &Launch, arguments: &[OsString]) {
-    if let Err(error) = preparation(launch, arguments) {
-        eprintln!("tj run: repository standards preparation failed: {error:#}");
+fn prepare(launch: &Launch, directory: &Path, arguments: &[OsString]) {
+    if let Err(error) = preparation(launch, directory, arguments) {
+        eprintln!("TJ: repository standards preparation failed: {error:#}");
     }
 }
 
@@ -159,7 +165,7 @@ fn launch_id() -> Option<String> {
     std::env::var("TJ_RUN_LAUNCH_ID").ok().filter(|id| !id.is_empty())
 }
 
-fn generated_id() -> Result<String> {
+pub(crate) fn generated_id() -> Result<String> {
     let mut bytes = [0u8; 16];
     getrandom::fill(&mut bytes).map_err(|error| anyhow::anyhow!("no OS randomness: {error}"))?;
     Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
@@ -269,14 +275,8 @@ fn prebound_session(args: &Args, launch: &Launch) -> Result<Option<PreboundSessi
 
 fn end_not_started(launch: &Launch, prebound: &PreboundSession, wrapper_pid: u32, wrapper_started_at: &str) {
     if let Err(error) = store::end_not_started(launch, &prebound.handle, wrapper_pid, wrapper_started_at) {
-        eprintln!("tj run: could not mark unstarted launch {}: {error:#}", launch.id);
+        eprintln!("TJ: could not mark unstarted launch {}: {error:#}", launch.id);
     }
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Trigger {
-    Done,
-    Closing,
 }
 
 struct Watch {
@@ -284,9 +284,12 @@ struct Watch {
     marks: PathBuf,
     poll: Duration,
     idle: Duration,
+    input_idle: Duration,
     next_poll: Instant,
     reported: HashSet<String>,
-    mark: Option<SystemTime>,
+    completion: Option<Store>,
+    revision: Option<u64>,
+    ready_since: Option<Instant>,
     pinned: Option<turn::Turn>,
     rollout: Option<PathBuf>,
     next_lookup: Instant,
@@ -295,13 +298,9 @@ struct Watch {
 impl Watch {
     fn report(&mut self, line: String) {
         if !self.reported.contains(&line) {
-            eprintln!("\r\ntj run: {line}\r");
+            eprintln!("\r\nTJ: {line}\r");
             self.reported.insert(line);
         }
-    }
-
-    fn marked(&self) -> Option<SystemTime> {
-        self.marks.join("done").metadata().and_then(|meta| meta.modified()).ok()
     }
 
     fn turn(&mut self, agent: u32) -> Option<turn::Turn> {
@@ -318,59 +317,84 @@ impl Watch {
         }
     }
 
-    fn done(&mut self, agent: u32, turn: Option<turn::Turn>) -> bool {
-        let marked = self.marked();
-        if marked != self.mark {
-            self.mark = marked;
+    fn record(&mut self) -> Result<Option<Record>> {
+        if self.completion.is_none() {
+            self.completion = Some(lifecycle::for_launch(&self.launch.id)?);
+        }
+        let store = self.completion.as_ref().context("completion store not bound")?;
+        store.load()?.map(|record| lifecycle::deliver(store, record)).transpose()
+    }
+
+    fn ready(&mut self) -> Result<Option<Record>> {
+        let Some(record) = self.record()? else { return Ok(None) };
+        if self.revision != Some(record.revision()) {
+            self.revision = Some(record.revision());
             self.pinned = None;
+            self.ready_since = None;
+            self.report(lifecycle::message(&record));
         }
-        let Some(marked) = marked else { return false };
-        let background = turn::shells(agent);
-        match turn::judge(marked, SystemTime::now(), turn, &mut self.pinned, background, self.idle) {
-            turn::Done::Due => true,
-            turn::Done::Waiting => false,
-            turn::Done::Withdrawn => {
-                let _ = std::fs::remove_file(self.marks.join("done"));
-                self.report(
-                    "a turn started after `tj done`, which withdrew it; the agent runs it again when finished".into(),
-                );
-                false
-            }
+        if record.held_open()
+            || !matches!(
+                record.state(),
+                State::Ready { .. } | State::Closing { .. } | State::Attention { outcome: Some(_), .. }
+            )
+        {
+            return Ok(None);
         }
+        Ok(Some(record))
     }
 
-    fn closing(&mut self) -> bool {
-        store::closing(&self.launch.id).unwrap_or_else(|error| {
-            self.report(format!("{error:#}"));
-            false
-        })
-    }
-
-    fn completed_on_exit(&self, turn: Option<turn::Turn>) -> bool {
-        let Some(marked) = self.marked() else { return false };
-        let Some(turn) = turn else { return false };
-        if let Some(pinned) = self.pinned {
-            return turn == pinned;
-        }
-        // A successful host exit may precede its final idle record. A later turn withdraws done.
-        if !turn.idle {
-            return turn.changed < marked;
-        }
-        turn::judge(marked, SystemTime::now(), Some(turn), &mut None, 0, Duration::ZERO) == turn::Done::Due
-    }
-
-    fn trigger(&mut self, agent: u32) -> Option<Trigger> {
+    fn natural_exit(&mut self, agent: u32) -> Result<Option<Record>> {
+        let Some(record) = self.ready()? else { return Ok(None) };
         let turn = self.turn(agent);
-        if self.done(agent, turn) {
-            return Some(Trigger::Done);
+        if turn.is_some_and(|turn| turn.idle) && self.pinned.is_none_or(|pinned| Some(pinned) == turn) {
+            return Ok(Some(record));
+        }
+        let reason = "Native activity after the final response is changed or unverified; the work remains open";
+        let store = self.completion.as_ref().context("completion store not bound")?.clone();
+        lifecycle::Closing::begin(store, &record)?.withdraw(reason)?;
+        self.report(reason.into());
+        Ok(None)
+    }
+
+    fn trigger(&mut self, agent: u32) -> Option<lifecycle::Closing> {
+        let ready = self.ready();
+        match ready {
+            Ok(Some(record)) => {
+                let turn = self.turn(agent);
+                if let Some(turn) = turn.filter(|turn| turn.idle) {
+                    if self.pinned.is_some_and(|pinned| pinned != turn) {
+                        self.report(
+                            "Native activity changed after the final response; closeout needs a new verified turn."
+                                .into(),
+                        );
+                        return None;
+                    }
+                    self.pinned = Some(turn);
+                    let since = *self.ready_since.get_or_insert_with(Instant::now);
+                    if since.elapsed() >= self.idle
+                        && turn::shells(agent) == 0
+                        && agent::input_idle().is_none_or(|idle| idle >= self.input_idle)
+                    {
+                        return match lifecycle::Closing::begin(self.completion.as_ref()?.clone(), &record) {
+                            Ok(closing) => Some(closing),
+                            Err(error) => {
+                                self.report(format!("{error:#}"));
+                                None
+                            }
+                        };
+                    }
+                } else {
+                    self.ready_since = None;
+                }
+            }
+            Ok(None) => {}
+            Err(error) => self.report(format!("completion remains unverified: {error:#}")),
         }
         if Instant::now() < self.next_poll {
             return None;
         }
         self.next_poll = Instant::now() + self.poll;
-        if self.closing() {
-            return Some(Trigger::Closing);
-        }
         if let Err(error) = closeout::notify(&self.launch) {
             self.report(format!("could not record merge notification: {error:#}"));
         }
@@ -378,27 +402,37 @@ impl Watch {
     }
 }
 
-fn stop(agent: &mut Agent, host: Host, grace: Duration) -> Result<()> {
+fn stop(agent: &mut Agent, host: Host, grace: Duration, mut allowed: impl FnMut(u32) -> Result<bool>) -> Result<bool> {
     let (signal, presses) = host.stop();
     let deadline = Instant::now() + grace;
     let mut sent = 0;
     while agent.try_wait()?.is_none() && Instant::now() < deadline {
+        if !allowed(agent.pid())? {
+            return Ok(false);
+        }
         if sent < presses {
             if let Err(error) = agent.stop(signal) {
-                eprintln!("tj run: could not ask the agent to exit: {error}");
+                eprintln!("TJ: could not ask the agent to exit: {error}");
                 sent = presses;
             }
             sent += 1;
         }
         std::thread::sleep(Duration::from_millis(400));
     }
-    agent.kill_tree(Duration::from_secs(30)).context("could not end the agent's processes")
+    if !allowed(agent.pid())? {
+        return Ok(false);
+    }
+    agent.kill_tree(Duration::from_secs(30)).context("could not end the agent's processes")?;
+    Ok(true)
 }
 
 fn successor_arguments(args: &Args, launch: &Launch, agent: Vec<OsString>) -> Vec<OsString> {
     let mut arguments: Vec<OsString> =
-        ["run", "--host", launch.host.name(), "--title", &launch.title, "--cwd"].map(OsString::from).to_vec();
+        ["_session", "--host", launch.host.name(), "--title", &launch.title, "--cwd"].map(OsString::from).to_vec();
     arguments.push(launch.cwd.clone().into_os_string());
+    if let Some(directory) = &args.command_cwd {
+        arguments.extend([OsString::from("--command-cwd"), directory.clone().into_os_string()]);
+    }
     if let Some(item) = &launch.item {
         arguments.extend(["--item", item.as_str()].map(OsString::from));
     }
@@ -406,6 +440,7 @@ fn successor_arguments(args: &Args, launch: &Launch, agent: Vec<OsString>) -> Ve
         ("--poll-seconds", args.poll_seconds),
         ("--idle-seconds", args.idle_seconds),
         ("--grace-seconds", args.grace_seconds),
+        ("--native-exit-seconds", args.native_exit_seconds),
         ("--restart-grace-seconds", args.restart_grace_seconds),
         ("--plugin-grace-seconds", args.plugin_grace_seconds),
         ("--input-idle-seconds", args.input_idle_seconds),
@@ -436,14 +471,14 @@ fn restart(agent: &mut Agent, watch: &mut Watch, args: &Args, exe: &Path) -> Res
             return Ok(None);
         }
     };
-    eprintln!("\r\ntj run: tj was updated; resuming {}:{session} in the new version\r", host.name());
-    stop(agent, host, Duration::from_secs(args.grace_seconds))?;
+    eprintln!("\r\nTJ: tj was updated; resuming {}:{session} in the new version\r", host.name());
+    stop(agent, host, Duration::from_secs(args.grace_seconds), |_| Ok(true))?;
     let resume = host.resume(&args.agent, &session);
     update::successor::hand_over(exe, &successor_arguments(args, &watch.launch, resume)).map(Some)
 }
 
 fn wait_for_enter() {
-    eprintln!("tj run: press Enter to close this tab");
+    eprintln!("TJ: press Enter to close this tab");
     let _ = std::io::stdin().read_line(&mut String::new());
 }
 
@@ -456,7 +491,7 @@ static OPEN_RECORD: Mutex<()> = Mutex::new(());
 fn mark_open(launch_id: &str, open: bool) {
     let _record = OPEN_RECORD.lock().unwrap_or_else(PoisonError::into_inner);
     if let Err(error) = store::set_open(launch_id, open) {
-        eprintln!("tj run: {error:#}");
+        eprintln!("TJ: {error:#}");
     }
 }
 
@@ -481,6 +516,7 @@ pub fn run(args: Args) -> Result<ExitCode> {
 }
 
 fn supervise(args: &Args, launch: Launch, prebound: Option<&PreboundSession>) -> Result<ExitCode> {
+    let command_cwd = args.command_cwd.as_deref().unwrap_or(&launch.cwd);
     let exe = std::env::current_exe().context("could not locate the tj executable")?;
     let selected = tj_agents::selected(&launch.cwd);
     let upstream = if selected && !args.successor {
@@ -506,7 +542,7 @@ fn supervise(args: &Args, launch: Launch, prebound: Option<&PreboundSession>) ->
                 end_not_started(&launch, prebound, pid, &started_at);
                 return Err(error);
             }
-            eprintln!("tj run: launch {} was not recorded: {error:#}", launch.id);
+            return Err(error).context("managed launch was not recorded; the native host was not started");
         }
     }
     if let Some(prebound) = prebound {
@@ -517,16 +553,16 @@ fn supervise(args: &Args, launch: Launch, prebound: Option<&PreboundSession>) ->
     }
     mark_open(&launch.id, true);
     if selected {
-        prepare(&launch, &args.agent);
+        prepare(&launch, command_cwd, &args.agent);
     }
     match upstream.map(std::thread::JoinHandle::join) {
-        Some(Ok(Ok(Some(line)))) => eprintln!("tj run: {line}"),
+        Some(Ok(Ok(Some(line)))) => eprintln!("TJ: {line}"),
         Some(Ok(Err(error))) => {
-            eprintln!("tj run: could not check for tj-agents updates: {:#}", anyhow::Error::from(error));
+            eprintln!("TJ: could not check for tj-agents updates: {:#}", anyhow::Error::from(error));
         }
         _ => {}
     }
-    let mut agent = match Agent::start(&args.agent, &launch.cwd, &environment)
+    let mut agent = match Agent::start(&args.agent, command_cwd, &environment)
         .with_context(|| format!("could not start {}", args.agent[0].to_string_lossy()))
     {
         Ok(agent) => agent,
@@ -550,9 +586,12 @@ fn supervise(args: &Args, launch: Launch, prebound: Option<&PreboundSession>) ->
         marks,
         poll,
         idle: Duration::from_secs(args.idle_seconds),
+        input_idle: Duration::from_secs(args.input_idle_seconds),
         next_poll: Instant::now() + poll,
         reported: HashSet::new(),
-        mark: None,
+        completion: None,
+        revision: None,
+        ready_since: None,
         pinned: None,
         rollout: None,
         next_lookup: Instant::now(),
@@ -561,48 +600,102 @@ fn supervise(args: &Args, launch: Launch, prebound: Option<&PreboundSession>) ->
     // The shared timestamp limits requests even when tabs start at different times.
     let mut next_upstream = Instant::now() + poll;
     let mut upstream = None;
-    let removal = loop {
+    loop {
         if let Some(code) = agent.try_wait()? {
             agent.kill_tree(Duration::from_secs(30))?;
             if resumed && code != 0 {
-                eprintln!("\r\ntj run: the resumed agent exited with code {code}\r");
+                eprintln!("\r\nTJ: the resumed agent exited with code {code}\r");
                 wait_for_enter();
             }
-            let turn = watch.turn(agent.pid());
-            // Even an agent that exits itself must explicitly finish. Failure is never completion.
-            let finished = code == 0 && watch.completed_on_exit(turn);
-            let closing = watch.closing() || finished;
-            let _ = std::fs::remove_dir_all(&watch.marks);
-            if closing {
-                let result = closeout::owned_preflight(&watch.launch)
-                    .map_err(anyhow::Error::msg)
-                    .and_then(|plan| closeout::finish(&watch.launch, plan));
+            // A clean process exit is not a final result. Only the exact native receipt can close.
+            let ready = if code == 0 {
+                match watch.natural_exit(agent.pid()) {
+                    Ok(ready) => ready,
+                    Err(error) => {
+                        watch.report(format!("completion remains unverified: {error:#}"));
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+            if let Some(record) = ready {
+                let store = watch.completion.as_ref().context("completion store not bound")?.clone();
+                let closing = lifecycle::Closing::begin(store, &record)?;
+                let result =
+                    closeout::await_native_exit(&watch.launch, &closing, Duration::from_secs(args.native_exit_seconds))
+                        .and_then(|()| {
+                            closing.attempt(crate::completion::Step::Cleanup, || {
+                                closeout::owned_preflight(&watch.launch).map_err(anyhow::Error::msg)
+                            })
+                        })
+                        .and_then(|plan| closeout::finish(&watch.launch, plan, &closing));
                 if let Err(error) = result {
-                    eprintln!("tj run: closeout stopped: {error:#}");
+                    eprintln!("TJ: closeout stopped: {error:#}");
                     wait_for_enter();
                     return Ok(ExitCode::FAILURE);
                 }
                 return Ok(ExitCode::from(u8::try_from(code).unwrap_or(1)));
             }
             if let Err(error) = store::end(&watch.launch.id, "exited") {
-                eprintln!("tj run: {error:#}");
+                eprintln!("TJ: {error:#}");
             }
             return Ok(ExitCode::from(u8::try_from(code).unwrap_or(1)));
         }
-        if let Some(trigger) = watch.trigger(agent.pid()) {
+        if let Some(closing) = watch.trigger(agent.pid()) {
             match closeout::owned_preflight(&watch.launch) {
-                Ok(removal) => break removal,
-                Err(reason) => {
-                    watch.report(reason);
-                    if trigger == Trigger::Done {
-                        let _ = std::fs::remove_file(watch.marks.join("done"));
+                Ok(removal) => {
+                    // Preflight can take time. Recheck input and native activity before ending the host.
+                    if closing.check().is_err() {
+                        watch.report("Closeout withdrawn while checking ownership; the session remains open.".into());
+                        continue;
                     }
+                    if watch.turn(agent.pid()) != watch.pinned || turn::shells(agent.pid()) != 0 {
+                        closing.withdraw("Native activity changed during closeout preflight")?;
+                        continue;
+                    }
+                    let stopped = stop(&mut agent, watch.launch.host, grace, |pid| {
+                        if closing.check().is_err() {
+                            return Ok(false);
+                        }
+                        // The native status may disappear once the host exits. Its durable token
+                        // still rejects a final hook that recorded new input during shutdown.
+                        match watch.turn(pid) {
+                            Some(turn) if Some(turn) == watch.pinned => Ok(true),
+                            None if agent::started_at(pid)?.is_none() => Ok(true),
+                            _ => {
+                                let _ = closing.withdraw("Native activity changed while stopping the host");
+                                Ok(false)
+                            }
+                        }
+                    })?;
+                    if !stopped {
+                        watch.report("Closeout withdrawn during shutdown; no further stop signal was sent.".into());
+                        continue;
+                    }
+                    let result = closeout::await_native_exit(
+                        &watch.launch,
+                        &closing,
+                        Duration::from_secs(args.native_exit_seconds),
+                    )
+                    .and_then(|()| closeout::finish(&watch.launch, removal, &closing));
+                    let _ = std::fs::remove_dir_all(&watch.marks);
+                    if let Err(error) = result {
+                        eprintln!("tj: closeout stopped: {error:#}");
+                        wait_for_enter();
+                        return Ok(ExitCode::FAILURE);
+                    }
+                    return Ok(ExitCode::SUCCESS);
+                }
+                Err(reason) => {
+                    let _ = closing.fail(crate::completion::Step::Cleanup, &reason);
+                    watch.report(reason);
                 }
             }
         }
         if upstream.as_ref().is_some_and(std::thread::JoinHandle::is_finished) {
             match upstream.take().map(std::thread::JoinHandle::join) {
-                Some(Ok(Ok(Some(line)))) => eprintln!("tj run: {line}"),
+                Some(Ok(Ok(Some(line)))) => eprintln!("TJ: {line}"),
                 Some(Ok(Err(error))) => watch.report(format!("could not check for tj-agents updates: {error}")),
                 _ => {}
             }
@@ -612,7 +705,13 @@ fn supervise(args: &Args, launch: Launch, prebound: Option<&PreboundSession>) ->
             upstream = update::upstream::start(watch.launch.host, &watch.launch.cwd, args.update_url.clone());
         }
         let host = update::host(watch.launch.host);
-        let due = if watch.marked().is_some() { None } else { update::due(&mut watcher, host, agent.pid(), graces) };
+        let finishing = watch.completion.as_ref().and_then(|store| store.load().ok().flatten()).is_some_and(|record| {
+            matches!(
+                record.state(),
+                State::Active { intent: Some(_), .. } | State::Ready { .. } | State::Closing { .. }
+            )
+        });
+        let due = if finishing { None } else { update::due(&mut watcher, host, agent.pid(), graces) };
         match due {
             Some(update::gate::Apply::Plugins) => {
                 let revision = watcher.revision();
@@ -630,30 +729,7 @@ fn supervise(args: &Args, launch: Launch, prebound: Option<&PreboundSession>) ->
             None => {}
         }
         std::thread::sleep(Duration::from_millis(500));
-    };
-    let result = stop(&mut agent, watch.launch.host, grace).and_then(|()| closeout::finish(&watch.launch, removal));
-    let _ = std::fs::remove_dir_all(&watch.marks);
-    if let Err(error) = result {
-        eprintln!("tj run: closeout stopped: {error:#}");
-        wait_for_enter();
-        return Ok(ExitCode::FAILURE);
     }
-    Ok(ExitCode::SUCCESS)
-}
-
-pub fn done() -> Result<ExitCode> {
-    let Some(launch_id) = owner::launch() else {
-        if launch_id().is_some() {
-            bail!("tj done only works from the tab's own agent; this process inherited another tab's tj run");
-        }
-        bail!("tj done only works inside a verified tj run session");
-    };
-    let marks = marks(&launch_id)?;
-    let marker = marks.join("done");
-    std::fs::create_dir_all(marker.parent().context("marker has no folder")?)?;
-    std::fs::write(&marker, rfc3339(SystemTime::now()))?;
-    println!("Marked done: this session closes out once it has been idle for about 10 minutes. New input cancels.");
-    Ok(ExitCode::SUCCESS)
 }
 
 #[cfg(test)]
@@ -670,6 +746,7 @@ mod tests {
             host: Some(Host::Codex),
             title: Some("Tab".to_owned()),
             cwd: None,
+            command_cwd: None,
             item: None,
             launch_id: Some("launch".to_owned()),
             parent: None,
@@ -677,12 +754,12 @@ mod tests {
             poll_seconds: 120,
             idle_seconds: 600,
             grace_seconds: 10,
+            native_exit_seconds: 90,
             restart_grace_seconds: 30,
             plugin_grace_seconds: 2,
             input_idle_seconds: 2,
             update_url: String::new(),
             successor: false,
-            _retired_ask_idle_seconds: None,
             agent,
         }
     }

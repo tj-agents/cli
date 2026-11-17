@@ -1,11 +1,12 @@
 use std::path::{Path, PathBuf};
 use std::process::{ExitCode, Stdio};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 
-use super::{Launch, hidden, store};
+use super::{Launch, hidden, lifecycle, store};
+use crate::completion::{State, Step};
 use crate::{feed, item_cli, paths};
 
 mod journal;
@@ -53,9 +54,9 @@ pub fn notify(launch: &Launch) -> Result<()> {
         &json!({
             "at": chrono::Local::now().format("%Y-%m-%d %H:%M").to_string(),
             "from": null,
-            "name": "tj run",
+            "name": "TJ",
             "kind": "merged",
-            "text": format!("Every PR linked to {item} has merged. Closeout still requires the session's explicit `tj done` after its remaining work and waits finish.")
+            "text": format!("Every PR linked to {item} has merged. Completion still requires the session's final result after all remaining work and waits finish.")
         }),
     )?;
     Ok(())
@@ -147,6 +148,10 @@ fn other_writers(owner: &store::Ownership) -> Result<()> {
             if !proven_dead {
                 bail!("another session may still be using {}: {}", path.display(), session["session"]);
             }
+            native_stopped(
+                session["launch_id"].as_str().context("another session has no managed launch to verify")?,
+                session["session"].as_str().context("another session has no native identity to verify")?,
+            )?;
         }
     }
     Ok(())
@@ -375,17 +380,68 @@ fn removed(removal: &Removal) -> Result<()> {
     Ok(())
 }
 
-pub fn finish(launch: &Launch, plan: Plan) -> Result<()> {
+fn native_dead(launch: &str, session: &str) -> Result<bool> {
+    let output = hidden("tj-session")
+        .args(["liveness", "--session", session, "--launch-id", launch])
+        .stdin(Stdio::null())
+        .output()
+        .context("could not verify native session liveness")?;
+    if !output.status.success() {
+        bail!("native session liveness is unverified: {}", String::from_utf8_lossy(&output.stderr).trim());
+    }
+    let proof: Value = serde_json::from_slice(&output.stdout).context("native liveness returned no JSON")?;
+    if proof["session"].as_str() != Some(session) || proof["launch_id"].as_str() != Some(launch) {
+        bail!("native session liveness returned a different identity");
+    }
+    match proof["state"].as_str() {
+        Some("dead") => Ok(true),
+        Some("live") => Ok(false),
+        _ => bail!("native session liveness returned an unknown state"),
+    }
+}
+
+fn native_stopped(launch: &str, session: &str) -> Result<()> {
+    if !native_dead(launch, session)? {
+        bail!("native session may still be live; cleanup retained: {session}");
+    }
+    Ok(())
+}
+
+pub fn await_native_exit(launch: &Launch, closing: &lifecycle::Closing, timeout: Duration) -> Result<()> {
+    closing.attempt(Step::Cleanup, || {
+        let deadline = Instant::now() + timeout;
+        let mut announced = false;
+        loop {
+            let record = closing.check()?;
+            if native_dead(&launch.id, record.identity().session_handle())? {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                bail!("native session is still loaded after host exit; cleanup retained for tj closeout");
+            }
+            if !announced {
+                eprintln!("TJ: waiting for the native conversation to unload before cleanup.");
+                announced = true;
+            }
+            std::thread::sleep(Duration::from_millis(500));
+        }
+    })
+}
+
+fn cleanup(launch: &Launch, plan: &Plan, closing: &lifecycle::Closing) -> Result<()> {
+    closing.check()?;
+    native_stopped(&launch.id, &plan.owner.session)?;
     let rechecked = owned_preflight(launch).map_err(anyhow::Error::msg)?;
     if rechecked.owner != plan.owner || rechecked.removals != plan.removals || rechecked.journals != plan.journals {
         bail!("worktree ownership or content changed while stopping the agent; recovery required");
     }
-    journal::write(launch, &plan)?;
+    journal::write(launch, plan)?;
     // The aggregate is durable before any predecessor proof is retired.
     for source in &plan.journals {
         journal::clear(source)?;
     }
     for removal in &plan.removals {
+        closing.check()?;
         let Some(claim) = removal_claim(&plan.owner, removal) else {
             removed(removal)?;
             continue;
@@ -400,19 +456,38 @@ pub fn finish(launch: &Launch, plan: Plan) -> Result<()> {
     if !completion_owner(launch)?.0.claims.is_empty() {
         bail!("owned worktrees remain after cleanup; recovery required");
     }
-    if let Some(item) = &launch.item {
-        let item = item.as_str();
-        let output = hidden("tj-item")
-            .args(["progress", item, "--state", "Done"])
-            .current_dir(&plan.repository)
-            .stdin(Stdio::null())
-            .output()
-            .context("could not run tj item progress")?;
-        if !output.status.success() {
-            bail!("tj item progress {item}: {}", String::from_utf8_lossy(&output.stderr).trim());
-        }
+    closing.record(Step::Cleanup, &format!("owned-worktrees-released:{}", launch.id))?;
+    Ok(())
+}
+
+pub fn finish(launch: &Launch, plan: Plan, closing: &lifecycle::Closing) -> Result<()> {
+    closing.attempt(Step::Cleanup, || cleanup(launch, &plan, closing))?;
+    if !closing.recorded(Step::Tracker)? {
+        closing.attempt(Step::Tracker, || {
+            if let Some(item) = &launch.item {
+                let item = item.as_str();
+                let output = hidden("tj-item")
+                    .args(["progress", item, "--state", "Done"])
+                    .current_dir(&plan.repository)
+                    .stdin(Stdio::null())
+                    .output()
+                    .context("could not run tj item progress")?;
+                if !output.status.success() {
+                    bail!("tj item progress {item}: {}", String::from_utf8_lossy(&output.stderr).trim());
+                }
+            }
+            closing.record(
+                Step::Tracker,
+                &format!(
+                    "tracker-done:{}",
+                    launch.item.as_ref().map_or("no-work-item", crate::domain::item::Reference::as_str)
+                ),
+            )
+        })?;
     }
+    closing.check()?;
     store::end(&launch.id, "closed")?;
+    closing.complete()?;
     journal::clear(&launch.id)
 }
 
@@ -429,16 +504,13 @@ fn wrapper_alive(row: &store::Row) -> Result<bool> {
 
 #[derive(clap::Args)]
 pub struct Args {
-    /// Work item whose sessions to close. Without it, only launches whose tab is already gone are swept.
+    /// Retry verified completion for this item's dead sessions, or sweep interrupted closeout receipts.
     item: Option<String>,
 }
 
 pub fn run(args: Args) -> Result<ExitCode> {
     let cwd = std::env::current_dir()?;
     let item = args.item.as_deref().map(|value| item_cli::reference(value, &cwd, hidden("tj-item"))).transpose()?;
-    if let Some(item) = &item {
-        store::mark_closing(item)?;
-    }
     let mut failed = false;
     for row in store::launches(item.as_ref())? {
         match wrapper_alive(&row) {
@@ -452,13 +524,46 @@ pub fn run(args: Args) -> Result<ExitCode> {
         }
         let launch = &row.launch;
         let started = !matches!(journal::read(launch), Ok(None));
-        let swept = item.is_some() || row.closing || started;
-        if !swept {
-            continue;
-        }
-        let result = owned_preflight(launch).map_err(anyhow::Error::msg).and_then(|plan| finish(launch, plan));
+        let selected = item.is_some() || row.closing || started;
+        let result = (|| -> Result<bool> {
+            let store = match lifecycle::for_recovery(&launch.id) {
+                Ok(Some(store)) => store,
+                Ok(None) => return Ok(false),
+                Err(_) if !selected => return Ok(false),
+                Err(error) => return Err(error),
+            };
+            let record = match store.load()? {
+                Some(record) => record,
+                None if !selected => return Ok(false),
+                None => bail!("no final result receipt; resume this session to finish its work"),
+            };
+            if matches!(record.state(), State::Completed { .. }) {
+                if !started {
+                    return Ok(false);
+                }
+                let plan = owned_preflight(launch).map_err(anyhow::Error::msg)?;
+                native_stopped(&launch.id, &plan.owner.session)?;
+                if !plan.owner.claims.is_empty() {
+                    bail!("completed session acquired new worktree claims; recovery required");
+                }
+                if !row.closed {
+                    store::end(&launch.id, "closed")?;
+                }
+                journal::clear(&launch.id)?;
+                return Ok(true);
+            }
+            if !selected && record.state().outcome().is_none() {
+                return Ok(false);
+            }
+            let record = lifecycle::deliver(&store, record)?;
+            let closing = lifecycle::Closing::begin(store, &record)?;
+            let plan = closing.attempt(Step::Cleanup, || owned_preflight(launch).map_err(anyhow::Error::msg))?;
+            finish(launch, plan, &closing)?;
+            Ok(true)
+        })();
         match result {
-            Ok(()) => println!("closed     {} ({})", launch.title, launch.cwd.display()),
+            Ok(true) => println!("closed     {} ({})", launch.title, launch.cwd.display()),
+            Ok(false) => {}
             Err(error) => {
                 failed = true;
                 println!("kept       {} ({}): {error:#}", launch.title, launch.cwd.display());
@@ -500,6 +605,7 @@ mod tests {
             },
             closing: false,
             ended: false,
+            closed: false,
             wrapper_pid: pid,
             wrapper_started_at: started.to_rfc3339(),
         };

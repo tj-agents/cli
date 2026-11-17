@@ -2,16 +2,19 @@
 
 Fast shell tools for agentic programming, on Windows and Linux. `tj` is the deterministic OS and terminal
 mechanics layer of [tj-agents](https://github.com/tj-agents): judgement lives in skills, `tj` does the
-parts the hosts themselves don't cover, with the same behaviour from Claude Code and Codex. `tj` provides
-two everyday commands, plus `tj run`, the root process of every agent tab:
+parts the hosts themselves don't cover. Start a managed conversation with `tj claude` or `tj codex`, using
+the provider's native terminal interface and arguments. Session search and directory navigation are also
+available:
 
 | Command | What it does |
 | --- | --- |
 | `cr` | Search your Claude Code or Codex sessions by **anything said in them**, preview how each one ended, and press Enter to resume it in the folder it was started from. |
 | `f` | Fuzzy-jump to a project folder. `f core` goes straight to the best match; plain `f` opens a picker. |
 | `cd` / `cdi` | Use [zoxide](https://github.com/ajeetdsouza/zoxide) to jump to a previously visited directory by name, or choose one interactively with `cdi`. |
-| `run` | Run an agent in its tab and close its work item out once it is finished: agent stopped, worktree removed, card Done, tab closed. |
-| `message` | Send another Claude or Codex session a message, addressed by its tab title, with the same behaviour from either host. |
+| `tj claude` / `tj codex` | Start an independent managed conversation in the current terminal, with native arguments and recorded completion. |
+| `tj finish` / `tj wait` / `tj hold` | Request completion after the final response, record a genuine wait, or keep the session open. |
+| `tj receipt` | Inspect the durable result and closeout record for a managed launch. |
+| `tj message` | Address another session by title or handle through the common messaging interface. |
 
 Any other `tj <name> ...` runs `tj-<name> ...` from PATH, so `tj item` runs the `tj-item` tool from
 `tj-agents/work-items`.
@@ -50,6 +53,11 @@ git clone https://github.com/tj-agents/cli $HOME\source\repos\tj-agents\cli
 
 Then open a new terminal.
 
+Managed conversations also need [Agent's installation and repository setup](https://github.com/tj-agents/agent#install)
+and at least one installed native provider. Use your own provider authentication and repository access.
+Agent supplies the host adapters, lifecycle hooks and `tj` command shims; the CLI-only installation supplies
+the binaries and shell tools below.
+
 You can run the installer as often as you like. It updates whatever is out of date and reports `ok`
 for everything else, so re-running it after a `git pull` is how you upgrade. It:
 
@@ -77,8 +85,8 @@ never visited. Uninstall removes the CLI wiring and binaries, leaving zoxide and
 | Remove CLI binaries and shell wiring | `linux/install.sh --uninstall` | `windows\install.ps1 -Uninstall` |
 
 [fzf](https://github.com/junegunn/fzf) 0.75.0,
-[worktrunk](https://github.com/max-sixty/worktrunk) 0.81.0, installed as `git-wt` next to `tj` for `tj run` to
-remove worktrees with, and [Handy](https://github.com/cjpais/Handy) are installed and kept current by
+[worktrunk](https://github.com/max-sixty/worktrunk) 0.81.0, installed as `git-wt` next to `tj` for managed
+worktree cleanup, and [Handy](https://github.com/cjpais/Handy) are installed and kept current by
 [Agent](https://github.com/tj-agents/agent#install)'s install and refresh, through `tj_cli.fzf_install`,
 `tj_cli.worktrunk_install` and `tj_cli.handy_install` at the `tj-cli` revision Agent pins.
 The CLI shell installers own native binaries, shell wiring and zoxide. Agent owns the additional tools listed above.
@@ -186,143 +194,198 @@ into it. The functions live in `linux/tj.sh`, `linux/tj.fish` and `windows/tj.ps
 The Rust source in `src/` is shared by both platforms. Only the installers and the shell functions
 differ, so only those are split into `linux/` and `windows/`.
 
-## `tj run`: the agent tab's root process
+## Managed sessions
 
 ```text
-tj run [--host claude|codex] [--title T] [--cwd WORKTREE] [--launch-id U] [--item REF] [--parent HOST:ID] [--session codex:UUID] -- <agent argv>
-tj done              the session's last step: close out after about 10 idle minutes
-tj closeout [REF]    close an item's sessions; with no REF, sweep tabs closed by hand or crashed wrappers
+tj claude [native arguments]
+tj codex [native arguments]
+tj claude --resume <session-id>
+tj codex resume <session-id>
+tj claude auth login
+tj codex login
 ```
 
-The launcher opens the tab (`wt.exe new-tab … tj run …` or `tmux new-window … tj run …`); `tj run` never
-opens one. It starts the agent as its child: in a Job Object on Windows, or in its own foreground process
-group on Linux, where the agent also dies with the wrapper. It registers the launch with `agent-store
-launch` and exports `TJ_RUN_PID`, `TJ_RUN_STARTED_AT`, `TJ_RUN_LAUNCH_ID` and `AGENT_CLI_TAB_TITLE` to the agent.
+`tj claude` and `tj codex` run the provider's native terminal interface in the current terminal. Native
+flags, prompts, subcommands and resume arguments pass through to that provider; relative directory
+arguments keep their meaning. Help, version, authentication and other maintenance commands run directly
+without creating a managed conversation. Use the provider's own authentication, model selection and access
+controls. Omitting TJ's permission preference preserves native controls; see
+[Agent's repository permissions](https://github.com/tj-agents/agent#repository-permissions).
 
-It marks the launch open (`agent-store set-open`) when it starts and closed when it exits or, on Windows, when
-the user closes the tab. A logoff, shutdown or crash leaves it open, so `tj recover --open` reopens exactly the
-tabs that were open. On Linux a closed tab hangs the wrapper up before it can record the close.
+A public launch is independent: it does not inherit a calling agent's parent or work item. A work item is
+optional. To delegate into a named Windows Terminal or tmux tab, use
+[Agent's handoff](https://github.com/tj-agents/agent/blob/main/.agents/agent/utility/handoff/SKILL.md), which
+requires exactly one of `--parent <host:id>` and `--independent`. `tj start` supplies the work-item launch
+workflow. A plain `claude` or `codex` command starts the provider directly and does not add TJ supervision
+or closeout receipts.
 
-Only the agent's command line is required, so a shell function can run a typed `claude` or `codex` under it:
-the host defaults to the executable's name, the folder to the current one, the title to the repository or
-worktree folder's name (suffixed `-2`, `-3`… while an open launch holds it) and the launch id to a random one.
-The executable must be the native `claude` or `codex`, not an npm `.cmd` shim.
+The managed wrapper owns the native child process: a Job Object on Windows or a foreground process group
+on Linux. It records a launch and binds the native session through Agent's SessionStart hook. The title
+defaults to the repository or worktree folder name, with a numeric suffix while another open launch holds
+it. Only the managed session's own agent can change its completion state; inherited environment variables
+alone do not establish ownership.
 
-`--item` accepts a full tracker reference or URL unchanged. A bare id such as `461` or `#461` is resolved
+In a repository selecting TJ plugins, startup invokes `tj prepare` to check selected plugins and the
+standards index before the host reads instructions. Startup and refresh leave authored instructions and
+repository settings untouched. Drift reports an explicit `tj prepare --host <host> --cwd <path> --write`
+command. Preparation failures warn and allow the provider to start, but missing lifecycle evidence leaves
+completion unverified. Install and enable Agent in that repository for managed completion.
+
+Work-item launches accept a full tracker reference or URL. A bare id such as `461` or `#461` is resolved
 by `tj-item --cwd WORKTREE reference ID` using that project's tracker profile before a launch is recorded
-or an agent starts. `tj closeout ID` uses the current directory's profile before marking anything closing.
+or an agent starts. `tj closeout ID` uses the current directory's profile before attempting closeout.
 A missing profile or failed resolution stops the command; a Git code remote never selects a tracker.
 Recovery and binary handover carry the resolved reference with the original agent arguments.
 
-`--session codex:UUID` binds a pre-created Codex thread before the native process starts. It requires an
-explicit `--host codex` and an absolute native command in the exact form
-`codex --cd WORKTREE resume UUID [-- PROMPT]`. The delimiter is required when a prompt is supplied, so
-prompt text beginning with a hyphen remains literal.
+### Completion, waits and keep-open
 
-In a repository whose `.agents/plugins.json` selects a `@tj-agents` plugin, `tj run` invokes Agent's
-`tj-prepare` before each start with the host, working directory and host arguments. Agent reconciles the
-repository's selected plugins and its standards index before the host reads native instructions. Missing
-preparation or a preparation failure prints a warning and the session still starts. Install Agent to provide
-`tj-prepare`.
+Run these commands from the managed agent's own tool process:
 
-The [plugin update flow](docs/plugin-updates.md) describes marketplace checks, installation and reloads in
-running tabs, including the host-specific acceptance checks.
+```text
+tj finish
+tj wait user "The user must choose the deployment environment"
+tj wait child "The delegated review must return"
+tj wait ci "The required checks must pass"
+tj wait approval "Deployment approval is pending"
+tj hold
+tj hold --release
+tj receipt
+```
 
-Only the tab's own agent speaks for it. `tj done` acts only when
-the caller descends from the wrapper through its agent, with no second copy of that agent in between; a tab,
-shell or agent started from inside the session inherits `TJ_RUN_*` but is ignored. `tj launch` prints the
-launch the caller belongs to, for Agent's `SessionStart` binding.
+`tj finish` records intent for the current native turn. The agent then writes its final response normally.
+Agent's native Stop adapter records that response against the exact session and turn; a finish request
+alone is insufficient. Missing, interrupted or conflicting evidence leaves the session incomplete. TJ
+does not infer success from response wording, a clean process exit, idleness or a merged PR.
 
-An updated `tj` executable restarts the agent once the new file has settled and runs, Claude has been idle
-30 s with no shell running under it (a background task), and input has been idle 30 s. The wrapper stops the agent the way closeout does
-and hands the tab to the new binary, which starts the agent again as `claude --resume <id>` or `codex resume
-<id>`, keeping the original options and dropping the prompt and any earlier session choice. Linux replaces the
-process in place; Windows keeps the old wrapper as the tab's root, waiting for its successor, since the tab
-closes when its first process exits. The launch row, its marks and the conversation are kept. The id is the
-session `agent-store show --launch-id` binds to the launch; with none bound the agent keeps running and the
-wrapper says so once. A resume that exits with an error leaves the tab open with the reason. Codex exposes no
-turn state to the update check, so a Codex tab takes an updated `tj` at its next start.
+`tj wait <user|child|ci|approval> <reason>` records what is pending and withdraws finish intent. It does not
+start a poller or synthesize input. Pending native background work also prevents closeout. Once work
+resumes, the agent completes it and requests finish for that turn. `tj hold` keeps the session open even
+when a final result is available. The hold survives new input and resuming that conversation; only
+`tj hold --release` releases it, and release alone does not request completion.
 
-To let already-running wrappers hand over safely, a successor accepts and ignores their retired
-`--ask-idle-seconds` argument. This upgrade exception requires `--successor`; fresh launches reject the
-argument, and new wrappers never forward it. It does not enable idle messages.
+New input cancels pending completion and invalidates closeout authorization for the previous turn.
+Before stopping the host, TJ also requires readable native idle state, no running background shell and a
+short quiet period. It rechecks those conditions during shutdown. Idleness creates no user messages,
+nudges or model turns.
 
-It closes out only when one of these happens:
+The completion record retains the final response, session and launch identity, wait or hold state, and
+receipts for result delivery, cleanup and tracker completion. A result being recorded is distinct from
+closeout succeeding. Read the record from the owning agent with `tj receipt`, or from a terminal after
+the session has closed:
 
-- `tj done` was run, the turn that ran it ended, and the agent has stayed idle for about 10 minutes since with no
-  shell running under it. The wrapper reads each turn from the host itself, never from hooks: Claude's
-  `<claude home>/sessions/<pid>.json` and the Codex thread's rollout under `<codex home>/sessions`. A turn started
-  after `tj done`, by a prompt, a queued message or a finished background task, withdraws it, and an unreadable
-  record never closes. While `tj done` stands, the tab applies no update;
-- `agent-store` marks the launch or its session `closing`, which is what `tj closeout REF` does.
+```text
+tj receipt --launch <launch-id>
+```
 
-A merged PR never completes a session: an item can be merged while the session still has work. Every two
-minutes the wrapper checks `tj item prs`. When all PRs have merged, it records a notification in the bound
-session's feed. The item and sorted PR URLs identify that event durably, so later polls, turns, feed reads,
-wrapper restarts and launches of the same session do not repeat it. A newly merged PR set gets a new event.
+Records live in durable application data, separately from disposable caches. For a parented session,
+result delivery uses the common [messaging interface](#tj-message-and-tj-feed-messaging-between-sessions)
+and the exact recorded parent. Independent sessions retain their native final response and local receipt.
 
-Idleness generates no messages or model turns. An agent waiting on a reply from the user, an approval,
-a child session or a merge remains unfinished. Work with no item or PR finishes through `tj done` too.
+### Safe closeout and recovery
 
-An agent that is unsure carries on and the tab stays open. A refused check withdraws `tj done` and prints
-the reason; the agent runs it again once the reason is fixed.
-
-Before stopping anything, it checks every linked worktree claimed by the exact native session for the
+Before stopping anything, TJ checks every linked worktree claimed by the exact native session for the
 current launch or earlier launches of the same work item, including roots in other repositories. Earlier
 wrappers must be provably stopped. Each root must be registered, clean and integrated into its freshly
 fetched default branch; a merged item PR alone cannot authorize deletion. Worktrunk supplies the content
-checks for squash and rebase merges. Live or unknown process ownership keeps the worktree open, and
-unmanaged claims require recovery or adoption before closeout.
+checks for squash and rebase merges. Authored changes, live or unknown process ownership, and unmanaged
+claims prevent removal. Primary checkouts remain.
 
-Historical cleanup requires a shared linked work item. Unlinked launches retain their separate claims
-and cleanup journals; their common native conversation does not establish a shared task.
+Historical cleanup requires a shared linked work item. Unlinked launches retain separate claims and
+cleanup journals; their common native conversation does not establish a shared task. Cleanup never guesses
+ownership from a neighbouring folder or adopts legacy location metadata.
 
-After stopping its own agent process tree, the wrapper repeats those checks and refuses changed ownership or content. Each worktree and branch must disappear before its ownership record is released under its original launch. Cleanup journals preserve unfinished removals across repeated recoveries. The item becomes Done and the launch closes only after all of those roots are removed. Primary checkouts remain. A missing or unrecorded ownership root requires recovery; cleanup never guesses ownership from a neighbouring folder or adopts legacy location metadata.
+With a valid result receipt and closeout authorization, the wrapper:
 
-1. asks the agent to exit: a console break or SIGINT for Claude, a Ctrl+C keypress for Codex (through
-   `tmux send-keys` on Linux);
-2. kills what is left after 10 s and waits until no process of the tree remains;
-3. runs `git-wt remove --foreground` for each owned linked worktree;
-4. runs `tj item progress REF --state Done` and `agent-store end`;
-5. exits 0, so Windows Terminal (`closeOnExit` default) or tmux closes the tab.
+1. asks its native host to exit with a console break or SIGINT for Claude, or Ctrl+C for Codex;
+2. rechecks authorization during the grace period, then ends the remaining owned process tree;
+3. rechecks ownership and content, and runs `git-wt remove --foreground` for each safe linked worktree;
+4. releases each claim only after its worktree and branch are gone, marks the linked item Done when there
+   is one, and closes the launch;
+5. records completed closeout and exits, returning to the calling shell or closing a launcher-owned tab.
 
-Helpers run hidden through `tj_hook` on Windows, and in their own session on Linux, so they never touch the
-agent's console. If the agent exits successfully by itself with a readable host record and `tj done`
-still standing, the wrapper can clean up immediately. A failed exit preserves unfinished worktrees.
-An explicit closing request also authorizes cleanup, subject to the same ownership and content checks.
-Otherwise the wrapper ends the launch and keeps the worktrees, preserving the exit code. A dead-wrapper
-sweep requires explicit closing or an existing cleanup journal: a leftover completion mark cannot prove
-that no later turn withdrew it. Merged PRs alone do not authorize cleanup.
+Cleanup journals and completion receipts retain unfinished stages for recovery. A failed native exit
+preserves unfinished worktrees; a successful exit permits cleanup only with a valid final result and all
+the same checks. Helpers run hidden through `tj_hook` on Windows and in their own session on Linux.
+
+```text
+tj closeout <work-item-ref>
+tj closeout
+tj recover --open
+```
+
+`tj closeout <ref>` retries verified completion for dead launches of that item; without a reference it
+sweeps interrupted closeout work. It skips live wrappers and cannot replace missing final evidence or
+override a hold. Resume an incomplete session to finish its work. `tj recover --open` reopens launches
+recorded as open whose native agent is no longer running. Logoff, shutdown or a crash can leave that mark;
+on Windows an ordinary tab close records it closed. On Linux a tab hangup can arrive before the wrapper
+records the close. See [Agent's recovery details](https://github.com/tj-agents/agent#lifecycle).
+
+A merged PR never completes a session. Every two minutes the wrapper checks a linked item's PRs and
+records a feed notification when all have merged. The item and sorted PR URLs identify the event durably,
+so later polls, feed reads, wrapper restarts and launches of the same session do not repeat it. A newly
+merged PR set gets a new event.
+
+### Runtime updates
+
+The [plugin update flow](docs/plugin-updates.md) owns marketplace checks, installation and reloads in
+running sessions. Separately, the wrapper detects a replacement `tj` executable. Once the new file has
+settled and runs, Claude and input have been idle for 30 seconds, and no background shell remains, it
+hands over to the new binary and resumes the same conversation. The original options remain; the prompt
+and earlier session choice are removed. Completion already awaiting closeout prevents that restart.
+
+Linux replaces the wrapper in place. Windows keeps the old wrapper as the tab's root while its successor
+runs. Launch identity and the conversation remain. Without a bound native session, the current agent
+continues and the wrapper reports the missing binding. A failed resume leaves the reason visible. Codex
+currently takes a replacement binary on its next start.
 
 ## `tj message` and `tj feed`: messaging between sessions
 
 ```text
-tj message <title|host:id> <text>   post a message to another Claude or Codex session's feed
-tj feed                             show this session's unread messages, once, with how to reply
-tj feed --wait [--timeout <secs>]   in a Codex session: block until a message arrives (default 12 hours); exit 1 if none did
+tj message <title|host:id> <text> [--request-id <id>]
+tj feed                           show this session's unread feed messages, once, with how to reply
+tj feed --wait [--timeout <secs>]  wait for a feed message (default 12 hours); exit 1 if none arrived
 ```
 
-The target is looked up with `agent-store sessions --title` (or `agent-store show` for a handle) and must be
-exactly one session that has not ended. The caller is the Claude session when `CLAUDECODE=1`, otherwise the
-Codex thread in `CODEX_THREAD_ID`; a message from neither is shown as from a terminal.
+Both hosts use `tj message`; TJ owns the provider routing decision. Address an exact session handle or a
+title resolving to one registered session that has not ended. Claude-to-Claude messages use the sending
+Claude session's native adapter; messages involving Codex, or sent from a plain terminal, use the feed.
+Native routing requires Agent's adapter to be active in a Claude host with the supported mod API
+(Claude Code 2.1.287 or newer). It preserves the source session identity and native delivery controls.
 
-Both hosts receive messages in `<cache>/feed/<host>-<id>.jsonl`, with `<host>-<id>.read` holding the byte
+| Receipt | Meaning |
+| --- | --- |
+| Native `submitted` | The source provider accepted or queued the send; recipient approval, rendering and reading are not proved. |
+| Feed `stored` | The record was appended to the recipient's feed; no wake or reading is proved. |
+| Native `not-delivered`, `unknown`, or missing receipt | Success is unverified; TJ does not switch transports or automatically resend. |
+
+A held, refused or uncertain native send never falls back to the feed. Reuse `--request-id <id>` only for
+the exact same message and recipient: it preserves that operation's identity when inspecting or retrying,
+instead of creating a new send. A claimed native request is not resent after an adapter restart. Automatic
+final-result delivery uses the same routing and a stable identity for its session, launch and turn.
+
+<!-- Parent reconciliation required before publication: verify the source Claude mod is installed and
+loaded on supported hosts and complete real native acceptance on Windows and Linux. The bridge maps
+native isDelivered=true to submitted only; keep recipient approval/read claims out of this contract.
+Confirm the final provider minimum and user-facing errors after integration. -->
+
+The feed transport stores messages in `<cache>/feed/<host>-<id>.jsonl`, with `<host>-<id>.read` holding the byte
 offset already shown. Writers use an OS file lock and flush complete records; a torn last line is separated
 before the next append. On Unix the folder and feeds are readable only by you. Unreadable lines are
 reported and passed over. Sender host, handle and title stay with the message and its reply command.
 
-Delivery does not submit user input, invoke a host queue or start a model turn. A session reads `tj feed`
-when useful. When awaiting a result, it can run `tj feed --wait` through its host's background-command tool
-so the result returns through that tool's native completion. Posting to a feed by itself proves storage,
-not rendering or an unsolicited wake. Claude's peer inbox starts a turn when idle, so it is unsuitable for
-this prompt-free transport; see its [native delivery contract](https://code.claude.com/docs/en/cross-session-messaging#message-delivery).
+Feed delivery does not submit user input or start a model turn. A session reads `tj feed` when useful.
+When awaiting a result through the feed, it can run `tj feed --wait` through its host's background-command
+tool so the result returns through that tool's native completion. Native message delivery follows the
+provider's own behavior. See [agent:message](https://github.com/tj-agents/agent/blob/main/.agents/agent/utility/message/SKILL.md)
+for the agent workflow.
 
 ## Configuration
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `TJ_F_ROOT` | `~/projects`, then `~/source/repos` | where `f` searches |
-| `TJ_CACHE_DIR` | OS cache folder + `/tj` | where `cr` keeps its index, `tj done` its marks, `tj update` the published updates, `tj run` its update check and each session its feed |
+| `TJ_CACHE_DIR` | OS cache folder + `/tj` | session search indexes, published plugin updates, wrapper update checks and session feeds |
+| `TJ_STATE_DIR` | OS local application data folder + `/tj` | durable completion records under `completion/` and native message requests and receipts under `messages/` |
 | `TJ_BIN_DIR` | `~/.local/bin` / `%LOCALAPPDATA%\Programs\tj` | where the installer puts `tj` and `tj_hook` |
 | `CLAUDE_CONFIG_DIR` | `~/.claude` | Claude Code's config folder, as Claude Code itself reads it |
 | `CODEX_HOME` | `~/.codex` | Codex's config folder, as Codex itself reads it |
@@ -424,7 +487,8 @@ run changes anything. A successful current `main` commit automatically publishes
 | `src/bin/tj_hook.rs` | the windowless executable entry point |
 | `src/process.rs` and `src/process/` | native command execution and Windows process containment |
 | `packages/tj-cli/src/tj_cli/process/` | the Python API for the native launcher |
-| `src/run/` | `tj run`, `tj done`, `tj update` and `tj closeout` |
+| `src/run/` | internal managed supervision (`tj _session`), lifecycle commands, update handling and `tj closeout` |
+| `src/completion.rs`, `src/completion/` | completion state and durable result receipts |
 | `src/message.rs`, `src/feed.rs` | `tj message`, `tj feed` and durable notification identity |
 | `src/process/agent.rs` and `src/process/agent/` | the agent's job or process group, per-host stop, tree kill |
 | `src/f.rs` | folder walk, match scoring, picker |

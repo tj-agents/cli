@@ -4,7 +4,10 @@ use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 
 use crate::feed::{self, Feed};
-use crate::{host::Host, run::store};
+use crate::{host::Host, paths, run::store};
+
+mod binding;
+pub(crate) mod bridge;
 
 #[derive(clap::Args)]
 pub(crate) struct Args {
@@ -12,6 +15,9 @@ pub(crate) struct Args {
     target: String,
     /// The message
     text: String,
+    /// Reuse this identity only to inspect/retry the exact same message safely.
+    #[arg(long)]
+    request_id: Option<String>,
 }
 
 struct Session {
@@ -60,6 +66,9 @@ fn resolve(target: &str) -> Result<Session> {
     let live: Vec<Session> =
         rows.iter().filter(|row| row["state"].as_str() != Some("ended")).filter_map(Session::from_row).collect();
     match <[Session; 1]>::try_from(live) {
+        Ok([session]) if is_handle(target) && session.handle() != target => {
+            bail!("agent-store resolved {target:?} to a different session: {}", session.handle());
+        }
         Ok([session]) => Ok(session),
         Err(live) if live.is_empty() => bail!("no live session is addressed by {target:?}"),
         Err(live) => {
@@ -69,19 +78,57 @@ fn resolve(target: &str) -> Result<Session> {
     }
 }
 
-/// Delivery records a message without submitting user input to either host.
-pub(crate) fn run(args: &Args) -> Result<ExitCode> {
-    let target = resolve(&args.target)?;
-    let from = Host::current().and_then(Host::handle);
-    let name = env("AGENT_CLI_TAB_TITLE").or_else(|| from.clone());
+pub(crate) fn send(
+    target: &str,
+    from: Option<&str>,
+    name: Option<&str>,
+    text: &str,
+    event: &Value,
+    kind: &str,
+) -> Result<Value> {
+    let target = resolve(target)?;
     if Host::from_name(&target.host).is_none() {
         bail!("{} runs on {}, which tj message cannot reach", target.name(), target.host);
     }
+    crate::completion::Identity::new("message", target.handle())?;
+    let native = target.host == "claude" && from.is_some_and(|source| source.starts_with("claude:"));
+    let transport = if native { "native" } else { "feed" };
+    binding::bind(
+        &paths::state_dir()?.join("messages"),
+        &json!({
+            "schema":1, "source":from, "event":event, "target":target.handle(),
+            "transport":transport, "text":text, "kind":kind,
+        }),
+    )?;
+    if native {
+        return bridge::send(from.context("native message needs a source session")?, &target.handle(), text, event);
+    }
     let at = chrono::Local::now().format("%Y-%m-%d %H:%M").to_string();
     Feed::new(&feed::folder()?, &target.handle())?
-        .post(&json!({"at": at, "from": from, "name": name, "text": &args.text}))?;
-    println!("posted to {}'s feed; it reads it when it runs tj feed", target.name());
-    Ok(ExitCode::SUCCESS)
+        .post_once(event, &json!({"at":at, "from":from, "name":name, "text":text, "kind":kind}))?;
+    Ok(json!({"transport":"feed", "state":"stored", "target":target.handle(), "name":target.name(), "event":event}))
+}
+
+/// All callers use the same route. Native refusal or uncertainty never falls back to a feed.
+pub(crate) fn run(args: &Args) -> Result<ExitCode> {
+    let from = Host::current().and_then(Host::handle);
+    let name = env("AGENT_CLI_TAB_TITLE").or_else(|| from.clone());
+    let id = args.request_id.clone().map(Ok).unwrap_or_else(crate::run::generated_id)?;
+    let event = json!({"kind":"message", "source":from, "id":id});
+    let receipt = send(&args.target, from.as_deref(), name.as_deref(), &args.text, &event, "message")?;
+    if receipt["transport"] == "feed" {
+        println!(
+            "posted to {}'s feed; it reads it when it runs tj feed",
+            receipt["name"].as_str().unwrap_or("recipient")
+        );
+    } else {
+        println!("{receipt}");
+    }
+    Ok(if matches!(receipt["state"].as_str(), Some("stored" | "submitted")) {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(1)
+    })
 }
 
 #[cfg(test)]
