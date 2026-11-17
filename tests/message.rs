@@ -1,5 +1,7 @@
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Child, Command, Output, Stdio};
+use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
@@ -7,7 +9,7 @@ use serde_json::{Value, json};
 const CODEX_CHILD: &str = "019a0000-0000-7000-8000-00000000c0de";
 const CLAUDE_PEER: &str = "4d86b5f2-0000-4000-8000-00000000c1a0";
 
-const HOST_VARIABLES: [&str; 8] = [
+const HOST_VARIABLES: [&str; 9] = [
     "CLAUDECODE",
     "CLAUDE_CODE_SESSION_ID",
     "CLAUDE_CODE_MESSAGING_SOCKET",
@@ -16,6 +18,7 @@ const HOST_VARIABLES: [&str; 8] = [
     "CODEX_THREAD_ID",
     "AGENT_CLI_TAB_TITLE",
     "TJ_CACHE_DIR",
+    "TJ_STATE_DIR",
 ];
 
 struct Sandbox {
@@ -74,7 +77,11 @@ impl Sandbox {
         for name in HOST_VARIABLES {
             command.env_remove(name);
         }
-        command.env("PATH", path).env("TJ_CACHE_DIR", self.root.join("cache")).envs(caller.iter().copied());
+        command
+            .env("PATH", path)
+            .env("TJ_CACHE_DIR", self.root.join("cache"))
+            .env("TJ_STATE_DIR", self.root.join("state"))
+            .envs(caller.iter().copied());
         command
     }
 
@@ -109,22 +116,184 @@ const FROM_CODEX: [(&str, &str); 2] = [("CODEX_THREAD_ID", "019a-parent"), ("AGE
 const AS_CLAUDE_PEER: [(&str, &str); 2] = [("CLAUDECODE", "1"), ("CLAUDE_CODE_SESSION_ID", CLAUDE_PEER)];
 const AS_CODEX_CHILD: [(&str, &str); 1] = [("CODEX_THREAD_ID", CODEX_CHILD)];
 
+struct NativeAdapter {
+    child: Child,
+    requests: Receiver<Value>,
+}
+
+impl NativeAdapter {
+    fn start(sandbox: &Sandbox) -> Self {
+        let mut child = sandbox
+            .command(&["_message-host", "--session", "claude:c1a0de00"], &FROM_CLAUDE)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let (sender, requests) = mpsc::channel();
+        std::thread::spawn(move || {
+            for line in BufReader::new(stdout).lines() {
+                let Ok(line) = line else { break };
+                let value = serde_json::from_str(&line).unwrap();
+                if sender.send(value).is_err() {
+                    break;
+                }
+            }
+        });
+        let adapter = Self { child, requests };
+        let lease = sandbox.root.join("state/messages/claude-c1a0de00/host.lock");
+        let deadline = Instant::now() + Duration::from_secs(8);
+        loop {
+            if let Ok(file) = std::fs::OpenOptions::new().read(true).write(true).open(&lease)
+                && matches!(fs4::FileExt::try_lock(&file), Err(fs4::TryLockError::WouldBlock))
+            {
+                return adapter;
+            }
+            assert!(Instant::now() < deadline, "native adapter failed to acquire its lease");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    fn request(&self) -> Value {
+        self.requests.recv_timeout(Duration::from_secs(8)).expect("native send was not routed to the adapter")
+    }
+}
+
+impl Drop for NativeAdapter {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+fn native_receipt(sandbox: &Sandbox, request: &Value, result: &Value) {
+    let output = sandbox.tj(
+        &[
+            "_message-receipt",
+            "--session",
+            "claude:c1a0de00",
+            "--request",
+            request["id"].as_str().unwrap(),
+            "--result",
+            &result.to_string(),
+        ],
+        &FROM_CLAUDE,
+    );
+    assert!(output.status.success(), "{}", stderr(&output));
+}
+
 #[test]
-fn either_host_posts_to_either_hosts_feed_preserving_the_sender() {
+fn claude_routes_through_its_native_adapter_and_retries_keep_the_original_receipt() {
+    let sandbox = sandbox(&[session("claude", CLAUDE_PEER, "Peer", "active")]);
+    let adapter = NativeAdapter::start(&sandbox);
+    let arguments = ["message", "Peer", "result\nsecond line", "--request-id", "stable"];
+    let sending =
+        sandbox.command(&arguments, &FROM_CLAUDE).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+    let request = adapter.request();
+    assert_eq!(request["session"], "claude:c1a0de00");
+    assert_eq!(request["target"], format!("claude:{CLAUDE_PEER}"));
+    assert_eq!(request["text"], "result\nsecond line");
+    let native = json!({"isDelivered":true});
+    native_receipt(&sandbox, &request, &native);
+    let output = sending.wait_with_output().unwrap();
+    assert!(output.status.success(), "{}", stderr(&output));
+    let receipt: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(receipt["transport"], "native");
+    assert_eq!(receipt["state"], "submitted");
+    assert_eq!(receipt["native"], native);
+    let retry = sandbox.tj(&arguments, &FROM_CLAUDE);
+    assert!(retry.status.success(), "{}", stderr(&retry));
+    assert_eq!(serde_json::from_slice::<Value>(&retry.stdout).unwrap(), receipt);
+    let changed = sandbox.tj(&["message", "Peer", "changed", "--request-id", "stable"], &FROM_CLAUDE);
+    assert_eq!(changed.status.code(), Some(2));
+    assert!(stderr(&changed).contains("changes the original recipient or content"));
+    assert!(adapter.requests.try_recv().is_err());
+    assert!(!sandbox.root.join("cache/feed").exists());
+}
+
+#[test]
+fn native_refusal_and_unknown_results_are_preserved_without_feed_fallback() {
+    for native in [
+        json!({"isDelivered":false,"reason":"Permission was denied"}),
+        json!({"error":"Native connection ended before a result"}),
+    ] {
+        let sandbox = sandbox(&[session("claude", CLAUDE_PEER, "Peer", "active")]);
+        let adapter = NativeAdapter::start(&sandbox);
+        let sending = sandbox
+            .command(&["message", "Peer", "hello"], &FROM_CLAUDE)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        native_receipt(&sandbox, &adapter.request(), &native);
+        let output = sending.wait_with_output().unwrap();
+        assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+        let receipt: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(receipt["native"], native);
+        assert_eq!(receipt["state"], if native["isDelivered"] == false { "not-delivered" } else { "unknown" });
+        assert!(!sandbox.root.join("cache/feed").exists());
+    }
+}
+
+#[test]
+fn missing_or_crashed_native_adapters_do_not_resend_or_switch_transport() {
+    let sandbox = sandbox(&[session("claude", CLAUDE_PEER, "Peer", "active")]);
+    let arguments = ["message", "Peer", "hello", "--request-id", "stable"];
+    let missing = sandbox.tj(&arguments, &FROM_CLAUDE);
+    assert_eq!(missing.status.code(), Some(2));
+    assert!(stderr(&missing).contains("native message adapter is unavailable"));
+    let adapter = NativeAdapter::start(&sandbox);
+    let sending =
+        sandbox.command(&arguments, &FROM_CLAUDE).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+    adapter.request();
+    drop(adapter);
+    let output = sending.wait_with_output().unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert!(stderr(&output).contains("delivery is unknown"));
+    let retry = sandbox.tj(&arguments, &FROM_CLAUDE);
+    assert_eq!(retry.status.code(), Some(2));
+    assert!(stderr(&retry).contains("delivery is unknown"));
+    let restarted = NativeAdapter::start(&sandbox);
+    assert!(restarted.requests.recv_timeout(Duration::from_millis(300)).is_err());
+    assert!(!sandbox.root.join("cache/feed").exists());
+}
+
+#[test]
+fn feed_retries_preserve_one_copy_and_refuse_changed_content() {
+    let sandbox = sandbox(&[session("codex", CODEX_CHILD, "Peer", "active")]);
+    let arguments = ["message", "Peer", "hello", "--request-id", "stable"];
+    assert!(sandbox.tj(&arguments, &FROM_CODEX).status.success());
+    assert!(sandbox.tj(&arguments, &FROM_CODEX).status.success());
+    let changed = sandbox.tj(&["message", "Peer", "changed", "--request-id", "stable"], &FROM_CODEX);
+    assert_eq!(changed.status.code(), Some(2));
+    assert!(stderr(&changed).contains("changes the original sender or content"));
+    assert_eq!(sandbox.posted(&format!("codex-{CODEX_CHILD}.jsonl")).len(), 1);
+}
+
+#[test]
+fn routes_without_a_native_sender_use_the_feed_preserving_the_sender() {
     for (host, id, recipient) in
         [("claude", CLAUDE_PEER, &AS_CLAUDE_PEER[..]), ("codex", CODEX_CHILD, &AS_CODEX_CHILD[..])]
     {
         let sandbox = sandbox(&[session(host, id, "Peer", "active")]);
+        let mut expected = Vec::new();
         for caller in [&FROM_CLAUDE[..], &FROM_CODEX[..]] {
+            if host == "claude" && caller == FROM_CLAUDE {
+                continue;
+            }
             let output = sandbox.tj(&["message", "Peer", "PR 56 is ready"], caller);
             assert!(output.status.success(), "{}", stderr(&output));
             assert!(stdout(&output).contains("posted to Peer's feed; it reads it when it runs tj feed"));
+            expected.push(if caller == FROM_CLAUDE {
+                ("claude:c1a0de00", "cli 82")
+            } else {
+                ("codex:019a-parent", "agent 92")
+            });
         }
         let posted = sandbox.posted(&format!("{host}-{id}.jsonl"));
-        assert_eq!(posted.len(), 2);
-        for (message, from, name) in
-            [(&posted[0], "claude:c1a0de00", "cli 82"), (&posted[1], "codex:019a-parent", "agent 92")]
-        {
+        assert_eq!(posted.len(), expected.len());
+        for (message, &(from, name)) in posted.iter().zip(&expected) {
             assert_eq!(message["from"], from);
             assert_eq!(message["name"], name);
             assert_eq!(message["text"], "PR 56 is ready");
@@ -132,8 +301,9 @@ fn either_host_posts_to_either_hosts_feed_preserving_the_sender() {
         let read = sandbox.tj(&["feed"], recipient);
         assert!(read.status.success(), "{}", stderr(&read));
         let shown = stdout(&read);
-        assert!(shown.contains("cli 82 (claude:c1a0de00): PR 56 is ready"), "{shown}");
-        assert!(shown.contains("agent 92 (codex:019a-parent): PR 56 is ready"), "{shown}");
+        for (from, name) in expected {
+            assert!(shown.contains(&format!("{name} ({from}): PR 56 is ready")), "{shown}");
+        }
         assert!(!sandbox.root.join("cache").join("bridge").exists());
     }
 }
@@ -144,6 +314,15 @@ fn a_handle_is_looked_up_with_show() {
     let output = sandbox.tj(&["message", &format!("codex:{CODEX_CHILD}"), "done"], &FROM_CODEX);
     assert!(output.status.success(), "{}", stderr(&output));
     assert!(std::fs::read_to_string(sandbox.stubs.join("agent-store.log")).unwrap().contains("show codex:"));
+}
+
+#[test]
+fn a_handle_cannot_be_redirected_by_an_inconsistent_store_reply() {
+    let sandbox = sandbox(&[session("codex", CODEX_CHILD, "Phase 3b", "active")]);
+    let output = sandbox.tj(&["message", "codex:someone-else", "private result"], &FROM_CODEX);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(stderr(&output).contains("to a different session"));
+    assert!(!sandbox.root.join("cache/feed").exists());
 }
 
 #[test]
@@ -192,7 +371,7 @@ fn feed_wait_returns_when_a_message_arrives() {
         [("claude", CLAUDE_PEER, &AS_CLAUDE_PEER[..]), ("codex", CODEX_CHILD, &AS_CODEX_CHILD[..])]
     {
         let sandbox = sandbox(&[session(host, id, "Phase 3b", "active")]);
-        let waiting = sandbox
+        let mut waiting = sandbox
             .command(&["feed", "--wait", "--timeout", "60"], recipient)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -200,13 +379,22 @@ fn feed_wait_returns_when_a_message_arrives() {
             .spawn()
             .unwrap();
         std::thread::sleep(Duration::from_millis(500));
-        let sent = sandbox.tj(&["message", "Phase 3b", "finished: PR 12"], &FROM_CLAUDE);
-        assert!(sent.status.success(), "{}", stderr(&sent));
+        let (sender, expected) = if host == "claude" {
+            (&FROM_CODEX[..], "agent 92 (codex:019a-parent)")
+        } else {
+            (&FROM_CLAUDE[..], "cli 82 (claude:c1a0de00)")
+        };
+        let sent = sandbox.tj(&["message", "Phase 3b", "finished: PR 12"], sender);
+        if !sent.status.success() {
+            let _ = waiting.kill();
+            let _ = waiting.wait();
+            panic!("{}", stderr(&sent));
+        }
         let started = Instant::now();
         let output = waiting.wait_with_output().unwrap();
         assert!(started.elapsed() < Duration::from_secs(30));
         assert!(output.status.success(), "{}", stderr(&output));
-        assert!(stdout(&output).contains("cli 82 (claude:c1a0de00): finished: PR 12"));
+        assert!(stdout(&output).contains(&format!("{expected}: finished: PR 12")));
     }
 }
 
@@ -303,7 +491,7 @@ fn concurrent_senders_preserve_every_message_after_a_torn_line() {
             .iter()
             .enumerate()
             .map(|(number, text)| {
-                let sender = if number % 2 == 0 { &FROM_CLAUDE[..] } else { &FROM_CODEX[..] };
+                let sender = if host != "claude" && number % 2 == 0 { &FROM_CLAUDE[..] } else { &FROM_CODEX[..] };
                 sandbox
                     .command(&["message", "Peer", text], sender)
                     .stdin(Stdio::null())
@@ -324,7 +512,10 @@ fn concurrent_senders_preserve_every_message_after_a_torn_line() {
         for (number, text) in messages.iter().enumerate() {
             let matches: Vec<_> = posted.iter().filter(|message| message["text"] == text.as_str()).collect();
             assert_eq!(matches.len(), 1, "message {number} was lost or duplicated");
-            assert_eq!(matches[0]["from"], if number % 2 == 0 { "claude:c1a0de00" } else { "codex:019a-parent" });
+            assert_eq!(
+                matches[0]["from"],
+                if host != "claude" && number % 2 == 0 { "claude:c1a0de00" } else { "codex:019a-parent" }
+            );
         }
         let output = sandbox.tj(&["feed"], recipient);
         assert!(output.status.success(), "{}", stderr(&output));

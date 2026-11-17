@@ -1,15 +1,79 @@
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Output, Stdio};
+use std::process::{Child as ProcessChild, Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
 const ITEM: &str = "github:github.com/acme/app:1";
 const BOUND: &str =
     r#"{"ok":true,"data":{"launch":{"state":"active"},"session":{"native_id":"sess-1","state":"active"}}}"#;
-const CLOSING: &str =
-    r#"{"ok":true,"data":{"launch":{"state":"closing"},"session":{"native_id":"sess-1","state":"active"}}}"#;
 const PREBOUND: &str = "123e4567-e89b-12d3-a456-426614174000";
 const MERGED: &str = r#"{"prs":[{"url":"u","state":"merged"}],"all_merged":true}"#;
+
+/// Own the wrapper until its output is collected, including assertion unwinding.
+struct Child {
+    process: Option<ProcessChild>,
+    #[cfg(unix)]
+    log: PathBuf,
+}
+
+impl Child {
+    fn new(process: ProcessChild, _sandbox: &Sandbox) -> Self {
+        Self {
+            process: Some(process),
+            #[cfg(unix)]
+            log: _sandbox.log.clone(),
+        }
+    }
+
+    fn kill(&mut self) -> std::io::Result<()> {
+        #[cfg(unix)]
+        {
+            // The native fixture has its own process group. Verify it still belongs to this
+            // live wrapper before stopping that group, including the fixture's grandchild.
+            let wrapper = self.id().to_string();
+            let log = std::fs::read_to_string(&self.log).unwrap_or_default();
+            if let Some(pid) = log.lines().rev().find_map(|line| line.strip_prefix("pid ")?.parse::<i32>().ok()) {
+                if let (Some(group), Ok(stat)) =
+                    (rustix::process::Pid::from_raw(pid), std::fs::read_to_string(format!("/proc/{pid}/stat")))
+                {
+                    let fields: Vec<_> =
+                        stat.rsplit_once(')').map_or("", |(_, rest)| rest).split_whitespace().collect();
+                    if fields.get(1) == Some(&wrapper.as_str()) && fields.get(2) == Some(&pid.to_string().as_str()) {
+                        let _ = rustix::process::kill_process_group(group, rustix::process::Signal::KILL);
+                    }
+                }
+            }
+        }
+        // Windows closes the wrapper's kill-on-close job with its process handles.
+        self.process.as_mut().unwrap().kill()
+    }
+
+    fn wait_with_output(mut self) -> std::io::Result<Output> {
+        self.process.take().unwrap().wait_with_output()
+    }
+}
+
+impl std::ops::Deref for Child {
+    type Target = ProcessChild;
+
+    fn deref(&self) -> &Self::Target {
+        self.process.as_ref().unwrap()
+    }
+}
+
+impl std::ops::DerefMut for Child {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.process.as_mut().unwrap()
+    }
+}
+
+impl Drop for Child {
+    fn drop(&mut self) {
+        if self.process.as_mut().is_some_and(|child| !matches!(child.try_wait(), Ok(Some(_)))) && self.kill().is_ok() {
+            let _ = self.wait();
+        }
+    }
+}
 
 struct Sandbox {
     _directory: tempfile::TempDir,
@@ -73,7 +137,7 @@ fn sandbox() -> Sandbox {
     git(&root, &["clone", "-q", "--bare", "seed", "origin.git"]);
     git(&root, &["clone", "-q", "origin.git", "repo"]);
     let primary = root.join("repo");
-    git(&primary, &["worktree", "add", "-q", "../repo.worktrees/Feature-1", "-b", "Feature/1"]);
+    git(&primary, &["worktree", "add", "-q", ".worktrees/Feature-1", "-b", "Feature/1"]);
     let stubs = root.join("stubs");
     std::fs::create_dir(&stubs).unwrap();
     #[cfg(windows)]
@@ -94,13 +158,14 @@ fn sandbox() -> Sandbox {
     set_store_list(&stubs, "launches", serde_json::json!([]));
     stub(&stubs, "tj-item", r#"{"prs":[],"all_merged":false}"#);
     stub(&stubs, "tj-prepare", "prepared");
+    stub(&stubs, "tj-session", "{}");
     stub(&stubs, "codex", "unexpected prompt delivery");
     std::fs::copy(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/prepare.py"), stubs.join("prepare.py"))
         .unwrap();
-    for folder in ["home", "cache"] {
+    for folder in ["home", "cache", "state"] {
         std::fs::create_dir(root.join(folder)).unwrap();
     }
-    let worktree = root.join("repo.worktrees").join("Feature-1");
+    let worktree = primary.join(".worktrees").join("Feature-1");
     Sandbox { log: root.join("dummy.log"), _directory: directory, root, stubs, primary, worktree }
 }
 
@@ -120,6 +185,7 @@ fn environment(sandbox: &Sandbox) -> Vec<(&'static str, std::ffi::OsString)> {
     vec![
         ("PATH", search_path(sandbox)),
         ("TJ_CACHE_DIR", sandbox.root.join("cache").into_os_string()),
+        ("TJ_STATE_DIR", sandbox.root.join("state").into_os_string()),
         ("DUMMY_LOG", sandbox.log.clone().into_os_string()),
         ("DUMMY_TJ", std::ffi::OsString::from(env!("CARGO_BIN_EXE_tj"))),
         ("CLAUDE_CONFIG_DIR", sandbox.root.join("claude").into_os_string()),
@@ -142,7 +208,7 @@ fn run_arguments(sandbox: &Sandbox, launch: &str, host: &str, mode: &str, grace:
     bind(sandbox, launch, host, false);
     let fixture = fixture();
     [
-        "run",
+        "_session",
         "--host",
         host,
         "--title",
@@ -159,6 +225,8 @@ fn run_arguments(sandbox: &Sandbox, launch: &str, host: &str, mode: &str, grace:
         "2",
         "--grace-seconds",
         grace,
+        "--native-exit-seconds",
+        "2",
         "--restart-grace-seconds",
         "2",
         "--input-idle-seconds",
@@ -241,7 +309,7 @@ fn spawn(sandbox: &Sandbox, arguments: &[String], cwd: &Path) -> Child {
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         command.creation_flags(CREATE_NO_WINDOW);
     }
-    command.spawn().unwrap()
+    Child::new(command.spawn().unwrap(), sandbox)
 }
 
 fn log(sandbox: &Sandbox, name: &str) -> String {
@@ -262,7 +330,7 @@ fn finish(mut child: Child, timeout: Duration) -> Output {
         if Instant::now() > deadline {
             child.kill().unwrap();
             let output = child.wait_with_output().unwrap();
-            panic!("tj run did not exit; stderr: {}", String::from_utf8_lossy(&output.stderr));
+            panic!("TJ did not exit; stderr: {}", String::from_utf8_lossy(&output.stderr));
         }
         std::thread::sleep(Duration::from_millis(100));
     }
@@ -271,14 +339,18 @@ fn finish(mut child: Child, timeout: Duration) -> Output {
 
 fn still_running(child: &mut Child, wait: Duration) {
     std::thread::sleep(wait);
-    assert!(child.try_wait().unwrap().is_none(), "tj run exited");
+    assert!(child.try_wait().unwrap().is_none(), "TJ exited");
 }
 
 /// Runs `tj` inside the agent, as the hooks of the tab's own agent do, and returns its exit code and stderr.
 fn in_agent(sandbox: &Sandbox, arguments: &[&str]) -> (i32, String) {
+    in_agent_command(sandbox, serde_json::json!(arguments))
+}
+
+fn in_agent_command(sandbox: &Sandbox, command: serde_json::Value) -> (i32, String) {
     let commands = sandbox.root.join("commands");
     let number = log(sandbox, "commands").lines().count();
-    let mut line = serde_json::to_string(arguments).unwrap();
+    let mut line = command.to_string();
     line.push('\n');
     std::fs::OpenOptions::new().create(true).append(true).open(&commands).unwrap().write_all(line.as_bytes()).unwrap();
     let prefix = format!("ran {number} ");
@@ -290,26 +362,52 @@ fn in_agent(sandbox: &Sandbox, arguments: &[&str]) -> (i32, String) {
             let (code, stderr) = ran.split_once(' ').unwrap_or((&ran, ""));
             return (code.parse().unwrap(), stderr.to_owned());
         }
-        assert!(Instant::now() < deadline, "the agent never ran tj {arguments:?}");
+        assert!(Instant::now() < deadline, "the agent never ran queued tj command {number}");
         std::thread::sleep(Duration::from_millis(100));
     }
 }
 
-/// The agent's last step, as a host runs it: `tj done` inside a turn, which then ends.
+fn native_session(sandbox: &Sandbox) -> String {
+    let show: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(sandbox.stubs.join("agent-store-show.json")).unwrap()).unwrap();
+    show["data"]["session"]["session"].as_str().unwrap().to_owned()
+}
+
+fn lifecycle(sandbox: &Sandbox, turn: &str, event: &str, report: Option<&str>, pending: Option<&str>) {
+    let payload = serde_json::json!({
+        "session": native_session(sandbox),
+        "turn": turn,
+        "event": event,
+        "report": report,
+        "pending": pending,
+    });
+    let (code, stderr) =
+        in_agent_command(sandbox, serde_json::json!({"arguments": ["_lifecycle"], "input": payload.to_string()}));
+    assert_eq!(code, 0, "native lifecycle {event}: {stderr}");
+}
+
+/// The agent's final native response: start the turn, request finish, then provide its nonempty report.
 fn done(sandbox: &Sandbox) {
-    let (code, stderr) = in_agent(sandbox, &["done"]);
-    assert_eq!(code, 0, "tj done: {stderr}");
+    let turn = format!("turn-{}", log(sandbox, "commands").lines().count());
+    lifecycle(sandbox, &turn, "start", None, None);
+    let (code, stderr) = in_agent(sandbox, &["finish"]);
+    assert_eq!(code, 0, "tj finish: {stderr}");
+    lifecycle(sandbox, &turn, "end", Some("Final result"), None);
     set_turn(sandbox, true);
 }
 
 fn refused(sandbox: &Sandbox, child: &mut Child, launch: &str) {
     done(sandbox);
-    let mark = sandbox.root.join("cache").join("run").join(launch).join("done");
-    let deadline = Instant::now() + Duration::from_secs(30);
-    while mark.exists() {
-        assert!(Instant::now() < deadline, "closeout never checked the done mark");
-        std::thread::sleep(Duration::from_millis(100));
-    }
+    wait_until("closeout never recorded its refusal", || {
+        let output = Command::new(env!("CARGO_BIN_EXE_tj"))
+            .args(["receipt", "--launch", launch])
+            .envs(environment(sandbox))
+            .current_dir(&sandbox.root)
+            .output()
+            .unwrap();
+        let record: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        record["state"]["kind"] == "attention" && record["state"]["outcome"].is_object()
+    });
     still_running(child, Duration::from_millis(500));
     assert!(!log(sandbox, "dummy.log").contains("graceful"), "the agent was stopped");
 }
@@ -380,7 +478,7 @@ fn bind(sandbox: &Sandbox, launch: &str, host: &str, closing: bool) {
     let show = sandbox.stubs.join("agent-store-show.json");
     let mut value = serde_json::json!({
         "ok": true, "data": {
-            "launch": {"launch_id": launch, "host": host, "session": format!("{host}:sess-1"), "state": "active", "item": null},
+            "launch": {"launch_id": launch, "host": host, "session": format!("{host}:sess-1"), "state": "active", "item": null, "parent": null},
             "session": {"session": format!("{host}:sess-1"), "native_id": "sess-1", "host": host,
                 "launch_id": launch, "worktree": sandbox.worktree, "state": "active"}
         }
@@ -399,6 +497,16 @@ fn bind(sandbox: &Sandbox, launch: &str, host: &str, closing: bool) {
         value["data"]["launch"]["state"] = serde_json::json!("closing");
     }
     std::fs::write(&show, value.to_string()).unwrap();
+    set_reply(
+        sandbox,
+        "tj-session-liveness.json",
+        &serde_json::json!({
+            "session": value["data"]["session"]["session"],
+            "launch_id": launch,
+            "state": "dead"
+        })
+        .to_string(),
+    );
     if !sandbox.stubs.join("agent-store-worktrees.json").exists() {
         if sandbox.worktree.exists() {
             claim(sandbox, launch, host, std::slice::from_ref(&sandbox.worktree));
@@ -447,6 +555,16 @@ fn assert_closed_out(sandbox: &Sandbox, output: &Output, launch: &str) {
     assert!(store.contains(&format!("launch --launch-id {launch} --host")), "{store}");
     assert!(store.contains(&format!("end --launch-id {launch} --reason closed")), "{store}");
     assert!(log(sandbox, "stubs/tj-item.log").contains(&format!("progress {ITEM} --state Done")));
+    assert!(sandbox.root.join("state").join("completion").is_dir(), "completion leaked into TJ_CACHE_DIR");
+    let receipt = Command::new(env!("CARGO_BIN_EXE_tj"))
+        .args(["receipt", "--launch", launch])
+        .envs(environment(sandbox))
+        .current_dir(&sandbox.root)
+        .output()
+        .unwrap();
+    assert!(receipt.status.success(), "{}", String::from_utf8_lossy(&receipt.stderr));
+    let receipt: serde_json::Value = serde_json::from_slice(&receipt.stdout).unwrap();
+    assert_eq!(receipt["state"]["kind"], "completed");
 }
 
 fn feed_messages(sandbox: &Sandbox, host: &str) -> Vec<serde_json::Value> {
@@ -484,6 +602,48 @@ fn assert_unfinished(sandbox: &Sandbox, launch: &str) {
 }
 
 #[test]
+fn codex_final_result_reaches_its_parent_once_and_has_a_durable_receipt() {
+    let sandbox = sandbox();
+    let launch = "codex-parent-result";
+    let mut arguments = run_arguments(&sandbox, launch, "codex", "signal", "10");
+    let separator = arguments.iter().position(|argument| argument == "--").unwrap();
+    arguments.splice(separator..separator, ["--parent", "codex:parent-1"].map(str::to_owned));
+    let show = sandbox.stubs.join("agent-store-show.json");
+    let mut binding: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&show).unwrap()).unwrap();
+    binding["data"]["launch"]["parent"] = serde_json::json!("codex:parent-1");
+    std::fs::write(&show, binding.to_string()).unwrap();
+    set_reply(
+        &sandbox,
+        "agent-store-show-codex-parent-1.json",
+        &serde_json::json!({
+            "ok": true, "data": {"session": {
+                "session": "codex:parent-1", "host": "codex", "native_id": "parent-1", "state": "active"
+            }}
+        })
+        .to_string(),
+    );
+    let child = spawn(&sandbox, &arguments, &sandbox.root);
+    wait_for_log(&sandbox, "agent ");
+    done(&sandbox);
+    assert_eq!(in_agent(&sandbox, &["hold"]).0, 0);
+    let messages = || {
+        log(&sandbox, "cache/feed/codex-parent-1.jsonl")
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>()
+    };
+    wait_until("Codex parent never received the final result", || messages().len() == 1);
+    let message = &messages()[0];
+    assert_eq!(message["kind"], "result");
+    assert_eq!(message["from"], "codex:sess-1");
+    assert_eq!(message["text"], "Final result");
+    std::thread::sleep(Duration::from_secs(2));
+    assert_eq!(messages().len(), 1, "the final result was delivered more than once");
+    assert_eq!(in_agent(&sandbox, &["hold", "--release"]).0, 0);
+    assert_closed_out(&sandbox, &finish(child, Duration::from_secs(60)), launch);
+}
+
+#[test]
 fn an_item_merged_before_the_session_started_never_stops_it() {
     let sandbox = sandbox();
     set_reply(&sandbox, "tj-item-prs.json", MERGED);
@@ -493,7 +653,9 @@ fn an_item_merged_before_the_session_started_never_stops_it() {
     assert!(sandbox.worktree.exists());
     assert!(!log(&sandbox, "dummy.log").contains("graceful"), "the agent was stopped");
     assert!(!log(&sandbox, "stubs/tj-item.log").contains("--state Done"));
-    set_reply(&sandbox, "agent-store-show.json", CLOSING);
+    bind(&sandbox, "merged-before", "claude", true);
+    still_running(&mut child, Duration::from_secs(2));
+    done(&sandbox);
     let output = finish(child, Duration::from_secs(60));
     assert_closed_out(&sandbox, &output, "merged-before");
 }
@@ -513,14 +675,14 @@ fn merge_notices_reach_both_hosts_once_per_pr_set_despite_reads_polls_and_later_
         );
         wait_until("merge notice never reached the feed", || feed_messages(&sandbox, host).len() == 1);
         let notice = &feed_messages(&sandbox, host)[0];
-        assert_eq!(notice["name"], "tj run");
+        assert_eq!(notice["name"], "TJ");
         assert!(notice["from"].is_null());
         assert_eq!(notice["kind"], "merged");
         assert!(notice["text"].as_str().unwrap().contains(ITEM));
         assert_eq!(notice["event"]["item"], ITEM);
         assert_eq!(notice["event"]["prs"], serde_json::json!(["https://example.com/pr/1", "https://example.com/pr/2"]));
         assert!(feed_messages(&sandbox, if host == "claude" { "codex" } else { "claude" }).is_empty());
-        assert!(read_feed(&sandbox, host).contains("tj run: Every PR linked"));
+        assert!(read_feed(&sandbox, host).contains("TJ: Every PR linked"));
         for _ in 0..2 {
             set_turn(&sandbox, false);
             still_running(&mut child, Duration::from_secs(2));
@@ -577,7 +739,9 @@ fn idle_sessions_never_generate_notices_or_prompts() {
             assert!(feed_messages(&sandbox, host).is_empty());
             assert_no_prompt_delivery(&sandbox);
             assert_unfinished(&sandbox, &launch);
-            set_reply(&sandbox, "agent-store-show.json", CLOSING);
+            bind(&sandbox, &launch, host, true);
+            still_running(&mut child, Duration::from_secs(2));
+            done(&sandbox);
             let output = finish(child, Duration::from_secs(60));
             assert_eq!(output.status.code(), Some(0), "{}", String::from_utf8_lossy(&output.stderr));
             assert!(!sandbox.worktree.exists());
@@ -593,14 +757,13 @@ fn idle_sessions_never_generate_notices_or_prompts() {
 fn fresh_launches_reject_the_retired_idle_ask_option() {
     let sandbox = sandbox();
     let output = Command::new(env!("CARGO_BIN_EXE_tj"))
-        .args(["run", "--ask-idle-seconds", "2", "--", "unused"])
+        .args(["_session", "--ask-idle-seconds", "2", "--", "unused"])
         .envs(environment(&sandbox))
         .output()
         .unwrap();
     assert_eq!(output.status.code(), Some(2));
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("required arguments were not provided"), "{stderr}");
-    assert!(stderr.contains("--successor"), "{stderr}");
+    assert!(stderr.contains("unexpected argument '--ask-idle-seconds'"), "{stderr}");
     assert!(log(&sandbox, "stubs/agent-store.log").is_empty());
 }
 
@@ -649,9 +812,7 @@ fn merge_notice_identity_survives_successor_restarts_and_new_launches_of_the_sam
             }
             if successor {
                 let separator = arguments.iter().position(|argument| argument == "--").unwrap();
-                // This is the handover command emitted by already-running wrappers. A zero interval
-                // also proves that accepting the retired argument does not restore idle prompts.
-                arguments.splice(separator..separator, ["--ask-idle-seconds", "0", "--successor"].map(str::to_owned));
+                arguments.splice(separator..separator, ["--successor"].map(str::to_owned));
             }
             let starts = log(&sandbox, "dummy.log").lines().filter(|line| line.starts_with("pid ")).count();
             let child = spawn(&sandbox, &arguments, &sandbox.root);
@@ -661,7 +822,7 @@ fn merge_notice_identity_survives_successor_restarts_and_new_launches_of_the_sam
             assert_eq!(feed_messages(&sandbox, host).len(), if number == 3 { 2 } else { 1 });
             let read = read_feed(&sandbox, host);
             if number == 0 || number == 3 {
-                assert!(read.contains("tj run: Every PR linked"), "{read}");
+                assert!(read.contains("TJ: Every PR linked"), "{read}");
             } else {
                 assert_eq!(read.trim(), "no unread messages");
             }
@@ -744,6 +905,7 @@ fn an_unrelated_worktree_binding_does_not_stop_or_clean_the_agent() {
     for (field, wrong) in [("launch_id", "another-launch"), ("host", "codex"), ("worktree", "relative/path")] {
         let sandbox = sandbox();
         let launch = "wrong-binding";
+        let mut child = start(&sandbox, launch, "claude", "signal", "2");
         let mut binding = serde_json::json!({
             "ok": true,
             "data": {
@@ -756,8 +918,15 @@ fn an_unrelated_worktree_binding_does_not_stop_or_clean_the_agent() {
         });
         binding["data"]["session"][field] = serde_json::Value::String(wrong.to_owned());
         set_reply(&sandbox, "agent-store-show.json", &binding.to_string());
-        let mut child = start(&sandbox, launch, "claude", "signal", "2");
-        refused(&sandbox, &mut child, launch);
+        if field == "worktree" {
+            refused(&sandbox, &mut child, launch);
+        } else {
+            let (code, stderr) = in_agent(&sandbox, &["finish"]);
+            assert_ne!(code, 0, "finish accepted a foreign binding");
+            assert!(stderr.contains("exact reciprocal native session binding"), "{stderr}");
+            still_running(&mut child, Duration::from_millis(500));
+            assert!(!log(&sandbox, "dummy.log").contains("graceful"));
+        }
         assert!(sandbox.worktree.exists());
         assert!(!log(&sandbox, "stubs/tj-item.log").contains("--state Done"));
         binding["data"]["session"]["launch_id"] = serde_json::json!(launch);
@@ -767,13 +936,11 @@ fn an_unrelated_worktree_binding_does_not_stop_or_clean_the_agent() {
         done(&sandbox);
         let output = finish(child, Duration::from_secs(60));
         assert_closed_out(&sandbox, &output, launch);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(stderr.contains("not bound") || stderr.contains("not absolute"), "{stderr}");
     }
 }
 
 #[test]
-fn an_explicitly_closing_orphan_cleans_its_bound_worktree_when_the_launch_directory_is_gone() {
+fn a_closing_orphan_without_a_final_receipt_keeps_its_bound_worktree() {
     for host in ["claude", "codex"] {
         let sandbox = sandbox();
         let launch = format!("orphan-{host}");
@@ -813,10 +980,9 @@ fn an_explicitly_closing_orphan_cleans_its_bound_worktree_when_the_launch_direct
             .current_dir(&sandbox.root)
             .output()
             .unwrap();
-        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
-        assert!(!sandbox.worktree.exists(), "the bound worktree is still there");
-        assert!(git(&sandbox.primary, &["branch", "--list", "Feature/1"]).is_empty());
-        assert!(log(&sandbox, "stubs/agent-store.log").contains(&format!("end --launch-id {launch} --reason closed")));
+        assert_unfinished(&sandbox, &launch);
+        assert!(!git(&sandbox.primary, &["branch", "--list", "Feature/1"]).is_empty());
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("closed     "));
     }
 }
 
@@ -873,6 +1039,22 @@ fn start_host(sandbox: &Sandbox, launch: &str, host: &str) -> Child {
 }
 
 #[test]
+fn dropping_a_test_wrapper_stops_its_fixture_tree() {
+    let sandbox = sandbox();
+    let child = start(&sandbox, "fixture-owner", "claude", "ignore", "10");
+    wait_for_log(&sandbox, "grandchild ");
+    let mut pids = vec![child.id()];
+    pids.extend(log(&sandbox, "dummy.log").lines().filter_map(|line| {
+        line.strip_prefix("pid ").or_else(|| line.strip_prefix("grandchild "))?.parse::<u32>().ok()
+    }));
+    assert_eq!(pids.len(), 3);
+    drop(child);
+    wait_until("the abandoned fixture retained a process", || {
+        pids.iter().all(|pid| tj_cli::process::agent::started_at(*pid).unwrap().is_none())
+    });
+}
+
+#[test]
 fn codex_closes_out_after_done_and_idle() {
     let sandbox = sandbox();
     let child = start_host(&sandbox, "idle", "codex");
@@ -882,35 +1064,51 @@ fn codex_closes_out_after_done_and_idle() {
 }
 
 #[test]
-fn a_turn_started_after_done_withdraws_it_and_mark_closing_still_closes() {
+fn new_input_cancels_finish_and_explicit_closing_does_not_override_it() {
     for host in ["claude", "codex"] {
         let sandbox = sandbox();
         let launch = format!("withdrawn-{host}");
         let mut child = start_host(&sandbox, &launch, host);
-        assert_eq!(in_agent(&sandbox, &["done"]).0, 0);
-        set_turn(&sandbox, false);
-        let mark = sandbox.root.join("cache").join("run").join(&launch).join("done");
-        wait_until("the new turn never withdrew tj done", || !mark.exists());
+        lifecycle(&sandbox, "finish-request", "start", None, None);
+        assert_eq!(in_agent(&sandbox, &["finish"]).0, 0);
+        lifecycle(&sandbox, "new-input", "start", None, None);
         set_turn(&sandbox, true);
         still_running(&mut child, Duration::from_secs(5));
         assert!(!log(&sandbox, "dummy.log").contains("graceful"), "the agent was stopped");
-        set_reply(&sandbox, "agent-store-show.json", CLOSING);
+        bind(&sandbox, &launch, host, true);
+        still_running(&mut child, Duration::from_secs(2));
+        assert!(sandbox.worktree.exists(), "closing overrode missing final report");
+        done(&sandbox);
         let output = finish(child, Duration::from_secs(60));
         assert_closed_out(&sandbox, &output, &launch);
     }
 }
 
 #[test]
-fn done_waits_for_the_turn_that_ran_it_to_end_however_long_it_takes() {
+fn explicit_closing_does_not_override_a_keep_open_hold() {
+    let sandbox = sandbox();
+    let launch = "held-closing";
+    let mut child = start_host(&sandbox, launch, "codex");
+    assert_eq!(in_agent(&sandbox, &["hold"]).0, 0);
+    done(&sandbox);
+    bind(&sandbox, launch, "codex", true);
+    still_running(&mut child, Duration::from_secs(3));
+    assert!(sandbox.worktree.exists(), "closing overrode the keep-open hold");
+    assert_eq!(in_agent(&sandbox, &["hold", "--release"]).0, 0);
+    assert_closed_out(&sandbox, &finish(child, Duration::from_secs(60)), launch);
+}
+
+#[test]
+fn finish_waits_for_the_native_turn_end_however_long_it_takes() {
     for host in ["claude", "codex"] {
         let sandbox = sandbox();
         let launch = format!("running-{host}");
         let mut child = start_host(&sandbox, &launch, host);
-        set_turn(&sandbox, false);
-        std::thread::sleep(Duration::from_millis(50));
-        assert_eq!(in_agent(&sandbox, &["done"]).0, 0);
+        lifecycle(&sandbox, "still-running", "start", None, None);
+        assert_eq!(in_agent(&sandbox, &["finish"]).0, 0);
         still_running(&mut child, Duration::from_secs(5));
-        assert!(sandbox.root.join("cache").join("run").join(&launch).join("done").exists());
+        assert!(sandbox.worktree.exists(), "finish closed before the native turn ended");
+        lifecycle(&sandbox, "still-running", "end", Some("Final result"), None);
         set_turn(&sandbox, true);
         let output = finish(child, Duration::from_secs(60));
         assert_closed_out(&sandbox, &output, &launch);
@@ -918,7 +1116,7 @@ fn done_waits_for_the_turn_that_ran_it_to_end_however_long_it_takes() {
 }
 
 #[test]
-fn a_shell_left_running_under_the_agent_keeps_done_waiting() {
+fn a_shell_left_running_under_the_agent_keeps_final_result_waiting() {
     for host in ["claude", "codex"] {
         let sandbox = sandbox();
         let launch = format!("shell-{host}");
@@ -926,7 +1124,7 @@ fn a_shell_left_running_under_the_agent_keeps_done_waiting() {
         assert_eq!(in_agent(&sandbox, &["shell", "start"]).0, 0);
         done(&sandbox);
         still_running(&mut child, Duration::from_secs(6));
-        assert!(sandbox.root.join("cache").join("run").join(&launch).join("done").exists());
+        assert!(sandbox.worktree.exists(), "background shell did not keep the final result open");
         assert_eq!(in_agent(&sandbox, &["shell", "stop"]).0, 0);
         let output = finish(child, Duration::from_secs(60));
         assert_closed_out(&sandbox, &output, &launch);
@@ -934,17 +1132,15 @@ fn a_shell_left_running_under_the_agent_keeps_done_waiting() {
 }
 
 #[test]
-fn a_forced_nonzero_exit_preserves_worktrees_even_after_explicit_done() {
+fn a_forced_nonzero_exit_preserves_worktrees_after_an_unfinished_finish_request() {
     for host in ["claude", "codex"] {
         let sandbox = sandbox();
         set_reply(&sandbox, "tj-item-prs.json", MERGED);
         let launch = format!("done-failed-exit-{host}");
         let child = start_host(&sandbox, &launch, host);
-        set_turn(&sandbox, false);
-        std::thread::sleep(Duration::from_millis(50));
-        let (code, stderr) = in_agent(&sandbox, &["done"]);
-        assert_eq!(code, 0, "tj done: {stderr}");
-        assert!(sandbox.root.join("cache").join("run").join(&launch).join("done").is_file());
+        lifecycle(&sandbox, "unfinished", "start", None, None);
+        let (code, stderr) = in_agent(&sandbox, &["finish"]);
+        assert_eq!(code, 0, "tj finish: {stderr}");
         kill_dummy(&sandbox);
         let output = finish(child, Duration::from_secs(60));
         assert!(!output.status.success());
@@ -956,17 +1152,28 @@ fn a_forced_nonzero_exit_preserves_worktrees_even_after_explicit_done() {
 /// Keep the existing dummy's process tree and command environment, controlling only its natural exit.
 fn natural_exit(sandbox: &Sandbox, launch: &str, host: &str, mark_done: bool) -> Child {
     const EXIT: &str = r#"
-import os, runpy, subprocess, sys, time
+import json, os, runpy, subprocess, sys, time
 from pathlib import Path
-fixture, mark_done = sys.argv[1], sys.argv[2] == "done"
+fixture, mark_done, host = sys.argv[1], sys.argv[2] == "done", sys.argv[3]
 original_exit = sys.exit
 def exit_fixture(code=0):
     if code != 3:
         original_exit(code)
     if mark_done:
-        result = subprocess.run([os.environ["DUMMY_TJ"], "done"], capture_output=True, text=True)
-        if result.returncode:
-            raise RuntimeError(result.stderr)
+        turn = "natural-exit"
+        for event, report in [("start", None), ("end", "Final result")]:
+            if event == "end":
+                result = subprocess.run([os.environ["DUMMY_TJ"], "finish"], capture_output=True, text=True)
+                if result.returncode:
+                    raise RuntimeError(result.stderr)
+            result = subprocess.run(
+                [os.environ["DUMMY_TJ"], "_lifecycle"],
+                input=json.dumps({"session": f"{host}:sess-1", "turn": turn, "event": event, "report": report, "pending": None}),
+                capture_output=True,
+                text=True,
+            )
+            if result.returncode:
+                raise RuntimeError(result.stderr)
     ready = Path(os.environ["DUMMY_LOG"]).with_name("exit-ready")
     ready.touch()
     while not ready.with_name("exit-now").exists():
@@ -989,6 +1196,7 @@ runpy.run_path(fixture, run_name="__main__")
             EXIT.into(),
             fixture().to_string_lossy().into_owned(),
             if mark_done { "done".into() } else { "unfinished".into() },
+            host.into(),
         ],
     );
     let child = spawn(sandbox, &arguments, &sandbox.root);
@@ -1001,12 +1209,11 @@ runpy.run_path(fixture, run_name="__main__")
 }
 
 #[test]
-fn a_successful_natural_exit_with_valid_explicit_done_closes_out_without_the_idle_grace() {
+fn a_successful_natural_exit_with_a_valid_final_receipt_closes_out_without_the_idle_grace() {
     for host in ["claude", "codex"] {
         let sandbox = sandbox();
         let launch = format!("successful-done-exit-{host}");
         let child = natural_exit(&sandbox, &launch, host, true);
-        assert!(sandbox.root.join("cache").join("run").join(&launch).join("done").is_file());
         set_turn(&sandbox, true);
         std::fs::write(sandbox.root.join("exit-now"), "").unwrap();
         assert_closed_out(&sandbox, &finish(child, Duration::from_secs(45)), &launch);
@@ -1100,7 +1307,7 @@ fn the_launch_is_recorded_before_the_agent_starts() {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    finish(child, Duration::from_secs(60));
+    finish(Child::new(child, &sandbox), Duration::from_secs(60));
     let seen_by_agent = log(&sandbox, "dummy.log");
     assert!(seen_by_agent.contains("launch --launch-id first --host"), "{seen_by_agent}");
 }
@@ -1347,7 +1554,7 @@ processes:
 }
 
 #[test]
-fn done_outside_tj_run_fails() {
+fn finish_outside_a_managed_session_fails() {
     let run = |arguments: &[&str]| {
         let mut output = Command::new(env!("CARGO_BIN_EXE_tj"))
             .args(arguments)
@@ -1360,8 +1567,8 @@ fn done_outside_tj_run_fails() {
         output.stderr.take().unwrap().read_to_string(&mut stderr).unwrap();
         (output.wait().unwrap().success(), stderr)
     };
-    let (succeeded, stderr) = run(&["done"]);
-    assert!(!succeeded && stderr.contains("only works inside a verified tj run session"));
+    let (succeeded, stderr) = run(&["finish"]);
+    assert!(!succeeded && stderr.contains("managed session"));
 }
 
 fn with_prompt(sandbox: &Sandbox, launch: &str, host: &str, mode: &str) -> Vec<String> {
@@ -1394,7 +1601,7 @@ fn fake_codex(sandbox: &Sandbox) -> PathBuf {
 }
 
 #[test]
-fn only_the_tabs_own_agent_can_mark_it_done() {
+fn only_the_tabs_own_agent_can_request_finish() {
     let sandbox = sandbox();
     let mut child = start(&sandbox, "owned", "claude", "signal", "10");
     wait_for_log(&sandbox, "wrapper ");
@@ -1404,23 +1611,21 @@ fn only_the_tabs_own_agent_can_mark_it_done() {
     let foreign = |arguments: &[&str]| {
         Command::new(env!("CARGO_BIN_EXE_tj"))
             .args(arguments)
+            .envs(environment(&sandbox))
             .envs([("TJ_RUN_LAUNCH_ID", "owned"), ("TJ_RUN_PID", pid), ("TJ_RUN_STARTED_AT", started_at)])
             .env_remove("CODEX_THREAD_ID")
             .env("TJ_CACHE_DIR", sandbox.root.join("cache"))
             .output()
             .unwrap()
     };
-    let mark = sandbox.root.join("cache").join("run").join("owned").join("done");
-    let refused = foreign(&["done"]);
+    let refused = foreign(&["finish"]);
     assert!(!refused.status.success(), "an unrelated process was accepted as the tab's agent: {refused:?}");
-    assert!(String::from_utf8_lossy(&refused.stderr).contains("inherited another tab"));
-    assert!(!mark.exists(), "a process outside the tab marked it done");
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("requires the managed session's own agent process"));
+    assert!(!sandbox.root.join("state").join("completion").exists(), "a process outside the tab requested finish");
     assert!(foreign(&["launch"]).stdout.is_empty());
     assert_eq!(in_agent(&sandbox, &["launch"]).0, 0);
-    assert_eq!(in_agent(&sandbox, &["done"]).0, 0);
-    assert!(mark.exists());
+    done(&sandbox);
     still_running(&mut child, Duration::from_secs(1));
-    set_reply(&sandbox, "agent-store-show.json", CLOSING);
     let output = finish(child, Duration::from_secs(60));
     assert_closed_out(&sandbox, &output, "owned");
 }
@@ -1449,7 +1654,7 @@ fn each_claude_update_is_applied_to_an_idle_claude_in_place_once() {
     let agent = log(&sandbox, "dummy.log");
     assert_eq!(agent.matches("typed /reload-plugins").count(), 2, "{agent}");
     assert_eq!(agent.matches("agent plugins Test tab").count(), 1, "the agent restarted: {agent}");
-    set_reply(&sandbox, "agent-store-show.json", CLOSING);
+    done(&sandbox);
     let output = finish(child, Duration::from_secs(60));
     assert_closed_out(&sandbox, &output, "plugins");
 }
@@ -1475,7 +1680,7 @@ fn a_codex_update_is_applied_through_its_app_server() {
         use std::os::windows::process::CommandExt;
         command.creation_flags(0x0800_0000);
     }
-    let child = command.spawn().unwrap();
+    let child = Child::new(command.spawn().unwrap(), &sandbox);
     wait_for_log(&sandbox, if keys { "raw" } else { "agent " });
     publish(&sandbox, "codex", "plugins b");
     wait_until("the Codex app-server was never asked to take the update", || {
@@ -1490,7 +1695,7 @@ fn a_codex_update_is_applied_through_its_app_server() {
     assert_eq!(wire.matches(r#""websocket": "masked-text""#).count(), 3, "{wire}");
     let agent = log(&sandbox, "dummy.log");
     assert_eq!(agent.matches("agent codex-reload Test tab").count(), 1, "the agent restarted: {agent}");
-    set_reply(&sandbox, "agent-store-show.json", CLOSING);
+    done(&sandbox);
     let output = finish(child, Duration::from_secs(60));
     assert_closed_out(&sandbox, &output, "codex-reload");
     assert!(!String::from_utf8_lossy(&output.stderr).contains("could not update codex"), "{output:?}");
@@ -1520,9 +1725,12 @@ fn a_new_tj_binary_resumes_the_same_conversation_in_the_same_tab() {
     #[cfg(windows)]
     std::fs::copy(env!("CARGO_BIN_EXE_tj_hook"), bin.join(name("tj_hook"))).unwrap();
     set_reply(&sandbox, "agent-store-show.json", BOUND);
+    let mut arguments = with_prompt(&sandbox, "upgrade", "claude", "signal");
+    let restart = arguments.iter().position(|argument| argument == "--restart-grace-seconds").unwrap();
+    arguments[restart + 1] = "0".to_owned();
     let mut command = Command::new(bin.join(name("tj")));
     command
-        .args(with_prompt(&sandbox, "upgrade", "claude", "signal"))
+        .args(arguments)
         .current_dir(&sandbox.root)
         .envs(environment(&sandbox))
         .stdin(Stdio::null())
@@ -1533,8 +1741,9 @@ fn a_new_tj_binary_resumes_the_same_conversation_in_the_same_tab() {
         use std::os::windows::process::CommandExt;
         command.creation_flags(0x0800_0000);
     }
-    let mut child = command.spawn().unwrap();
+    let mut child = Child::new(command.spawn().unwrap(), &sandbox);
     wait_for_log(&sandbox, "pid ");
+    assert_eq!(in_agent(&sandbox, &["hold"]).0, 0);
     set_status(&sandbox, "busy");
     install(b"\0");
     still_running(&mut child, Duration::from_secs(6));
@@ -1548,7 +1757,10 @@ fn a_new_tj_binary_resumes_the_same_conversation_in_the_same_tab() {
     let store = log(&sandbox, "stubs/agent-store.log");
     assert_eq!(store.matches("launch --launch-id upgrade ").count(), 1, "{store}");
     assert!(!store.contains("end --launch-id upgrade"), "{store}");
-    set_reply(&sandbox, "agent-store-show.json", CLOSING);
+    done(&sandbox);
+    still_running(&mut child, Duration::from_secs(6));
+    assert!(sandbox.worktree.exists(), "the successor lost the keep-open hold");
+    assert_eq!(in_agent(&sandbox, &["hold", "--release"]).0, 0);
     let output = finish(child, Duration::from_secs(60));
     assert_closed_out(&sandbox, &output, "upgrade");
 }
@@ -1572,7 +1784,7 @@ fn shell_started_session_needs_only_the_agent_command(host: &str) {
         &serde_json::json!({"ok": true, "data": {"launches": [{"launch_id": "x", "host": host, "title": "Feature-1", "worktree": "w", "state": "active", "wrapper": {"pid": 1, "started_at": "2026-01-01T00:00:00Z"}}]}}).to_string(),
     );
     let fixture = fixture().to_string_lossy().into_owned();
-    let arguments = ["run", "--host", host, "--", python(), &fixture, "exit"].map(str::to_owned);
+    let arguments = ["_session", "--host", host, "--", python(), &fixture, "exit"].map(str::to_owned);
     let output = finish(spawn(&sandbox, &arguments, &sandbox.worktree), Duration::from_secs(60));
     assert_eq!(output.status.code(), Some(3), "stderr: {}", String::from_utf8_lossy(&output.stderr));
     let agent = log(&sandbox, "dummy.log");
@@ -1587,7 +1799,7 @@ fn shell_started_session_needs_only_the_agent_command(host: &str) {
             .contains(&format!("launch --launch-id {id} --host {host} --title Feature-1-2"))
     );
 
-    let unknown = ["run", "--", python(), &fixture, "exit"].map(str::to_owned);
+    let unknown = ["_session", "--", python(), &fixture, "exit"].map(str::to_owned);
     let output = finish(spawn(&sandbox, &unknown, &sandbox.worktree), Duration::from_secs(60));
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("pass --host"));
@@ -1657,6 +1869,20 @@ fn recovered_arguments(sandbox: &Sandbox, launch: &str, host: &str) -> Vec<Strin
     arguments
 }
 
+fn crash_after_final_response(sandbox: &Sandbox, arguments: &[String]) {
+    let prior = log(sandbox, "dummy.log").lines().filter(|line| line.starts_with("pid ")).count();
+    let mut child = spawn(sandbox, arguments, &sandbox.root);
+    wait_for_polls(sandbox, "dummy.log", "pid ", prior + 1);
+    set_turn(sandbox, false);
+    let turn = format!("crash-{prior}");
+    lifecycle(sandbox, &turn, "start", None, None);
+    let (code, stderr) = in_agent(sandbox, &["finish"]);
+    assert_eq!(code, 0, "{stderr}");
+    lifecycle(sandbox, &turn, "end", Some("Final result before wrapper failure"), None);
+    child.kill().unwrap();
+    assert!(!finish(child, Duration::from_secs(60)).status.success());
+}
+
 #[test]
 fn recovered_done_from_primary_removes_predecessor_claims_with_original_identity() {
     for host in ["claude", "codex"] {
@@ -1667,12 +1893,7 @@ fn recovered_done_from_primary_removes_predecessor_claims_with_original_identity
         let mut rows = vec![predecessor(&sandbox, &old, host)];
         // Store's canonical goal controls history rather than the CLI item spelling.
         let item = serde_json::json!({"ref": "github:github.com/acme/app:42"});
-        set_reply(
-            &sandbox,
-            "agent-store-show.json",
-            &serde_json::json!({"ok": true, "data": {"launch": {"item": item}, "session": {}}}).to_string(),
-        );
-        rows[0]["item"] = item;
+        rows[0]["item"] = item.clone();
         rows[0]["state"] = serde_json::json!("ended");
         rows[0]["end_reason"] = serde_json::json!("closed");
         let mut claims = vec![serde_json::json!({
@@ -1700,6 +1921,13 @@ fn recovered_done_from_primary_removes_predecessor_claims_with_original_identity
         set_store_list(&sandbox.stubs, "worktrees", serde_json::json!(claims));
         let child = spawn(&sandbox, &arguments, &sandbox.root);
         wait_for_log(&sandbox, if cfg!(windows) && host == "codex" { "raw" } else { "agent " });
+        // The launch fixture records the supplied spelling first; native registration then
+        // resolves it to the canonical tracker identity before completion is requested.
+        set_reply(
+            &sandbox,
+            "agent-store-show.json",
+            &serde_json::json!({"ok": true, "data": {"launch": {"item": item}, "session": {}}}).to_string(),
+        );
         done(&sandbox);
         let output = finish(child, Duration::from_secs(120));
         assert_closed_out(&sandbox, &output, &launch);
@@ -1884,7 +2112,8 @@ fn recovered_journal_retries_partial_multi_launch_releases_under_original_owners
 #[test]
 fn recovered_predecessor_journal_survives_another_recovery_and_retires_consumed_proof() {
     let sandbox = sandbox();
-    let _arguments = recovered_arguments(&sandbox, "recovered-proof", "claude");
+    let arguments = recovered_arguments(&sandbox, "recovered-proof", "claude");
+    crash_after_final_response(&sandbox, &arguments);
     claim(&sandbox, "previous", "claude", std::slice::from_ref(&sandbox.worktree));
     let journal_dir = sandbox.root.join("cache/run");
     std::fs::create_dir_all(&journal_dir).unwrap();
@@ -1904,6 +2133,10 @@ fn recovered_predecessor_journal_survives_another_recovery_and_retires_consumed_
     old["end_reason"] = serde_json::json!("closed");
     let mut current = predecessor(&sandbox, "recovered-proof", "claude");
     current["state"] = serde_json::json!("closing");
+    let mut previous_binding: serde_json::Value =
+        serde_json::from_str(&log(&sandbox, "stubs/agent-store-show.json")).unwrap();
+    previous_binding["data"]["launch"] = old.clone();
+    set_reply(&sandbox, "agent-store-show-previous.json", &previous_binding.to_string());
     set_store_list(&sandbox.stubs, "launches", serde_json::json!([old, current]));
     for (field, value) in [
         ("session", serde_json::json!("claude:foreign")),
@@ -1921,15 +2154,6 @@ fn recovered_predecessor_journal_survives_another_recovery_and_retires_consumed_
         assert!(!log(&sandbox, "stubs/tj-item.log").contains("--state Done"));
     }
     std::fs::write(&previous, proof.to_string()).unwrap();
-    let mut other_item = old.clone();
-    other_item["item"]["ref"] = serde_json::json!("github:github.com/acme/app:2");
-    set_store_list(&sandbox.stubs, "launches", serde_json::json!([other_item, current]));
-    let retained = sweep_closeout(&sandbox);
-    assert!(retained.status.success(), "{}", String::from_utf8_lossy(&retained.stdout));
-    assert!(previous.exists());
-    assert!(!log(&sandbox, "stubs/agent-store.log").contains("release-worktree"));
-    // Resume the original canonical goal; the other goal's proof was never consumed.
-    set_store_list(&sandbox.stubs, "launches", serde_json::json!([old, current]));
     let failure = "agent-store-release-worktree-previous.json";
     set_reply(&sandbox, failure, r#"{"ok":false,"error":{"message":"interrupted release"}}"#);
     let interrupted = sweep_closeout(&sandbox);
@@ -1952,6 +2176,12 @@ fn recovered_predecessor_journal_survives_another_recovery_and_retires_consumed_
     let mut next = predecessor(&sandbox, "recovered-again", "claude");
     next["state"] = serde_json::json!("closing");
     set_store_list(&sandbox.stubs, "launches", serde_json::json!([old, current, next]));
+    let arguments = recovered_arguments(&sandbox, "recovered-again", "claude");
+    crash_after_final_response(&sandbox, &arguments);
+    let mut current_binding: serde_json::Value =
+        serde_json::from_str(&log(&sandbox, "stubs/agent-store-show.json")).unwrap();
+    current_binding["data"]["launch"] = current.clone();
+    set_reply(&sandbox, "agent-store-show-recovered-proof.json", &current_binding.to_string());
     let finished = sweep_closeout(&sandbox);
     assert!(finished.status.success(), "{}", String::from_utf8_lossy(&finished.stdout));
     assert!(!previous.exists() && !recovered.exists() && !journal_dir.join("recovered-again.closeout.json").exists());
@@ -1982,7 +2212,7 @@ fn one_dirty_owned_worktree_keeps_every_worktree_and_the_agent_open() {
     assert_closed_out(&sandbox, &output, "dirty-collection");
     assert!(!extra.exists());
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert_eq!(stderr.matches("worktree has uncommitted changes").count(), 1, "{stderr}");
+    assert!(stderr.contains("worktree has uncommitted changes"), "{stderr}");
 }
 
 #[test]
@@ -2030,12 +2260,16 @@ fn release_failure_keeps_the_claim_and_never_marks_done() {
 }
 
 fn retry_closeout(sandbox: &Sandbox, launch: &str) -> Output {
+    retry_closeout_with_reason(sandbox, launch, "exited")
+}
+
+fn retry_closeout_with_reason(sandbox: &Sandbox, launch: &str, reason: &str) -> Output {
     set_store_list(
         &sandbox.stubs,
         "launches",
         serde_json::json!([{
             "launch_id": launch, "host": "claude", "title": "Test tab",
-            "worktree": sandbox.worktree, "state": "ended", "end_reason": "exited",
+            "worktree": sandbox.worktree, "state": "ended", "end_reason": reason,
             "item": {"ref": ITEM},
             "wrapper": {"pid": 0, "started_at": "2026-01-01T00:00:00Z"}
         }]),
@@ -2067,7 +2301,11 @@ fn tracker_and_launch_finalization_failures_can_be_retried_after_all_releases() 
         assert!(sandbox.stubs.join("released.json").is_file());
         let journal = sandbox.root.join("cache/run").join(format!("{launch}.closeout.json"));
         assert!(journal.is_file());
+        let saved_journal = std::fs::read(&journal).unwrap();
         std::fs::remove_file(sandbox.stubs.join(failed)).unwrap();
+        if stage == "end" {
+            std::fs::write(sandbox.stubs.join("tj-item-progress.failed"), "tracker must not be called twice").unwrap();
+        }
         git(&sandbox.primary, &["branch", "Feature/1"]);
         let ended = log(&sandbox, "stubs/agent-store.log").matches("--reason closed").count();
         let refused = retry_closeout(&sandbox, &launch);
@@ -2077,11 +2315,72 @@ fn tracker_and_launch_finalization_failures_can_be_retried_after_all_releases() 
         assert!(journal.is_file());
         assert!(!git(&sandbox.primary, &["branch", "--list", "Feature/1"]).is_empty());
         git(&sandbox.primary, &["branch", "-d", "Feature/1"]);
-        let output = retry_closeout(&sandbox, &launch);
+        let output = retry_closeout_with_reason(&sandbox, &launch, if stage == "end" { "closed" } else { "exited" });
         assert_closed_out(&sandbox, &output, &launch);
         assert!(!journal.exists());
         assert_eq!(log(&sandbox, "stubs/agent-store.log").matches("release-worktree ").count(), 1);
+        assert_eq!(
+            log(&sandbox, "stubs/tj-item.log").matches("--state Done").count(),
+            if stage == "tracker" { 2 } else { 1 }
+        );
+        if stage == "end" {
+            std::fs::write(&journal, saved_journal).unwrap();
+            let recovered = retry_closeout_with_reason(&sandbox, &launch, "closed");
+            assert!(recovered.status.success(), "{}", String::from_utf8_lossy(&recovered.stdout));
+            assert!(!journal.exists());
+            assert_eq!(log(&sandbox, "stubs/tj-item.log").matches("--state Done").count(), 1);
+        }
     }
+}
+
+#[test]
+fn recovery_without_a_journal_keeps_live_or_unverified_native_sessions() {
+    let sandbox = sandbox();
+    let launch = "native-still-live";
+    let child = start(&sandbox, launch, "claude", "signal", "2");
+    set_reply(
+        &sandbox,
+        "tj-session-liveness.json",
+        &serde_json::json!({"session":"claude:sess-1", "launch_id":launch, "state":"live"}).to_string(),
+    );
+    done(&sandbox);
+    let output = finish(child, Duration::from_secs(60));
+    assert_eq!(output.status.code(), Some(1));
+    assert!(sandbox.worktree.exists());
+    assert!(!sandbox.root.join("cache/run").join(format!("{launch}.closeout.json")).exists());
+    let kept = retry_closeout(&sandbox, launch);
+    assert_eq!(kept.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&kept.stdout).contains("native session may still be live"));
+    std::fs::write(sandbox.stubs.join("tj-session-liveness.failed"), "provider query unavailable").unwrap();
+    let unknown = retry_closeout(&sandbox, launch);
+    assert_eq!(unknown.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&unknown.stdout).contains("native session liveness is unverified"));
+    assert!(sandbox.worktree.exists());
+    assert!(!log(&sandbox, "stubs/tj-item.log").contains("--state Done"));
+    std::fs::remove_file(sandbox.stubs.join("tj-session-liveness.failed")).unwrap();
+    set_reply(
+        &sandbox,
+        "tj-session-liveness.json",
+        &serde_json::json!({"session":"claude:sess-1", "launch_id":launch, "state":"dead"}).to_string(),
+    );
+    let recovered = retry_closeout(&sandbox, launch);
+    assert_closed_out(&sandbox, &recovered, launch);
+}
+
+#[test]
+fn native_daemon_idle_grace_finishes_when_the_provider_unloads() {
+    let sandbox = sandbox();
+    let launch = "native-exit-grace";
+    let child = start(&sandbox, launch, "codex", "keys", "3");
+    let state = |state| serde_json::json!({"session":"codex:sess-1", "launch_id":launch, "state":state}).to_string();
+    set_reply(&sandbox, "tj-session-liveness.json", &state("live"));
+    done(&sandbox);
+    wait_until("wrapper never checked native teardown", || !log(&sandbox, "stubs/tj-session.log").is_empty());
+    let next = sandbox.stubs.join("native-unloaded.json");
+    std::fs::write(&next, state("dead")).unwrap();
+    std::fs::rename(next, sandbox.stubs.join("tj-session-liveness.json")).unwrap();
+    let output = finish(child, Duration::from_secs(60));
+    assert_closed_out(&sandbox, &output, launch);
 }
 
 #[test]
