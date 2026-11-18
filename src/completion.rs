@@ -348,6 +348,12 @@ impl Outbox {
             StepState::Pending | StepState::Failed(_) => None,
         }
     }
+    pub fn failure(&self, step: Step) -> Option<&Failure> {
+        match self.step(step) {
+            StepState::Failed(failure) => Some(failure),
+            StepState::Pending | StepState::Recorded(_) => None,
+        }
+    }
     pub fn complete(&self) -> bool {
         [Step::Delivery, Step::Tracker, Step::Cleanup].into_iter().all(|step| self.receipt(step).is_some())
     }

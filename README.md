@@ -262,10 +262,15 @@ resumes, the agent completes it and requests finish for that turn. `tj hold` kee
 when a final result is available. The hold survives new input and resuming that conversation; only
 `tj hold --release` releases it, and release alone does not request completion.
 
-New input cancels pending completion and invalidates closeout authorization for the previous turn.
+Submitted native input cancels pending completion and invalidates closeout authorization for the previous turn.
 Before stopping the host, TJ also requires readable native idle state, no running background shell and a
 short quiet period. It rechecks those conditions during shutdown. Idleness creates no user messages,
 nudges or model turns.
+
+Codex's rollout cannot verify unsent drafts, other loaded conversations or all background work. TJ therefore
+delivers the final result but retains the Codex window and worktrees, with the reason visible in its receipt.
+Exit Codex normally after checking its native work; TJ then rechecks the final result, native liveness and
+repository state before cleanup. A finish request does not authorize TJ to discard unobservable native work.
 
 The completion record retains the final response, session and launch identity, wait or hold state, and
 receipts for result delivery, cleanup and tracker completion. A result being recorded is distinct from
@@ -295,8 +300,8 @@ ownership from a neighbouring folder or adopts legacy location metadata.
 
 With a valid result receipt and closeout authorization, the wrapper:
 
-1. asks its native host to exit with a console break or SIGINT for Claude, or Ctrl+C for Codex;
-2. rechecks authorization during the grace period, then ends the remaining owned process tree;
+1. asks Claude to exit with a console break or SIGINT; Codex waits for a normal native exit;
+2. rechecks authorization during Claude's shutdown grace period, then ends the remaining owned process tree;
 3. rechecks ownership and content, and runs `git-wt remove --foreground` for each safe linked worktree;
 4. releases each claim only after its worktree and branch are gone, marks the linked item Done when there
    is one, and closes the launch;
