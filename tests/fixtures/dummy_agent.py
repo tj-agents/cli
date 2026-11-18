@@ -20,6 +20,9 @@ def graceful(*_: object) -> None:
         Path(marker.read_text(encoding="utf-8")).write_text(
             "unfinished", encoding="utf-8"
         )
+    removed = marker.with_name("remove-on-stop")
+    if removed.exists():
+        Path(removed.read_text(encoding="utf-8")).unlink()
     note("graceful")
     sys.exit(0)
 

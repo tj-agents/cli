@@ -2298,7 +2298,8 @@ fn a_binary_update_failure_after_native_stop_preserves_recovery_and_the_receipt(
         } else {
             bin.join(format!("tj{}", std::env::consts::EXE_SUFFIX))
         };
-        std::fs::write(sandbox.root.join("dirty-on-stop"), failure.to_str().unwrap()).unwrap();
+        let marker = if preparation_failure { "dirty-on-stop" } else { "remove-on-stop" };
+        std::fs::write(sandbox.root.join(marker), failure.to_str().unwrap()).unwrap();
         set_status(&sandbox, "idle");
         install_replacement_binary(&bin, b"\0");
         let output = finish(child, Duration::from_secs(60));
