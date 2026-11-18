@@ -1246,6 +1246,7 @@ fn dropping_a_test_wrapper_stops_its_fixture_tree() {
 #[test]
 fn codex_retains_unobservable_native_work_until_a_normal_exit() {
     let sandbox = sandbox();
+    set_reply(&sandbox, "tj-item-prs.json", r#"{"all_merged":false,"prs":[]}"#);
     let mut child = start_host(&sandbox, "idle", "codex");
     done(&sandbox);
     wait_until("Codex retention never became visible", || {
@@ -1258,6 +1259,8 @@ fn codex_retains_unobservable_native_work_until_a_normal_exit() {
     assert!(sandbox.worktree.exists());
     assert!(!log(&sandbox, "dummy.log").contains("graceful"), "TJ sent an exit signal without proof");
     assert!(!log(&sandbox, "stubs/tj-item.log").contains("--state Done"));
+    set_reply(&sandbox, "tj-item-prs.json", MERGED);
+    wait_until("retained Codex stopped receiving merge notifications", || feed_messages(&sandbox, "codex").len() == 1);
     native_codex_exit(&sandbox, "codex");
     let output = finish(child, Duration::from_secs(60));
     assert_closed_out(&sandbox, &output, "idle");

@@ -406,15 +406,15 @@ impl Watch {
                             if let Err(error) = self.retain_codex(&record) {
                                 self.report(format!("could not record pending native exit: {error:#}"));
                             }
-                            return None;
+                        } else {
+                            return match lifecycle::Closing::begin(self.completion.as_ref()?.clone(), &record) {
+                                Ok(closing) => Some(closing),
+                                Err(error) => {
+                                    self.report(format!("{error:#}"));
+                                    None
+                                }
+                            };
                         }
-                        return match lifecycle::Closing::begin(self.completion.as_ref()?.clone(), &record) {
-                            Ok(closing) => Some(closing),
-                            Err(error) => {
-                                self.report(format!("{error:#}"));
-                                None
-                            }
-                        };
                     }
                 } else {
                     self.ready_since = None;
