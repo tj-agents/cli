@@ -343,6 +343,8 @@ running sessions. Separately, the wrapper detects a replacement `tj` executable.
 settled and runs, Claude and input have been idle for 30 seconds, and no background shell remains, it
 hands over to the new binary and resumes the same conversation. The original options remain; the prompt
 and earlier session choice are removed. Completion already awaiting closeout prevents that restart.
+Repository preparation must pass for the resume command before the running agent is stopped. If handover
+or successor startup then fails, the launch stays open for `tj recover --open` after the failure is repaired.
 
 Linux replaces the wrapper in place. Windows keeps the old wrapper as the tab's root while its successor
 runs. Launch identity and the conversation remain. Without a bound native session, the current agent
