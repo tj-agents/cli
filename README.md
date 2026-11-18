@@ -363,7 +363,7 @@ Both hosts use `tj message`; TJ owns the provider routing decision. Address an e
 title resolving to one registered session that has not ended. Claude-to-Claude messages use the sending
 Claude session's native adapter; messages involving Codex, or sent from a plain terminal, use the feed.
 Native routing requires Agent's adapter to be active in a Claude host with the supported mod API
-(Claude Code 2.1.287 or newer). It preserves the source session identity and native delivery controls.
+(Claude Code 2.1.306 or newer). It preserves the source session identity and native delivery controls.
 
 | Receipt | Meaning |
 | --- | --- |
@@ -398,7 +398,7 @@ for the agent workflow.
 | --- | --- | --- |
 | `TJ_F_ROOT` | `~/projects`, then `~/source/repos` | where `f` searches |
 | `TJ_CACHE_DIR` | OS cache folder + `/tj` | session search indexes, published plugin updates, wrapper update checks and session feeds |
-| `TJ_STATE_DIR` | OS local application data folder + `/tj` | durable completion records under `completion/` and native message requests and receipts under `messages/` |
+| `TJ_STATE_DIR` | OS local application data folder + `/tj` | durable completion records under `completion/`, native operation requests and receipts under `native/`, and message route bindings under `messages/` |
 | `TJ_BIN_DIR` | `~/.local/bin` / `%LOCALAPPDATA%\Programs\tj` | where the installer puts `tj` and `tj_hook` |
 | `CLAUDE_CONFIG_DIR` | `~/.claude` | Claude Code's config folder, as Claude Code itself reads it |
 | `CODEX_HOME` | `~/.codex` | Codex's config folder, as Codex itself reads it |

@@ -14,13 +14,17 @@ use anyhow::{Context, Result};
 use tj_cli::process::agent;
 
 use crate::host::Host;
+use crate::native_bridge;
 use crate::paths;
+use crate::run::Launch;
 pub(crate) use watch::Watcher;
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum ApplyError {
-    #[error("could not type into the agent's console")]
-    Typing(#[source] std::io::Error),
+    #[error("could not resolve the managed session for native reload")]
+    Session(#[source] anyhow::Error),
+    #[error(transparent)]
+    Native(#[from] native_bridge::ReloadError),
     #[error(
         "the managed Codex engine cannot reload through the shared daemon; plugin activation remains unverified until a native restart"
     )]
@@ -31,7 +35,7 @@ pub(crate) enum ApplyError {
 pub(crate) trait Update {
     /// Whether the agent process `agent` is mid-turn, read from the host itself rather than from hooks.
     fn activity(&self, agent: u32) -> gate::Activity;
-    fn apply(&self) -> Result<(), ApplyError>;
+    fn apply(&self, launch: &Launch, revision: &str) -> Result<bool, ApplyError>;
 }
 
 pub(crate) fn host(host: Host) -> &'static dyn Update {

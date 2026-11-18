@@ -47,9 +47,19 @@ Failed startup preparation stops before launching the provider or transferring r
 advisory repository drift alone does not fail preparation.
 
 Each running wrapper watches its host's publication file. Claude waits until its turn and input are
-idle, then types `/reload-plugins` and Enter into the shared console. Unsubmitted text in the console
-is not visible to the wrapper and the command can be appended to it. Managed Codex uses an owned embedded
-engine, which the shared daemon cannot reload. Its wrapper leaves activation unverified, reports that a
+idle, then sends a durable reload request to Agent's in-process native adapter. The adapter invokes
+Claude's `command.run` API without editing the composer. The wrapper acknowledges the request only after
+the native command returns; a missing adapter or receipt leaves activation unverified. The receipt retains
+native command output. It does not prove every plugin's changed behavior, which the acceptance checks below
+verify separately. Messaging continues while a native reload waits to run.
+
+Replacing Agent itself can retire the caller before it records the result. Its replacement waits for the
+old adapter's queue lease, then makes at most one additional native reload request to confirm completion.
+Native reload preserves drafts; message delivery is never repeated by this reconciliation. Receipts name
+their adapter lease so a late retired caller cannot overwrite the replacement's result. A second lost
+caller remains unverified rather than starting an endless reload loop.
+
+Managed Codex uses an owned embedded engine, which the shared daemon cannot reload. Its wrapper leaves activation unverified, reports that a
 native restart is required and retains the current process. It does not acknowledge a reload against an
 unrelated daemon as an update to that window. Automatic adoption by an already-running embedded Codex
 interface remains unsupported.
@@ -66,7 +76,8 @@ the new binary with the same conversation; Codex currently takes the new binary 
 
 - Merge a marketplace pin change with `tj claude` and `tj codex` sessions already open. Without a manual
   update, observe the installation, each host's publication and the changed plugin behavior in each
-  same conversation. For Claude, observe the reload command when idle; for Codex, exercise changed
+  same conversation. For Claude, preserve an unsent draft and its cursor through native reload, including
+  when Agent replaces its own adapter. For Codex, exercise changed
   behavior in a later turn instead of relying on an RPC acknowledgement or completion list.
 - Start and resume a Codex session in a selecting repository. Confirm its SessionStart hooks finish
   within their timeouts and its repository standards are available.
