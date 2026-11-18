@@ -1522,6 +1522,111 @@ fn the_launch_is_recorded_before_the_agent_starts() {
     assert!(seen_by_agent.contains("launch --launch-id first --host"), "{seen_by_agent}");
 }
 
+fn awaiting_registration(sandbox: &Sandbox, launch: &str, host: &str, mode: &str) -> Child {
+    let arguments = run_arguments(sandbox, launch, host, mode, "10");
+    std::fs::write(
+        sandbox.stubs.join("agent-store-prebind.json"),
+        serde_json::json!({"session":"sess-1", "host":host}).to_string(),
+    )
+    .unwrap();
+    let child = spawn(sandbox, &arguments, &sandbox.root);
+    wait_for_log(sandbox, "pid ");
+    child
+}
+
+#[test]
+fn registration_delayed_across_watchdog_polls_is_quiet_and_then_observed() {
+    for host in ["claude", "codex"] {
+        let sandbox = sandbox();
+        let launch = format!("registration-delayed-{host}");
+        let child = awaiting_registration(&sandbox, &launch, host, "signal");
+        wait_for_polls(&sandbox, "stubs/agent-store.log", &format!("show --launch-id {launch}"), 4);
+        let mut row: serde_json::Value =
+            serde_json::from_str(&log(&sandbox, "stubs/agent-store-prebind-launch.json")).unwrap();
+        row["session"] = serde_json::json!(format!("{host}:sess-1"));
+        row["created_at"] = row["wrapper"]["started_at"].clone();
+        set_store_list(&sandbox.stubs, "launches", serde_json::json!([row]));
+        std::fs::write(sandbox.stubs.join("agent-store-prebind-bound"), "").unwrap();
+        lifecycle(&sandbox, "registered", "start", None, None);
+        lifecycle(&sandbox, "registered", "end", Some("Registered final response"), None);
+        wait_until("registered completion was not observed", || {
+            completion_receipt(&sandbox, &launch)["state"]["kind"] == "attention"
+        });
+        assert_eq!(in_agent(&sandbox, &["exit-native"]).0, 0);
+        let output = finish(child, Duration::from_secs(30));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(0), "{stderr}");
+        assert!(!stderr.contains("missing session"), "{stderr}");
+        assert!(!stderr.contains("still awaiting native session registration"), "{stderr}");
+        assert!(sandbox.worktree.exists());
+    }
+}
+
+#[test]
+fn registration_missing_at_native_exit_is_reported_and_preserves_the_exit_code() {
+    for host in ["claude", "codex"] {
+        for code in [0, 3] {
+            let sandbox = sandbox();
+            let launch = format!("registration-exit-{host}-{code}");
+            let child = awaiting_registration(&sandbox, &launch, host, if code == 0 { "signal" } else { "exit" });
+            if code == 0 {
+                wait_for_polls(&sandbox, "stubs/agent-store.log", &format!("show --launch-id {launch}"), 3);
+                assert_eq!(in_agent(&sandbox, &["exit-native"]).0, 0);
+            }
+            let output = finish(child, Duration::from_secs(30));
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert_eq!(output.status.code(), Some(code), "{stderr}");
+            assert_eq!(stderr.matches("native exited without a verified session binding").count(), 1, "{stderr}");
+            assert_eq!(stderr.matches("missing session").count(), 1, "premature or absent warning: {stderr}");
+            assert!(sandbox.worktree.exists());
+            assert!(!log(&sandbox, "stubs/agent-store.log").contains("release-worktree"));
+            assert!(!log(&sandbox, "stubs/tj-item.log").contains("--state Done"));
+        }
+    }
+}
+
+#[test]
+fn registration_malformed_binding_and_store_errors_are_reported_while_native_is_live() {
+    for host in ["claude", "codex"] {
+        for failure in ["missing", "mismatched", "store"] {
+            let sandbox = sandbox();
+            let launch = format!("registration-error-{host}-{failure}");
+            let child = awaiting_registration(&sandbox, &launch, host, "signal");
+            let prefix = format!("show --launch-id {launch}");
+            wait_for_polls(&sandbox, "stubs/agent-store.log", &prefix, 3);
+            let mut reply: serde_json::Value =
+                serde_json::from_str(&log(&sandbox, "stubs/agent-store-show.json")).unwrap();
+            let diagnostic = match failure {
+                "missing" => {
+                    reply["data"]["session"] = serde_json::json!({});
+                    "missing session"
+                }
+                "mismatched" => {
+                    reply["data"]["session"]["launch_id"] = serde_json::json!("foreign");
+                    "completion requires an exact reciprocal native session binding"
+                }
+                "store" => {
+                    reply = serde_json::json!({"ok":false,"error":{"message":"store unavailable"}});
+                    "agent-store show: store unavailable"
+                }
+                _ => unreachable!(),
+            };
+            std::fs::write(sandbox.stubs.join("agent-store-show.json"), reply.to_string()).unwrap();
+            std::fs::remove_file(sandbox.stubs.join("agent-store-prebind.json")).unwrap();
+            let observed =
+                log(&sandbox, "stubs/agent-store.log").lines().filter(|line| line.starts_with(&prefix)).count();
+            wait_for_polls(&sandbox, "stubs/agent-store.log", &prefix, observed + 3);
+            assert_eq!(in_agent(&sandbox, &["exit-native"]).0, 0);
+            let output = finish(child, Duration::from_secs(30));
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let live_report = format!("TJ: completion remains unverified: {diagnostic}");
+            assert_eq!(stderr.lines().filter(|line| line.trim() == live_report).count(), 1, "{stderr}");
+            assert!(!stderr.contains("still awaiting native session registration"), "{stderr}");
+            assert!(sandbox.worktree.exists());
+        }
+    }
+}
+
 #[test]
 fn repository_preparation_finishes_before_the_agent_starts() {
     for host in ["claude", "codex"] {

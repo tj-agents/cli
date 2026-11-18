@@ -296,6 +296,8 @@ fn end_not_started(launch: &Launch, prebound: &PreboundSession, wrapper_pid: u32
     }
 }
 
+const REGISTRATION_REPORT_GRACE: Duration = Duration::from_secs(300);
+
 struct Watch {
     launch: Launch,
     marks: PathBuf,
@@ -305,6 +307,8 @@ struct Watch {
     next_poll: Instant,
     reported: HashSet<String>,
     completion: Option<Store>,
+    wrapper_started_at: String,
+    registration_report_at: Instant,
     revision: Option<u64>,
     ready_since: Option<Instant>,
     pinned: Option<turn::Turn>,
@@ -336,10 +340,29 @@ impl Watch {
 
     fn record(&mut self) -> Result<Option<Record>> {
         if self.completion.is_none() {
-            self.completion = Some(lifecycle::for_launch(&self.launch.id)?);
+            self.completion = lifecycle::for_startup(&self.launch, &self.wrapper_started_at)?;
+            if self.completion.is_none() {
+                self.awaiting_registration(Instant::now());
+                return Ok(None);
+            }
         }
         let store = self.completion.as_ref().context("completion store not bound")?;
         store.load()?.map(|record| lifecycle::deliver(store, record)).transpose()
+    }
+
+    fn awaiting_registration(&mut self, now: Instant) {
+        if now >= self.registration_report_at {
+            self.report("still awaiting native session registration".into());
+        }
+    }
+
+    fn exited(&mut self, agent: u32, code: i32) -> Result<Option<Record>> {
+        if self.completion.is_none() {
+            self.completion = Some(
+                lifecycle::for_launch(&self.launch.id).context("native exited without a verified session binding")?,
+            );
+        }
+        if code == 0 { self.natural_exit(agent) } else { Ok(None) }
     }
 
     fn ready(&mut self) -> Result<Option<Record>> {
@@ -689,6 +712,8 @@ fn supervise(
         next_poll: Instant::now() + poll,
         reported: HashSet::new(),
         completion: None,
+        wrapper_started_at: started_at,
+        registration_report_at: Instant::now() + REGISTRATION_REPORT_GRACE,
         revision: None,
         ready_since: None,
         pinned: None,
@@ -707,16 +732,12 @@ fn supervise(
                 wait_for_enter();
             }
             // A clean process exit is not a final result. Only the exact native receipt can close.
-            let ready = if code == 0 {
-                match watch.natural_exit(agent.pid()) {
-                    Ok(ready) => ready,
-                    Err(error) => {
-                        watch.report(format!("completion remains unverified: {error:#}"));
-                        None
-                    }
+            let ready = match watch.exited(agent.pid(), code) {
+                Ok(ready) => ready,
+                Err(error) => {
+                    watch.report(format!("completion remains unverified: {error:#}"));
+                    None
                 }
-            } else {
-                None
             };
             if let Some(record) = ready {
                 let store = watch.completion.as_ref().context("completion store not bound")?.clone();
@@ -879,6 +900,37 @@ mod tests {
 
     fn launch() -> Launch {
         Launch { id: "launch".to_owned(), host: Host::Codex, title: "Tab".to_owned(), cwd: cwd(), item: None }
+    }
+
+    #[test]
+    fn registration_waiting_is_reported_once_only_after_its_grace() {
+        let start = std::time::Instant::now();
+        let deadline = start + super::REGISTRATION_REPORT_GRACE;
+        let mut watch = super::Watch {
+            launch: launch(),
+            marks: PathBuf::new(),
+            poll: std::time::Duration::ZERO,
+            idle: std::time::Duration::ZERO,
+            input_idle: std::time::Duration::ZERO,
+            next_poll: start,
+            reported: std::collections::HashSet::new(),
+            completion: None,
+            wrapper_started_at: String::new(),
+            registration_report_at: deadline,
+            revision: None,
+            ready_since: None,
+            pinned: None,
+            rollout: None,
+            next_lookup: start,
+        };
+        watch.awaiting_registration(start);
+        watch.awaiting_registration(deadline - std::time::Duration::from_nanos(1));
+        assert!(watch.reported.is_empty());
+        watch.awaiting_registration(deadline);
+        watch.awaiting_registration(deadline + super::REGISTRATION_REPORT_GRACE);
+        assert_eq!(watch.reported.len(), 1);
+        assert!(watch.reported.contains("still awaiting native session registration"));
+        assert!(watch.completion.is_none());
     }
 
     #[test]
