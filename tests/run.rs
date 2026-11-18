@@ -1,6 +1,8 @@
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child as ProcessChild, Command, Output, Stdio};
+use std::sync::{Condvar, Mutex};
+use std::thread::ThreadId;
 use std::time::{Duration, Instant};
 
 const ITEM: &str = "github:github.com/acme/app:1";
@@ -75,6 +77,42 @@ impl Drop for Child {
     }
 }
 
+static FIXTURES: Mutex<Vec<(ThreadId, usize)>> = Mutex::new(Vec::new());
+static FIXTURE_AVAILABLE: Condvar = Condvar::new();
+
+struct FixtureSlot(ThreadId);
+
+impl FixtureSlot {
+    fn acquire() -> Self {
+        let owner = std::thread::current().id();
+        // Each test launches real process trees; admit it before starting its deadlines.
+        // Additional repositories in the same test share its slot.
+        let mut active = FIXTURE_AVAILABLE
+            .wait_while(FIXTURES.lock().unwrap(), |active| {
+                active.len() >= 2 && !active.iter().any(|(thread, _)| *thread == owner)
+            })
+            .unwrap();
+        if let Some((_, count)) = active.iter_mut().find(|(thread, _)| *thread == owner) {
+            *count += 1;
+        } else {
+            active.push((owner, 1));
+        }
+        Self(owner)
+    }
+}
+
+impl Drop for FixtureSlot {
+    fn drop(&mut self) {
+        let mut active = FIXTURES.lock().unwrap();
+        let index = active.iter().position(|(thread, _)| *thread == self.0).unwrap();
+        active[index].1 -= 1;
+        if active[index].1 == 0 {
+            active.swap_remove(index);
+            FIXTURE_AVAILABLE.notify_one();
+        }
+    }
+}
+
 struct Sandbox {
     _directory: tempfile::TempDir,
     root: PathBuf,
@@ -82,6 +120,7 @@ struct Sandbox {
     primary: PathBuf,
     worktree: PathBuf,
     log: PathBuf,
+    _slot: FixtureSlot,
 }
 
 fn git(cwd: &Path, arguments: &[&str]) -> String {
@@ -126,6 +165,7 @@ fn stub(directory: &Path, name: &str, fallback: &str) {
 }
 
 fn sandbox() -> Sandbox {
+    let slot = FixtureSlot::acquire();
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path().to_path_buf();
     let seed = root.join("seed");
@@ -140,6 +180,10 @@ fn sandbox() -> Sandbox {
     git(&primary, &["worktree", "add", "-q", ".worktrees/Feature-1", "-b", "Feature/1"]);
     let stubs = root.join("stubs");
     std::fs::create_dir(&stubs).unwrap();
+    // Windows searches an executable's own directory before PATH for its children.
+    // Keep real git-wt away from unrelated installed Git launchers beside it.
+    let worktrunk = which::which("git-wt").expect("git-wt is not on PATH: python -m tj_cli.worktrunk_install");
+    std::fs::copy(&worktrunk, stubs.join(worktrunk.file_name().unwrap())).unwrap();
     #[cfg(windows)]
     std::fs::write(stubs.join("agent-store.cmd"), "@echo off\r\npython \"%~dp0run_store.py\" %*\r\n").unwrap();
     #[cfg(unix)]
@@ -166,7 +210,7 @@ fn sandbox() -> Sandbox {
         std::fs::create_dir(root.join(folder)).unwrap();
     }
     let worktree = primary.join(".worktrees").join("Feature-1");
-    Sandbox { log: root.join("dummy.log"), _directory: directory, root, stubs, primary, worktree }
+    Sandbox { log: root.join("dummy.log"), _directory: directory, root, stubs, primary, worktree, _slot: slot }
 }
 
 fn python() -> &'static str {
@@ -174,8 +218,7 @@ fn python() -> &'static str {
 }
 
 fn search_path(sandbox: &Sandbox) -> std::ffi::OsString {
-    let worktrunk = which::which("git-wt").expect("git-wt is not on PATH: python -m tj_cli.worktrunk_install");
-    let mut entries = vec![sandbox.stubs.clone(), worktrunk.parent().unwrap().to_path_buf()];
+    let mut entries = vec![sandbox.stubs.clone()];
     entries.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap()));
     std::env::join_paths(entries).unwrap()
 }
@@ -1386,6 +1429,9 @@ fn unmerged_commits_keep_the_session_open_until_delivered() {
     refused(&sandbox, &mut child, "unmerged");
     assert!(sandbox.worktree.exists());
     assert!(!log(&sandbox, "stubs/tj-item.log").contains("--state Done"));
+    // Delivery is new native work; withdraw the refused result before changing the repository.
+    set_turn(&sandbox, false);
+    lifecycle(&sandbox, "deliver-work", "start", None, None);
     git(&sandbox.primary, &["merge", "--squash", "Feature/1"]);
     git(&sandbox.primary, &["commit", "-q", "-m", "squash work"]);
     git(&sandbox.primary, &["push", "-q", "origin", "main"]);
