@@ -399,6 +399,15 @@ impl Watch {
                         && turn::shells(agent) == 0
                         && agent::input_idle().is_none_or(|idle| idle >= self.input_idle)
                     {
+                        // A completed Codex rollout does not expose unsent drafts, other
+                        // loaded conversations or all background work in its native UI.
+                        // Keep delivering results, but leave native exit to that UI.
+                        if self.launch.host == Host::Codex {
+                            if let Err(error) = self.retain_codex(&record) {
+                                self.report(format!("could not record pending native exit: {error:#}"));
+                            }
+                            return None;
+                        }
                         return match lifecycle::Closing::begin(self.completion.as_ref()?.clone(), &record) {
                             Ok(closing) => Some(closing),
                             Err(error) => {
@@ -422,6 +431,19 @@ impl Watch {
             self.report(format!("could not record merge notification: {error:#}"));
         }
         None
+    }
+
+    fn retain_codex(&mut self, record: &Record) -> Result<()> {
+        use crate::completion::{Failure, Step};
+
+        let reason = "Codex remains open because drafts and other native work cannot be verified. Exit Codex normally after checking that work; TJ will then recheck cleanup.";
+        let failure = Failure::new(Step::Cleanup, reason)?;
+        if record.state().outcome().and_then(|outcome| outcome.outbox().failure(Step::Cleanup)) != Some(&failure) {
+            let store = self.completion.as_ref().context("completion store not bound")?.clone();
+            lifecycle::Closing::begin(store, record)?.fail(Step::Cleanup, reason)?;
+        }
+        self.report(reason.into());
+        Ok(())
     }
 }
 

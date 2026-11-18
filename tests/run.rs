@@ -441,6 +441,24 @@ fn done(sandbox: &Sandbox) {
     lifecycle(sandbox, &turn, "end", Some("Final result"), None);
 }
 
+/// Codex's native interface decides when it can exit; TJ must not infer that from a rollout.
+fn native_codex_exit(sandbox: &Sandbox, host: &str) {
+    if host == "codex" {
+        assert_eq!(in_agent(sandbox, &["exit-native"]).0, 0);
+    }
+}
+
+fn completion_receipt(sandbox: &Sandbox, launch: &str) -> serde_json::Value {
+    let output = Command::new(env!("CARGO_BIN_EXE_tj"))
+        .args(["receipt", "--launch", launch])
+        .envs(environment(sandbox))
+        .current_dir(&sandbox.root)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    serde_json::from_slice(&output.stdout).unwrap()
+}
+
 fn refused(sandbox: &Sandbox, child: &mut Child, launch: &str) {
     done(sandbox);
     wait_until("closeout never recorded its refusal", || {
@@ -687,6 +705,11 @@ fn codex_final_result_reaches_its_parent_once_and_has_a_durable_receipt() {
     std::thread::sleep(Duration::from_secs(2));
     assert_eq!(messages().len(), 1, "the final result was delivered more than once");
     assert_eq!(in_agent(&sandbox, &["hold", "--release"]).0, 0);
+    wait_until("Codex native exit never became pending", || {
+        completion_receipt(&sandbox, launch)["state"]["kind"] == "attention"
+    });
+    assert_eq!(messages().len(), 1, "waiting for native exit resent the result");
+    native_codex_exit(&sandbox, "codex");
     assert_closed_out(&sandbox, &finish(child, Duration::from_secs(60)), launch);
 }
 
@@ -758,6 +781,7 @@ fn merge_notices_reach_both_hosts_once_per_pr_set_despite_reads_polls_and_later_
         assert!(read_feed(&sandbox, host).contains("Every PR linked"));
         assert_no_prompt_delivery(&sandbox);
         done(&sandbox);
+        native_codex_exit(&sandbox, host);
         let output = finish(child, Duration::from_secs(60));
         assert_closed_out(&sandbox, &output, &launch);
     }
@@ -789,6 +813,7 @@ fn idle_sessions_never_generate_notices_or_prompts() {
             bind(&sandbox, &launch, host, true);
             still_running(&mut child, Duration::from_secs(2));
             done(&sandbox);
+            native_codex_exit(&sandbox, host);
             let output = finish(child, Duration::from_secs(60));
             assert_eq!(output.status.code(), Some(0), "{}", String::from_utf8_lossy(&output.stderr));
             assert!(!sandbox.worktree.exists());
@@ -1021,6 +1046,7 @@ fn incomplete_or_empty_pr_sets_never_produce_a_merge_notice() {
         wait_until("a valid merged PR set never produced a notice", || feed_messages(&sandbox, host).len() == 1);
         assert_no_prompt_delivery(&sandbox);
         done(&sandbox);
+        native_codex_exit(&sandbox, host);
         assert_closed_out(&sandbox, &finish(child, Duration::from_secs(60)), &launch);
     }
 }
@@ -1052,6 +1078,7 @@ fn closes_out_the_worktree_bound_after_launch() {
         });
         set_reply(&sandbox, "agent-store-show.json", &binding.to_string());
         done(&sandbox);
+        native_codex_exit(&sandbox, host);
         let output = finish(child, Duration::from_secs(60));
         assert_closed_out(&sandbox, &output, &launch);
         let store = log(&sandbox, "stubs/agent-store.log");
@@ -1217,10 +1244,21 @@ fn dropping_a_test_wrapper_stops_its_fixture_tree() {
 }
 
 #[test]
-fn codex_closes_out_after_done_and_idle() {
+fn codex_retains_unobservable_native_work_until_a_normal_exit() {
     let sandbox = sandbox();
-    let child = start_host(&sandbox, "idle", "codex");
+    let mut child = start_host(&sandbox, "idle", "codex");
     done(&sandbox);
+    wait_until("Codex retention never became visible", || {
+        completion_receipt(&sandbox, "idle")["state"]["kind"] == "attention"
+    });
+    let receipt = completion_receipt(&sandbox, "idle");
+    assert!(receipt["state"]["reason"].as_str().unwrap().contains("drafts and other native work"));
+    still_running(&mut child, Duration::from_secs(4));
+    assert_eq!(completion_receipt(&sandbox, "idle"), receipt, "polling rewrote the retained completion");
+    assert!(sandbox.worktree.exists());
+    assert!(!log(&sandbox, "dummy.log").contains("graceful"), "TJ sent an exit signal without proof");
+    assert!(!log(&sandbox, "stubs/tj-item.log").contains("--state Done"));
+    native_codex_exit(&sandbox, "codex");
     let output = finish(child, Duration::from_secs(60));
     assert_closed_out(&sandbox, &output, "idle");
 }
@@ -1241,6 +1279,7 @@ fn new_input_cancels_finish_and_explicit_closing_does_not_override_it() {
         still_running(&mut child, Duration::from_secs(2));
         assert!(sandbox.worktree.exists(), "closing overrode missing final report");
         done(&sandbox);
+        native_codex_exit(&sandbox, host);
         let output = finish(child, Duration::from_secs(60));
         assert_closed_out(&sandbox, &output, &launch);
     }
@@ -1257,6 +1296,7 @@ fn explicit_closing_does_not_override_a_keep_open_hold() {
     still_running(&mut child, Duration::from_secs(3));
     assert!(sandbox.worktree.exists(), "closing overrode the keep-open hold");
     assert_eq!(in_agent(&sandbox, &["hold", "--release"]).0, 0);
+    native_codex_exit(&sandbox, "codex");
     assert_closed_out(&sandbox, &finish(child, Duration::from_secs(60)), launch);
 }
 
@@ -1272,6 +1312,7 @@ fn finish_waits_for_the_native_turn_end_however_long_it_takes() {
         assert!(sandbox.worktree.exists(), "finish closed before the native turn ended");
         lifecycle(&sandbox, "still-running", "end", Some("Final result"), None);
         set_turn(&sandbox, true);
+        native_codex_exit(&sandbox, host);
         let output = finish(child, Duration::from_secs(60));
         assert_closed_out(&sandbox, &output, &launch);
     }
@@ -1288,6 +1329,7 @@ fn a_shell_left_running_under_the_agent_keeps_final_result_waiting() {
         still_running(&mut child, Duration::from_secs(6));
         assert!(sandbox.worktree.exists(), "background shell did not keep the final result open");
         assert_eq!(in_agent(&sandbox, &["shell", "stop"]).0, 0);
+        native_codex_exit(&sandbox, host);
         let output = finish(child, Duration::from_secs(60));
         assert_closed_out(&sandbox, &output, &launch);
     }
@@ -1814,19 +1856,20 @@ fn a_failed_exit_preserves_merged_worktrees_without_an_explicit_completion_signa
 
 #[cfg(windows)]
 #[test]
-fn codex_is_stopped_with_a_ctrl_c_keypress() {
+fn codex_normal_exit_cleans_up_a_windows_console() {
     let sandbox = sandbox();
     let child = start(&sandbox, "codex", "codex", "keys", "10");
     wait_for_log(&sandbox, "raw");
     done(&sandbox);
+    native_codex_exit(&sandbox, "codex");
     let output = finish(child, Duration::from_secs(60));
     assert_closed_out(&sandbox, &output, "codex");
-    assert!(log(&sandbox, "dummy.log").contains("graceful"), "the keypress did not reach the agent");
+    assert!(log(&sandbox, "dummy.log").contains("native exit"));
 }
 
 #[cfg(unix)]
 #[test]
-fn tmux_pane_closes_after_codex_is_stopped_with_a_keypress() {
+fn tmux_pane_closes_after_the_user_exits_codex_with_a_keypress() {
     if which::which("tmux").is_err() {
         panic!("tmux is required for the pane test");
     }
@@ -1864,6 +1907,9 @@ fn tmux_pane_closes_after_codex_is_stopped_with_a_keypress() {
     assert!(tmux.arg(script).status().unwrap().success());
     wait_for_log(&sandbox, "raw");
     done(&sandbox);
+    assert!(
+        Command::new("tmux").arg("-S").arg(&socket).args(["send-keys", "-t", "run", "C-c"]).status().unwrap().success()
+    );
     let deadline = Instant::now() + Duration::from_secs(60);
     while Command::new("tmux").arg("-S").arg(&socket).args(["has-session", "-t", "run"]).status().unwrap().success() {
         if Instant::now() > deadline {
@@ -2048,6 +2094,7 @@ fn a_codex_update_is_applied_through_its_app_server() {
     let agent = log(&sandbox, "dummy.log");
     assert_eq!(agent.matches("agent codex-reload Test tab").count(), 1, "the agent restarted: {agent}");
     done(&sandbox);
+    native_codex_exit(&sandbox, "codex");
     let output = finish(child, Duration::from_secs(60));
     assert_closed_out(&sandbox, &output, "codex-reload");
     assert!(!String::from_utf8_lossy(&output.stderr).contains("could not update codex"), "{output:?}");
@@ -2183,6 +2230,7 @@ fn closes_out_all_owned_worktrees_across_repositories() {
         let child = spawn(&sandbox, &arguments, &sandbox.root);
         wait_for_log(&sandbox, if keys { "raw" } else { "agent " });
         done(&sandbox);
+        native_codex_exit(&sandbox, host);
         let output = finish(child, Duration::from_secs(120));
         assert_closed_out(&sandbox, &output, &launch);
         assert!(!extra.exists());
@@ -2281,6 +2329,7 @@ fn recovered_done_from_primary_removes_predecessor_claims_with_original_identity
             &serde_json::json!({"ok": true, "data": {"launch": {"item": item}, "session": {}}}).to_string(),
         );
         done(&sandbox);
+        native_codex_exit(&sandbox, host);
         let output = finish(child, Duration::from_secs(120));
         assert_closed_out(&sandbox, &output, &launch);
         assert!(git(&sandbox.primary, &["branch", "--list", "Feature/1"]).is_empty());
@@ -2732,6 +2781,7 @@ fn native_daemon_idle_grace_finishes_when_the_provider_unloads() {
     let state = |state| serde_json::json!({"session":"codex:sess-1", "launch_id":launch, "state":state}).to_string();
     set_reply(&sandbox, "tj-session-liveness.json", &state("live"));
     done(&sandbox);
+    native_codex_exit(&sandbox, "codex");
     wait_until("wrapper never checked native teardown", || !log(&sandbox, "stubs/tj-session.log").is_empty());
     let next = sandbox.stubs.join("native-unloaded.json");
     std::fs::write(&next, state("dead")).unwrap();
