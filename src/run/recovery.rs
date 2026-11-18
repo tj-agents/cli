@@ -194,7 +194,6 @@ pub fn bind(args: BindArgs) -> Result<ExitCode> {
     if row["launch_id"].as_str() != Some(args.launch_id.as_str())
         || row["host"].as_str() != Some("claude")
         || row["state"].as_str() != Some("active")
-        || Host::from_ancestry(&chain[native..at]) != Some(Host::Claude)
         || agent::started_at(pid)?.map(super::rfc3339).as_deref() != Some(started)
     {
         bail!("replacement launch does not match the calling native process");
