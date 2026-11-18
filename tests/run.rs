@@ -1532,6 +1532,44 @@ fn recovery_admission(sandbox: &Sandbox, host: &str, native_state: &str, live_wr
 }
 
 #[test]
+fn public_resume_accepts_an_interpreter_only_when_native_inventory_proves_its_pid() {
+    let sandbox = sandbox();
+    recovery_admission(&sandbox, "claude", "live", false);
+    let child = start(&sandbox, "resumed", "claude", "ignore", "10");
+    let pid =
+        log(&sandbox, "dummy.log").lines().find_map(|line| line.strip_prefix("pid ")?.parse::<u32>().ok()).unwrap();
+    let arguments = [
+        "_resume-bind",
+        "--session",
+        &format!("claude:{PREBOUND}"),
+        "--launch-id",
+        "resumed",
+        "--from-launch-id",
+        "prior",
+    ];
+    for processes in [serde_json::json!([pid, child.id()]), serde_json::json!([pid])] {
+        set_reply(
+            &sandbox,
+            "tj-session-liveness.json",
+            &serde_json::json!({
+                "session": format!("claude:{PREBOUND}"), "launch_id":"prior",
+                "state":"live", "process_ids": processes,
+            })
+            .to_string(),
+        );
+        let (code, detail) = in_agent(&sandbox, &arguments);
+        if processes.as_array().unwrap().len() == 1 {
+            assert_eq!(code, 0, "{detail}");
+            assert!(log(&sandbox, "stubs/agent-store.log").contains("resume --session"));
+        } else {
+            assert_ne!(code, 0, "{detail}");
+            assert!(!log(&sandbox, "stubs/agent-store.log").contains("resume --session"));
+        }
+    }
+    drop(child);
+}
+
+#[test]
 fn recovery_admits_the_source_before_native_execution_for_both_hosts() {
     for host in ["claude", "codex"] {
         let sandbox = sandbox();
