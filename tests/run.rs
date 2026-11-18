@@ -1650,6 +1650,103 @@ fn a_prebound_native_codex_session_registers_and_verifies_before_spawning() {
     assert!(!store.contains("--reason not_started"), "{store}");
 }
 
+fn recovery_admission(sandbox: &Sandbox, host: &str, native_state: &str, live_wrapper: bool) -> Vec<String> {
+    let mut arguments = prebound_arguments(sandbox, "resumed");
+    let host_index = arguments.iter().position(|value| value == "--host").unwrap() + 1;
+    arguments[host_index] = host.to_owned();
+    let session_index = arguments.iter().position(|value| value == "--session").unwrap() + 1;
+    arguments[session_index] = format!("{host}:{PREBOUND}");
+    let separator = arguments.iter().position(|value| value == "--").unwrap();
+    if host == "claude" {
+        let source = Path::new(&arguments[separator + 1]);
+        let native = source.with_file_name(if cfg!(windows) { "claude.exe" } else { "claude" });
+        std::fs::rename(source, &native).unwrap();
+        arguments.splice(
+            separator + 1..,
+            [
+                native.to_string_lossy().into_owned(),
+                "--resume".into(),
+                PREBOUND.into(),
+                "--name".into(),
+                "Test tab".into(),
+            ],
+        );
+    }
+    arguments.splice(separator..separator, ["--resume-from".into(), "prior".into()]);
+    let started = if live_wrapper {
+        let actual: chrono::DateTime<chrono::Utc> =
+            tj_cli::process::agent::started_at(std::process::id()).unwrap().unwrap().into();
+        actual.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+    } else {
+        "2026-01-01T00:00:00Z".to_owned()
+    };
+    let wrapper = serde_json::json!({"pid":std::process::id(),"started_at":started});
+    set_reply(
+        sandbox,
+        "agent-store-prebind.json",
+        &serde_json::json!({"session":PREBOUND,"host":host,"resume_from":"prior"}).to_string(),
+    );
+    set_reply(sandbox, "agent-store-prebind-source.json", &serde_json::json!({
+        "launch":{"launch_id":"prior","host":host,"session":format!("{host}:{PREBOUND}"),"state":"active","wrapper":wrapper},
+        "session":{"session":format!("{host}:{PREBOUND}"),"host":host,"native_id":PREBOUND,"launch_id":"prior","state":"active","wrapper":wrapper}
+    }).to_string());
+    set_reply(
+        sandbox,
+        "tj-session-liveness.json",
+        &serde_json::json!({"session":format!("{host}:{PREBOUND}"),"launch_id":"prior","state":native_state})
+            .to_string(),
+    );
+    arguments
+}
+
+#[test]
+fn recovery_admits_the_source_before_native_execution_for_both_hosts() {
+    for host in ["claude", "codex"] {
+        let sandbox = sandbox();
+        let arguments = recovery_admission(&sandbox, host, "dead", false);
+        let output = finish(spawn(&sandbox, &arguments, &sandbox.root), Duration::from_secs(30));
+        assert!(!output.status.success());
+        let log = log(&sandbox, "stubs/agent-store.log");
+        let resume = log
+            .find(&format!("resume --session {host}:{PREBOUND} --from-launch-id prior --launch-id resumed"))
+            .expect(&log);
+        let registered = log.find(&format!("register --session {host}:{PREBOUND}")).expect(&log);
+        assert!(resume < registered, "{log}");
+        assert!(log.contains("end --launch-id resumed --reason exited"), "{log}");
+        assert!(!log.contains("release-worktree") && !log.contains("end --launch-id prior"), "{log}");
+    }
+}
+
+#[test]
+fn recovery_rejects_a_live_or_unknown_predecessor_before_creating_a_launch() {
+    for (native, wrapper) in [("live", false), ("unknown", false), ("dead", true)] {
+        let sandbox = sandbox();
+        let arguments = recovery_admission(&sandbox, "codex", native, wrapper);
+        let output = finish(spawn(&sandbox, &arguments, &sandbox.root), Duration::from_secs(30));
+        assert!(!output.status.success());
+        let log = log(&sandbox, "stubs/agent-store.log");
+        assert!(!log.contains("launch --launch-id") && !log.contains("resume --session"), "{log}");
+        assert!(!log.contains("set-open") && !log.contains("end --launch-id"), "{log}");
+    }
+}
+
+#[test]
+fn a_losing_recovery_never_spawns_or_changes_the_predecessor() {
+    let sandbox = sandbox();
+    let arguments = recovery_admission(&sandbox, "codex", "dead", false);
+    set_reply(
+        &sandbox,
+        "agent-store-resume.json",
+        r#"{"ok":false,"error":{"code":"conflict","message":"predecessor changed"}}"#,
+    );
+    let output = finish(spawn(&sandbox, &arguments, &sandbox.root), Duration::from_secs(30));
+    assert!(!output.status.success());
+    let log = log(&sandbox, "stubs/agent-store.log");
+    assert!(log.contains("end --launch-id resumed --reason not_started"), "{log}");
+    assert!(!log.contains("register --session") && !log.contains("--reason exited"), "{log}");
+    assert!(!log.contains("set-open") && !log.contains("end --launch-id prior"), "{log}");
+}
+
 #[test]
 fn prebound_receipt_identifies_only_the_verified_frontend() {
     let sandbox = sandbox();

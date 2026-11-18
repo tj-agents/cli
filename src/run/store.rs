@@ -53,8 +53,9 @@ pub fn launch(launch: &Launch, parent: Option<&str>, wrapper_pid: u32, wrapper_s
     call(&arguments).map(drop)
 }
 
-pub fn recorded(launch_id: &str) -> bool {
-    call(&["show", "--launch-id", launch_id]).is_ok()
+pub fn recorded_for(launch: &Launch, wrapper_pid: u32, wrapper_started_at: &str) -> bool {
+    call(&["show", "--launch-id", &launch.id])
+        .is_ok_and(|data| exact_launch(&data, launch, wrapper_pid, wrapper_started_at).is_ok())
 }
 
 fn text<'a>(value: &'a Value, field: &str) -> Result<&'a str> {
@@ -85,7 +86,9 @@ pub(super) fn exact_launch(data: &Value, launch: &Launch, wrapper_pid: u32, wrap
 
 /// `session` is the session row; agent-store's `show <handle>` returns it without a launch row.
 fn exact_session(session: &Value, launch: &Launch, handle: &str) -> Result<()> {
-    let native_id = handle.strip_prefix("codex:").context("prebound session is not codex")?;
+    let native_id = handle
+        .strip_prefix(&format!("{}:", launch.host.name()))
+        .context("prebound session does not match the launch host")?;
     if text(session, "session")? != handle
         || text(session, "native_id")? != native_id
         || text(session, "host")? != launch.host.name()
