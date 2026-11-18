@@ -12,8 +12,6 @@ use tokio::sync::{mpsc as async_mpsc, oneshot};
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::{self, Message};
 
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
-
 /// A host CLI run without a console window, so a detached caller never flashes one.
 pub(crate) fn host_command(program: &str) -> anyhow::Result<Command> {
     let executable = which::which(program).with_context(|| format!("`{program}` is not on PATH"))?;
@@ -67,12 +65,6 @@ pub(crate) struct Server {
 }
 
 impl Server {
-    pub(crate) fn connect() -> Result<Self, Error> {
-        let mut command = host_command("codex").map_err(Error::Host)?;
-        command.args(["app-server", "proxy"]);
-        Self::connect_command(command, REQUEST_TIMEOUT)
-    }
-
     pub(crate) fn connect_socket(socket: &std::path::Path) -> Result<Self, Error> {
         let mut command = host_command("codex").map_err(Error::Host)?;
         command.args(["app-server", "proxy", "--sock"]).arg(socket);

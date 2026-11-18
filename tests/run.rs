@@ -2061,9 +2061,11 @@ fn each_claude_update_is_applied_to_an_idle_claude_in_place_once() {
 }
 
 #[test]
-fn a_codex_update_is_applied_through_its_app_server() {
+fn a_managed_codex_update_stays_unverified_without_reloading_an_unrelated_daemon() {
     let sandbox = sandbox();
     let codex = fake_codex(&sandbox);
+    let diagnostic = "plugin activation remains unverified until a native restart";
+    let stderr_path = sandbox.root.join("wrapper-stderr.log");
     set_reply(&sandbox, "agent-store-show.json", BOUND);
     let keys = cfg!(windows);
     let arguments = with_prompt(&sandbox, "codex-reload", "codex", if keys { "keys" } else { "signal" });
@@ -2075,32 +2077,28 @@ fn a_codex_update_is_applied_through_its_app_server() {
         .env("FAKE_CODEX_LOG", &codex)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .stderr(std::fs::File::create(&stderr_path).unwrap());
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
         command.creation_flags(0x0800_0000);
     }
-    let child = Child::new(command.spawn().unwrap(), &sandbox);
+    let mut child = Child::new(command.spawn().unwrap(), &sandbox);
     wait_for_log(&sandbox, if keys { "raw" } else { "agent " });
     publish(&sandbox, "codex", "plugins b");
-    wait_until("the Codex app-server was never asked to take the update", || {
-        std::fs::read_to_string(&codex).unwrap_or_default().contains(r#""reloadUserConfig": true"#)
+    wait_until("the wrapper never reported the unavailable native reload", || {
+        std::fs::read_to_string(&stderr_path).unwrap_or_default().contains(diagnostic)
     });
-    wait_until("the Codex WebSocket peer never completed both fragmented replies", || {
-        std::fs::read_to_string(&codex).unwrap_or_default().matches(r#""websocket": "masked-pong""#).count() == 2
-    });
-    let wire = std::fs::read_to_string(&codex).unwrap();
-    assert!(wire.contains(r#""websocket": "upgrade""#), "no HTTP upgrade: {wire}");
-    assert!(wire.contains(r#""proxy": "initialized""#), "initialization was not completed: {wire}");
-    assert_eq!(wire.matches(r#""websocket": "masked-text""#).count(), 3, "{wire}");
+    still_running(&mut child, Duration::from_millis(500));
+    assert!(!codex.exists(), "the wrapper contacted a shared daemon that does not own its native engine");
     let agent = log(&sandbox, "dummy.log");
     assert_eq!(agent.matches("agent codex-reload Test tab").count(), 1, "the agent restarted: {agent}");
     done(&sandbox);
     native_codex_exit(&sandbox, "codex");
     let output = finish(child, Duration::from_secs(60));
     assert_closed_out(&sandbox, &output, "codex-reload");
-    assert!(!String::from_utf8_lossy(&output.stderr).contains("could not update codex"), "{output:?}");
+    let stderr = std::fs::read_to_string(&stderr_path).unwrap();
+    assert_eq!(stderr.matches(diagnostic).count(), 1, "{stderr}");
 }
 
 #[test]
