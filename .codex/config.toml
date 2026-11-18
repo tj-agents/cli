@@ -19,13 +19,22 @@ enabled = true
 [plugins."cli@tj-agents"]
 enabled = true
 
+[plugins."docs@tj-agents"]
+enabled = true
+
 [plugins."engineering@tj-agents"]
+enabled = true
+
+[plugins."github@tj-agents"]
 enabled = true
 
 [plugins."personal@tj-agents"]
 enabled = true
 
 [plugins."python@tj-agents"]
+enabled = true
+
+[plugins."skill@tj-agents"]
 enabled = true
 
 [plugins."template@tj-agents"]

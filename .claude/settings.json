@@ -4,8 +4,7 @@
       "source": {
         "source": "github",
         "repo": "tj-agents/marketplace"
-      },
-      "autoUpdate": true
+      }
     }
   },
   "enabledPlugins": {
@@ -13,13 +12,22 @@
     "agent@tj-agents": true,
     "base@tj-agents": true,
     "cli@tj-agents": true,
+    "docs@tj-agents": true,
     "engineering@tj-agents": true,
+    "github@tj-agents": true,
     "personal@tj-agents": true,
     "python@tj-agents": true,
+    "skill@tj-agents": true,
     "template@tj-agents": true,
     "workflow@tj-agents": true
   },
   "permissions": {
-    "allow": []
+    "allow": [],
+    "deny": [
+      "Bash(tj approve:*)",
+      "Bash(tj-approve:*)",
+      "PowerShell(tj approve:*)",
+      "PowerShell(tj-approve:*)"
+    ]
   }
 }
