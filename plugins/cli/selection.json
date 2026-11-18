@@ -1,6 +1,8 @@
 {
   "plugin": "cli",
-  "dependencies": [],
+  "dependencies": [
+    "tj-agents/base"
+  ],
   "profiles": {
     "core": [
       "cd",
