@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "merge": {
+    "approval": "none",
+    "merge": "agents",
+    "default_branch_push": "none",
+    "required_checks": [
+      "test (ubuntu-latest)",
+      "test (windows-latest)"
+    ]
+  }
+}
