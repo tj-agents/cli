@@ -1,7 +1,7 @@
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child as ProcessChild, Command, Output, Stdio};
-use std::sync::{Condvar, Mutex};
+use std::sync::{Condvar, Mutex, mpsc};
 use std::thread::ThreadId;
 use std::time::{Duration, Instant};
 
@@ -2133,33 +2133,238 @@ fn only_the_tabs_own_agent_can_request_finish() {
     assert_closed_out(&sandbox, &output, "owned");
 }
 
-#[cfg(windows)]
+/// Run the real CLI adapter against the dummy Claude binding; never start a native provider.
+struct NativeAdapter {
+    child: ProcessChild,
+    session: String,
+    requests: mpsc::Receiver<Result<serde_json::Value, String>>,
+    reader: Option<std::thread::JoinHandle<()>>,
+}
+
+impl NativeAdapter {
+    fn command(sandbox: &Sandbox, session: &str, arguments: &[&str]) -> Command {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_tj"));
+        command
+            .args(arguments)
+            .envs(environment(sandbox))
+            .env("CLAUDECODE", "1")
+            .env("CLAUDE_CODE_SESSION_ID", session.strip_prefix("claude:").unwrap())
+            .env_remove("CODEX_THREAD_ID")
+            .current_dir(&sandbox.root);
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            command.creation_flags(0x0800_0000);
+        }
+        command
+    }
+
+    fn start(sandbox: &Sandbox) -> Self {
+        let session = native_session(sandbox);
+        let mut child = Self::command(sandbox, &session, &["_native-host", "--session", &session])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(std::fs::File::create(sandbox.root.join("native-adapter-stderr.log")).unwrap())
+            .spawn()
+            .unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let (sender, requests) = mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            for line in BufReader::new(stdout).lines() {
+                let parsed = line
+                    .map_err(|error| error.to_string())
+                    .and_then(|line| serde_json::from_str(&line).map_err(|error| error.to_string()));
+                let failed = parsed.is_err();
+                if sender.send(parsed).is_err() || failed {
+                    break;
+                }
+            }
+        });
+        // Own the process before readiness assertions so a failure also cleans up its reader.
+        let mut adapter = Self { child, session, requests, reader: Some(reader) };
+        let lease = sandbox.root.join("state/native").join(adapter.session.replace(':', "-")).join("host.lock");
+        wait_until("native adapter never acquired its lease", || {
+            assert!(
+                adapter.child.try_wait().unwrap().is_none(),
+                "native adapter exited: {}",
+                log(sandbox, "native-adapter-stderr.log")
+            );
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&lease)
+                .is_ok_and(|file| matches!(fs4::FileExt::try_lock(&file), Err(fs4::TryLockError::WouldBlock)))
+        });
+        adapter
+    }
+
+    fn request(&self) -> serde_json::Value {
+        self.requests.recv_timeout(Duration::from_secs(30)).expect("native reload never reached the adapter").unwrap()
+    }
+
+    fn assert_quiet(&self) {
+        assert!(
+            matches!(self.requests.recv_timeout(Duration::from_secs(4)), Err(mpsc::RecvTimeoutError::Timeout)),
+            "the native adapter emitted another request or stopped"
+        );
+    }
+
+    fn receipt(&self, sandbox: &Sandbox, request: &serde_json::Value) {
+        assert_eq!(request["session"], self.session);
+        let result = serde_json::json!({"completed":true, "output":{"text":"Reloaded fixture plugins"}});
+        let output = Self::command(
+            sandbox,
+            &self.session,
+            &[
+                "_native-receipt",
+                "--session",
+                &self.session,
+                "--request",
+                request["id"].as_str().unwrap(),
+                "--lease",
+                request["lease"].as_str().unwrap(),
+                "--result",
+                &result.to_string(),
+            ],
+        )
+        .output()
+        .unwrap();
+        assert!(output.status.success(), "native receipt: {}", String::from_utf8_lossy(&output.stderr));
+    }
+}
+
+impl Drop for NativeAdapter {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        if let Some(reader) = self.reader.take() {
+            let _ = reader.join();
+        }
+    }
+}
+
+fn native_records(sandbox: &Sandbox) -> Vec<serde_json::Value> {
+    let path = sandbox.root.join("state/native").join(native_session(sandbox).replace(':', "-")).join("requests.jsonl");
+    let text = std::fs::read_to_string(path).unwrap_or_default();
+    let Some((complete, _)) = text.rsplit_once('\n') else { return Vec::new() };
+    complete.lines().map(|line| serde_json::from_str(line).unwrap()).collect()
+}
+
 #[test]
-fn each_claude_update_is_applied_to_an_idle_claude_in_place_once() {
+fn each_claude_update_uses_one_native_request_and_waits_for_its_completion_receipt() {
     let sandbox = sandbox();
     set_reply(&sandbox, "agent-store-show.json", BOUND);
-    let child = spawn(&sandbox, &with_prompt(&sandbox, "plugins", "claude", "keys"), &sandbox.root);
-    wait_for_log(&sandbox, "raw");
+    let mode = if cfg!(windows) { "keys" } else { "signal" };
+    let child = spawn(&sandbox, &with_prompt(&sandbox, "plugins", "claude", mode), &sandbox.root);
+    wait_for_log(&sandbox, if cfg!(windows) { "raw" } else { "agent " });
+    let adapter = NativeAdapter::start(&sandbox);
     set_status(&sandbox, "busy");
-    publish(&sandbox, "claude", "plugins b");
-    std::thread::sleep(Duration::from_secs(4));
-    assert!(!log(&sandbox, "dummy.log").contains("typed"), "typed into a turn that never ended");
+    let commit = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    publish(&sandbox, "claude", commit);
+    let first_publication = log(&sandbox, "cache/published/claude");
+    adapter.assert_quiet();
+    assert!(
+        !native_records(&sandbox).iter().any(|record| record["kind"] == "request"),
+        "reload was queued during a busy turn"
+    );
+    assert_no_prompt_delivery(&sandbox);
     set_status(&sandbox, "idle");
-    wait_for_log(&sandbox, "typed /reload-plugins");
+    let first = adapter.request();
+    assert_eq!(first["operation"], "reload_plugins");
+    assert_eq!(first["session"], native_session(&sandbox));
+    assert_eq!(first["revision"], first_publication);
+    assert!(!first["lease"].as_str().unwrap().is_empty());
+    adapter.assert_quiet();
+    let pending = native_records(&sandbox);
+    assert_eq!(pending.iter().filter(|record| record["kind"] == "request").count(), 1);
+    assert!(!pending.iter().any(|record| record["kind"] == "receipt"), "completion was invented");
+    adapter.receipt(&sandbox, &first);
+    adapter.assert_quiet();
     publish(&sandbox, "codex", "plugins c");
-    std::thread::sleep(Duration::from_secs(4));
-    assert_eq!(log(&sandbox, "dummy.log").matches("typed /reload-plugins").count(), 1, "a Codex update reached Claude");
-    publish(&sandbox, "claude", "plugins b");
-    wait_until("a second Claude update of the same plugins was skipped", || {
-        log(&sandbox, "dummy.log").matches("typed /reload-plugins").count() == 2
-    });
-    std::thread::sleep(Duration::from_secs(4));
+    adapter.assert_quiet();
+    assert_eq!(native_records(&sandbox).iter().filter(|record| record["kind"] == "request").count(), 1);
+    assert_eq!(log(&sandbox, "cache/published/claude"), first_publication, "Codex changed Claude's publication");
+    publish(&sandbox, "claude", commit);
+    let second_publication = log(&sandbox, "cache/published/claude");
+    assert_eq!(first_publication.lines().next(), second_publication.lines().next());
+    assert_ne!(first_publication, second_publication, "a second publish reused its stamp");
+    let second = adapter.request();
+    assert_eq!(second["operation"], "reload_plugins");
+    assert_eq!(second["session"], first["session"]);
+    assert_eq!(second["revision"], second_publication);
+    assert_ne!(second["id"], first["id"], "a distinct publication reused the completed request");
+    adapter.assert_quiet();
+    assert_eq!(native_records(&sandbox).iter().filter(|record| record["kind"] == "receipt").count(), 1);
+    adapter.receipt(&sandbox, &second);
+    adapter.assert_quiet();
+    let records = native_records(&sandbox);
+    assert_eq!(records.iter().filter(|record| record["kind"] == "request").count(), 2);
+    assert_eq!(records.iter().filter(|record| record["kind"] == "receipt").count(), 2);
+    assert!(!sandbox.root.join("state/messages").exists(), "reload polluted the message binding journal");
+    assert_no_prompt_delivery(&sandbox);
     let agent = log(&sandbox, "dummy.log");
-    assert_eq!(agent.matches("typed /reload-plugins").count(), 2, "{agent}");
     assert_eq!(agent.matches("agent plugins Test tab").count(), 1, "the agent restarted: {agent}");
     done(&sandbox);
     let output = finish(child, Duration::from_secs(60));
     assert_closed_out(&sandbox, &output, "plugins");
+}
+
+#[test]
+fn missing_claude_adapter_or_completion_receipt_never_applies_or_types_an_update() {
+    for claimed in [false, true] {
+        let sandbox = sandbox();
+        set_reply(&sandbox, "agent-store-show.json", BOUND);
+        let launch = if claimed { "reload-unverified" } else { "reload-unavailable" };
+        let mode = if cfg!(windows) { "keys" } else { "signal" };
+        let stderr_path = sandbox.root.join("wrapper-stderr.log");
+        let mut command = Command::new(env!("CARGO_BIN_EXE_tj"));
+        command
+            .args(with_prompt(&sandbox, launch, "claude", mode))
+            .envs(environment(&sandbox))
+            .current_dir(&sandbox.root)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(std::fs::File::create(&stderr_path).unwrap());
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            command.creation_flags(0x0800_0000);
+        }
+        let child = Child::new(command.spawn().unwrap(), &sandbox);
+        wait_for_log(&sandbox, if cfg!(windows) { "raw" } else { "agent " });
+        let adapter = claimed.then(|| NativeAdapter::start(&sandbox));
+        set_status(&sandbox, "idle");
+        publish(&sandbox, "claude", "plugins without a completion receipt");
+        if let Some(adapter) = adapter {
+            let request = adapter.request();
+            assert_eq!(request["operation"], "reload_plugins");
+            adapter.assert_quiet();
+            // A wrapper that marked the publication applied before completion will stop checking
+            // and fail to report the missing receipt after the adapter disappears.
+            drop(adapter);
+        }
+        let diagnostic = if claimed { "activation remains unverified" } else { "native adapter is unavailable" };
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let stderr = std::fs::read_to_string(&stderr_path).unwrap_or_default();
+            if stderr.contains(diagnostic) {
+                break;
+            }
+            assert!(Instant::now() < deadline, "missing {diagnostic:?}: {stderr}");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let records = native_records(&sandbox);
+        assert_eq!(records.iter().filter(|record| record["kind"] == "request").count(), usize::from(claimed));
+        assert!(!records.iter().any(|record| record["kind"] == "receipt"));
+        assert_no_prompt_delivery(&sandbox);
+        let agent = log(&sandbox, "dummy.log");
+        assert_eq!(agent.matches(&format!("agent {launch} Test tab")).count(), 1, "the agent restarted: {agent}");
+        done(&sandbox);
+        let output = finish(child, Duration::from_secs(60));
+        let stderr = std::fs::read_to_string(&stderr_path).unwrap();
+        assert!(stderr.contains(diagnostic), "missing {diagnostic:?}: {stderr}");
+        assert_closed_out(&sandbox, &output, launch);
+    }
 }
 
 #[test]

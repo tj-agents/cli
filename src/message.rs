@@ -4,10 +4,9 @@ use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 
 use crate::feed::{self, Feed};
-use crate::{host::Host, paths, run::store};
+use crate::{host::Host, native_bridge, paths, run::store};
 
 mod binding;
-pub(crate) mod bridge;
 
 #[derive(clap::Args)]
 pub(crate) struct Args {
@@ -101,7 +100,12 @@ pub(crate) fn send(
         }),
     )?;
     if native {
-        return bridge::send(from.context("native message needs a source session")?, &target.handle(), text, event);
+        return native_bridge::send(
+            from.context("native message needs a source session")?,
+            &target.handle(),
+            text,
+            event,
+        );
     }
     let at = chrono::Local::now().format("%Y-%m-%d %H:%M").to_string();
     Feed::new(&feed::folder()?, &target.handle())?

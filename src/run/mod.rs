@@ -813,10 +813,15 @@ fn supervise(
         let due = if finishing { None } else { update::due(&mut watcher, host, agent.pid(), graces) };
         match due {
             Some(update::gate::Apply::Plugins) => {
-                let revision = watcher.revision();
-                match host.apply() {
-                    Ok(()) => watcher.applied(revision),
-                    Err(error) => watch.report(format!("could not update {}: {error}", watch.launch.host.name())),
+                let Some(revision) = watcher.revision() else { continue };
+                match host.apply(&watch.launch, &revision) {
+                    Ok(true) => watcher.applied(Some(revision)),
+                    Ok(false) => {}
+                    Err(error) => watch.report(format!(
+                        "could not update {}: {:#}",
+                        watch.launch.host.name(),
+                        anyhow::Error::new(error)
+                    )),
                 }
             }
             Some(update::gate::Apply::Binary) => {

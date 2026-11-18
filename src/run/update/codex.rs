@@ -1,5 +1,6 @@
 use super::gate::Activity;
 use super::{ApplyError, Update};
+use crate::run::Launch;
 
 /// Managed Codex owns an embedded engine that the shared daemon cannot reload.
 pub(crate) struct Codex;
@@ -9,7 +10,7 @@ impl Update for Codex {
         Activity::Unknown
     }
 
-    fn apply(&self) -> Result<(), ApplyError> {
+    fn apply(&self, _launch: &Launch, _revision: &str) -> Result<bool, ApplyError> {
         Err(ApplyError::NativeReloadUnavailable)
     }
 }
