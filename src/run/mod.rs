@@ -9,7 +9,7 @@ pub mod update;
 
 use std::collections::HashSet;
 use std::ffi::{OsStr, OsString};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 use std::sync::{Mutex, PoisonError};
@@ -527,6 +527,9 @@ fn mark_closed(launch_id: &str) {
 pub fn run(args: Args) -> Result<ExitCode> {
     let launch = launch(&args)?;
     let prebound = prebound_session(&args, &launch)?;
+    if prebound.is_some() {
+        require_native_image(Path::new(&args.agent[0]))?;
+    }
     if args.resume_from.as_deref() == Some(launch.id.as_str()) {
         bail!("recovery must create a new launch");
     }
@@ -538,6 +541,20 @@ pub fn run(args: Args) -> Result<ExitCode> {
         mark_open(&id, false);
     }
     result
+}
+
+fn require_native_image(path: &Path) -> Result<()> {
+    let mut header = [0; 4];
+    std::fs::File::open(path)
+        .and_then(|mut file| file.read_exact(&mut header))
+        .context("cannot inspect the prepared native executable")?;
+    let native = if cfg!(windows) { header.starts_with(b"MZ") } else { header == *b"\x7fELF" };
+    if !native {
+        bail!(
+            "prepared sessions require a native executable, not an interpreter launcher; resolve the provider's vendored binary"
+        );
+    }
+    Ok(())
 }
 
 fn supervise(args: &Args, launch: Launch, prebound: Option<&PreboundSession>, admitted: &mut bool) -> Result<ExitCode> {

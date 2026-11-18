@@ -1513,6 +1513,18 @@ fn repository_preparation_failure_warns_and_still_starts_the_agent() {
 }
 
 #[test]
+fn a_prebound_session_rejects_interpreter_launchers_before_recording() {
+    let sandbox = sandbox();
+    let arguments = prebound_arguments(&sandbox, "script-refused");
+    let separator = arguments.iter().position(|argument| argument == "--").unwrap();
+    std::fs::write(&arguments[separator + 1], "#!/usr/bin/env node\nprocess.exit(0);\n").unwrap();
+    let output = finish(spawn(&sandbox, &arguments, &sandbox.root), Duration::from_secs(30));
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("require a native executable"));
+    assert!(!log(&sandbox, "stubs/agent-store.log").contains("launch --"));
+}
+
+#[test]
 fn a_prebound_native_codex_session_registers_and_verifies_before_spawning() {
     let sandbox = sandbox();
     prebind(&sandbox, false);

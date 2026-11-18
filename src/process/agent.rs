@@ -98,13 +98,14 @@ pub struct ChildIdentity {
 }
 
 pub fn direct_children(pid: u32) -> io::Result<Vec<ChildIdentity>> {
-    children_from(os::processes()?, pid, os::started_at)
+    children_from(os::processes()?, pid, os::started_at, os::processes)
 }
 
 fn children_from(
     table: HashMap<u32, (u32, String)>,
     pid: u32,
     mut read_started: impl FnMut(u32) -> io::Result<Option<SystemTime>>,
+    read_current: impl FnOnce() -> io::Result<HashMap<u32, (u32, String)>>,
 ) -> io::Result<Vec<ChildIdentity>> {
     let parent_started =
         read_started(pid)?.ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "parent process is not running"))?;
@@ -117,6 +118,14 @@ fn children_from(
             && started_at >= parent_started
         {
             children.push(ChildIdentity { pid: child, image, started_at });
+        }
+    }
+    let current = read_current()?;
+    for child in &children {
+        if current.get(&child.pid) != Some(&(pid, child.image.clone()))
+            || read_started(child.pid)? != Some(child.started_at)
+        {
+            return Err(io::Error::new(io::ErrorKind::NotFound, "child process identity or ancestry changed"));
         }
     }
     if read_started(pid)? != Some(parent_started) {
@@ -248,7 +257,7 @@ mod tests {
 
     #[test]
     fn direct_children_exclude_reused_parent_links_and_exited_processes() {
-        let table = [
+        let table: std::collections::HashMap<_, _> = [
             (2, (1, "old.exe".to_owned())),
             (3, (1, "codex.exe".to_owned())),
             (4, (3, "shell.exe".to_owned())),
@@ -256,14 +265,20 @@ mod tests {
         ]
         .into_iter()
         .collect();
-        let children = children_from(table, 1, |pid| {
-            Ok(match pid {
-                1 => Some(UNIX_EPOCH + Duration::from_secs(20)),
-                2 => Some(UNIX_EPOCH + Duration::from_secs(10)),
-                3 => Some(UNIX_EPOCH + Duration::from_nanos(30_123_456_700)),
-                _ => None,
-            })
-        })
+        let current = table.clone();
+        let children = children_from(
+            table,
+            1,
+            |pid| {
+                Ok(match pid {
+                    1 => Some(UNIX_EPOCH + Duration::from_secs(20)),
+                    2 => Some(UNIX_EPOCH + Duration::from_secs(10)),
+                    3 => Some(UNIX_EPOCH + Duration::from_nanos(30_123_456_700)),
+                    _ => None,
+                })
+            },
+            || Ok(current),
+        )
         .unwrap();
         assert_eq!(children.len(), 1);
         assert_eq!(children[0].pid, 3);
@@ -274,25 +289,43 @@ mod tests {
     fn direct_children_refuse_unobservable_children_or_a_changed_parent() {
         let table = || [(3, (1, "codex.exe".to_owned()))].into_iter().collect();
         assert!(
-            children_from(table(), 1, |pid| {
-                if pid == 3 {
-                    Err(io::Error::new(io::ErrorKind::PermissionDenied, "unobservable child"))
-                } else {
-                    Ok(Some(UNIX_EPOCH))
-                }
-            })
+            children_from(
+                table(),
+                1,
+                |pid| {
+                    if pid == 3 {
+                        Err(io::Error::new(io::ErrorKind::PermissionDenied, "unobservable child"))
+                    } else {
+                        Ok(Some(UNIX_EPOCH))
+                    }
+                },
+                || Ok(table())
+            )
             .is_err()
         );
         let mut reads = 0;
         assert!(
-            children_from(table(), 1, |pid| {
-                if pid == 1 {
-                    reads += 1;
-                }
-                Ok((reads < 2).then_some(UNIX_EPOCH))
-            })
+            children_from(
+                table(),
+                1,
+                |pid| {
+                    if pid == 1 {
+                        reads += 1;
+                    }
+                    Ok((reads < 2).then_some(UNIX_EPOCH))
+                },
+                || Ok(table())
+            )
             .is_err()
         );
+    }
+
+    #[test]
+    fn direct_children_refuse_pid_reuse_between_the_table_and_creation_time_reads() {
+        let table = [(3, (1, "codex".to_owned()))].into_iter().collect();
+        let current = [(3, (99, "codex".to_owned()))].into_iter().collect();
+        let read = |pid| Ok(Some(UNIX_EPOCH + Duration::from_secs(u64::from(pid))));
+        assert!(children_from(table, 1, read, || Ok(current)).is_err());
     }
 
     #[test]
