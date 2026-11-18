@@ -1573,7 +1573,7 @@ fn repository_preparation_failure_blocks_native_launch_for_both_hosts() {
 }
 
 #[test]
-fn repository_preparation_failure_closes_only_the_existing_successor_open_flag() {
+fn repository_preparation_failure_retains_the_existing_successor_for_recovery() {
     for host in ["claude", "codex"] {
         let sandbox = sandbox();
         select_tj_agents_checked(&sandbox);
@@ -1583,9 +1583,11 @@ fn repository_preparation_failure_closes_only_the_existing_successor_open_flag()
         arguments.insert(separator, "--successor".to_owned());
         let output = finish(spawn(&sandbox, &arguments, &sandbox.root), Duration::from_secs(30));
         assert!(!output.status.success());
-        assert!(String::from_utf8_lossy(&output.stderr).contains("simulated preparation failure"));
+        let error = String::from_utf8_lossy(&output.stderr);
+        assert!(error.contains("simulated preparation failure"), "{error}");
+        assert!(error.contains("remains open for tj recover --open"), "{error}");
         assert!(!sandbox.log.exists(), "native provider started after preparation failed");
-        assert_eq!(log(&sandbox, "stubs/agent-store.log").trim(), "set-open --launch-id prepare-failed --open false");
+        assert_eq!(log(&sandbox, "stubs/agent-store.log").trim(), "set-open --launch-id prepare-failed --open true");
     }
 }
 
@@ -2201,38 +2203,38 @@ fn a_managed_codex_update_stays_unverified_without_reloading_an_unrelated_daemon
     assert_eq!(stderr.matches(diagnostic).count(), 1, "{stderr}");
 }
 
-#[test]
-fn a_new_tj_binary_resumes_the_same_conversation_in_the_same_tab() {
-    let sandbox = sandbox();
+fn install_replacement_binary(bin: &Path, extra: &[u8]) {
+    let name = format!("tj{}", std::env::consts::EXE_SUFFIX);
+    let target = bin.join(&name);
+    if target.exists() {
+        std::fs::rename(&target, bin.join(format!("{name}.old"))).unwrap();
+    }
+    let mut binary = std::fs::read(env!("CARGO_BIN_EXE_tj")).unwrap();
+    binary.extend_from_slice(extra);
+    std::fs::write(&target, binary).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+}
+
+fn binary_update_wrapper(sandbox: &Sandbox) -> (Child, PathBuf) {
+    select_tj_agents_checked(sandbox);
     let bin = sandbox.root.join("bin");
     std::fs::create_dir(&bin).unwrap();
-    let name = |stem: &str| format!("{stem}{}", std::env::consts::EXE_SUFFIX);
-    let install = |extra: &[u8]| {
-        let target = bin.join(name("tj"));
-        if target.exists() {
-            std::fs::rename(&target, bin.join(format!("{}.old", name("tj")))).unwrap();
-        }
-        let mut binary = std::fs::read(env!("CARGO_BIN_EXE_tj")).unwrap();
-        binary.extend_from_slice(extra);
-        std::fs::write(&target, binary).unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
-    };
-    install(b"");
+    install_replacement_binary(&bin, b"");
     #[cfg(windows)]
-    std::fs::copy(env!("CARGO_BIN_EXE_tj_hook"), bin.join(name("tj_hook"))).unwrap();
-    set_reply(&sandbox, "agent-store-show.json", BOUND);
-    let mut arguments = with_prompt(&sandbox, "upgrade", "claude", "signal");
+    std::fs::copy(env!("CARGO_BIN_EXE_tj_hook"), bin.join("tj_hook.exe")).unwrap();
+    set_reply(sandbox, "agent-store-show.json", BOUND);
+    let mut arguments = with_prompt(sandbox, "upgrade", "claude", "signal");
     let restart = arguments.iter().position(|argument| argument == "--restart-grace-seconds").unwrap();
     arguments[restart + 1] = "0".to_owned();
-    let mut command = Command::new(bin.join(name("tj")));
+    let mut command = Command::new(bin.join(format!("tj{}", std::env::consts::EXE_SUFFIX)));
     command
         .args(arguments)
         .current_dir(&sandbox.root)
-        .envs(environment(&sandbox))
+        .envs(environment(sandbox))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -2241,14 +2243,31 @@ fn a_new_tj_binary_resumes_the_same_conversation_in_the_same_tab() {
         use std::os::windows::process::CommandExt;
         command.creation_flags(0x0800_0000);
     }
-    let mut child = Child::new(command.spawn().unwrap(), &sandbox);
+    (Child::new(command.spawn().unwrap(), sandbox), bin)
+}
+
+#[test]
+fn a_binary_update_waits_for_preparation_before_resuming_the_same_conversation() {
+    let sandbox = sandbox();
+    let (mut child, bin) = binary_update_wrapper(&sandbox);
     wait_for_log(&sandbox, "pid ");
     assert_eq!(in_agent(&sandbox, &["hold"]).0, 0);
     set_status(&sandbox, "busy");
-    install(b"\0");
+    std::fs::write(sandbox.stubs.join("prepare-failure"), "failed").unwrap();
+    install_replacement_binary(&bin, b"\0");
     still_running(&mut child, Duration::from_secs(6));
     assert!(!log(&sandbox, "dummy.log").contains("graceful"), "restarted mid-turn");
     set_status(&sandbox, "idle");
+    wait_until("binary restart never checked preparation", || {
+        log(&sandbox, "stubs/tj-prepare.log").lines().count() >= 2
+    });
+    still_running(&mut child, Duration::from_secs(1));
+    assert!(!log(&sandbox, "dummy.log").contains("graceful"), "stopped the agent after failed preparation");
+    assert_eq!(log(&sandbox, "dummy.log").matches("agent upgrade Test tab").count(), 1);
+    let input: Vec<String> = serde_json::from_str(&log(&sandbox, "stubs/prepare-input.json")).unwrap();
+    assert!(input.ends_with(&["--resume".to_owned(), "sess-1".to_owned()]), "{input:?}");
+    assert!(!log(&sandbox, "stubs/agent-store.log").contains("--open false"));
+    std::fs::remove_file(sandbox.stubs.join("prepare-failure")).unwrap();
     wait_for_log(&sandbox, "args --model m --resume sess-1");
     still_running(&mut child, Duration::from_secs(1));
     let agent = log(&sandbox, "dummy.log");
@@ -2257,12 +2276,54 @@ fn a_new_tj_binary_resumes_the_same_conversation_in_the_same_tab() {
     let store = log(&sandbox, "stubs/agent-store.log");
     assert_eq!(store.matches("launch --launch-id upgrade ").count(), 1, "{store}");
     assert!(!store.contains("end --launch-id upgrade"), "{store}");
+    std::fs::remove_file(sandbox.worktree.join(".agents/plugins.json")).unwrap();
     done(&sandbox);
     still_running(&mut child, Duration::from_secs(6));
     assert!(sandbox.worktree.exists(), "the successor lost the keep-open hold");
     assert_eq!(in_agent(&sandbox, &["hold", "--release"]).0, 0);
     let output = finish(child, Duration::from_secs(60));
     assert_closed_out(&sandbox, &output, "upgrade");
+}
+
+#[test]
+fn a_binary_update_failure_after_native_stop_preserves_recovery_and_the_receipt() {
+    for preparation_failure in [true, false] {
+        let sandbox = sandbox();
+        let (child, bin) = binary_update_wrapper(&sandbox);
+        wait_for_log(&sandbox, "pid ");
+        assert_eq!(in_agent(&sandbox, &["hold"]).0, 0);
+        let receipt = completion_receipt(&sandbox, "upgrade");
+        let failure = if preparation_failure {
+            sandbox.stubs.join("prepare-failure")
+        } else {
+            bin.join(format!("tj{}", std::env::consts::EXE_SUFFIX))
+        };
+        std::fs::write(sandbox.root.join("dirty-on-stop"), failure.to_str().unwrap()).unwrap();
+        set_status(&sandbox, "idle");
+        install_replacement_binary(&bin, b"\0");
+        let output = finish(child, Duration::from_secs(60));
+        assert!(!output.status.success());
+        let error = String::from_utf8_lossy(&output.stderr);
+        assert!(error.contains("remains open for tj recover --open"), "{error}");
+        if preparation_failure {
+            assert!(error.contains("simulated preparation failure"), "{error}");
+        } else {
+            assert!(error.contains("native handover failed"), "{error}");
+        }
+        let agent = log(&sandbox, "dummy.log");
+        assert!(agent.contains("graceful"), "{agent}");
+        assert_eq!(agent.matches("agent upgrade Test tab").count(), 1, "{agent}");
+        let store = log(&sandbox, "stubs/agent-store.log");
+        assert_eq!(store.matches("launch --launch-id upgrade ").count(), 1, "{store}");
+        assert!(!store.contains("--open false") && !store.contains("end --launch-id upgrade"), "{store}");
+        assert_eq!(
+            store.lines().rfind(|line| line.starts_with("set-open ")),
+            Some("set-open --launch-id upgrade --open true")
+        );
+        assert_eq!(completion_receipt(&sandbox, "upgrade"), receipt);
+        assert!(sandbox.worktree.exists());
+        assert!(!store.contains("release-worktree"), "{store}");
+    }
 }
 
 #[test]

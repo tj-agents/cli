@@ -493,7 +493,13 @@ fn successor_arguments(args: &Args, launch: &Launch, agent: Vec<OsString>) -> Ve
 }
 
 /// Stops the agent and hands the tab to the replaced tj binary, resuming the same conversation.
-fn restart(agent: &mut Agent, watch: &mut Watch, args: &Args, exe: &Path) -> Result<Option<ExitCode>> {
+fn restart(
+    agent: &mut Agent,
+    watch: &mut Watch,
+    args: &Args,
+    exe: &Path,
+    close_on_exit: &mut bool,
+) -> Result<Option<ExitCode>> {
     let host = watch.launch.host;
     let session = match store::bound_session(&watch.launch.id) {
         Ok(Some(session)) => session,
@@ -510,10 +516,22 @@ fn restart(agent: &mut Agent, watch: &mut Watch, args: &Args, exe: &Path) -> Res
             return Ok(None);
         }
     };
-    eprintln!("\r\nTJ: tj was updated; resuming {}:{session} in the new version\r", host.name());
-    stop(agent, host, Duration::from_secs(args.grace_seconds), |_| Ok(true))?;
     let resume = host.resume(&args.agent, &session);
-    update::successor::hand_over(exe, &successor_arguments(args, &watch.launch, resume)).map(Some)
+    if tj_agents::selected(&watch.launch.cwd) {
+        let directory = args.command_cwd.as_deref().unwrap_or(&watch.launch.cwd);
+        if let Err(error) = prepare(&watch.launch, directory, &resume) {
+            watch.report(format!("not updating tj: repository standards preparation failed: {error:#}"));
+            return Ok(None);
+        }
+    }
+    eprintln!("\r\nTJ: tj was updated; resuming {}:{session} in the new version\r", host.name());
+    // The successor owns normal closure; a failed handover must remain discoverable by recovery.
+    *close_on_exit = false;
+    stop(agent, host, Duration::from_secs(args.grace_seconds), |_| Ok(true))
+        .context("native restart failed; the launch remains open for tj recover --open")?;
+    update::successor::hand_over(exe, &successor_arguments(args, &watch.launch, resume))
+        .context("native handover failed; the launch remains open for tj recover --open")
+        .map(Some)
 }
 
 fn wait_for_enter() {
@@ -551,9 +569,14 @@ pub fn run(args: Args) -> Result<ExitCode> {
     }
     agent::prepare_wrapper().context("could not prepare the console")?;
     let id = launch.id.clone();
-    let mut admitted = args.successor;
-    let result = supervise(&args, launch, prebound.as_ref(), &mut admitted);
-    if admitted && !agent::session_ending() {
+    let mut close_on_exit = false;
+    let result = supervise(&args, launch, prebound.as_ref(), &mut close_on_exit);
+    if args.successor && !agent::session_ending() && !matches!(&result, Ok(code) if *code == ExitCode::SUCCESS) {
+        close_on_exit = false;
+        mark_open(&id, true);
+        eprintln!("TJ: native restart did not complete; the launch remains open for tj recover --open");
+    }
+    if close_on_exit && !agent::session_ending() {
         mark_open(&id, false);
     }
     result
@@ -573,7 +596,12 @@ fn require_native_image(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn supervise(args: &Args, launch: Launch, prebound: Option<&PreboundSession>, admitted: &mut bool) -> Result<ExitCode> {
+fn supervise(
+    args: &Args,
+    launch: Launch,
+    prebound: Option<&PreboundSession>,
+    close_on_exit: &mut bool,
+) -> Result<ExitCode> {
     let predecessor = args
         .resume_from
         .as_deref()
@@ -622,7 +650,7 @@ fn supervise(args: &Args, launch: Launch, prebound: Option<&PreboundSession>, ad
             return Err(error);
         }
     }
-    *admitted = true;
+    *close_on_exit = true;
     let closed = launch.id.clone();
     agent::on_tab_closed(Box::new(move || mark_closed(&closed)));
     mark_open(&launch.id, true);
@@ -793,7 +821,7 @@ fn supervise(args: &Args, launch: Launch, prebound: Option<&PreboundSession>, ad
             }
             Some(update::gate::Apply::Binary) => {
                 let exe = watcher.exe().to_path_buf();
-                if let Some(code) = restart(&mut agent, &mut watch, args, &exe)? {
+                if let Some(code) = restart(&mut agent, &mut watch, args, &exe, close_on_exit)? {
                     return Ok(code);
                 }
             }
