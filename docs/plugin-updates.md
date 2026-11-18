@@ -31,8 +31,8 @@ outside this observer's reach.
 Agent's plugin update checks the configured marketplaces, fetches changed ones and brings the host's
 installed plugins to their pins. It checks repository standards, updates the Agent command runtime and,
 when the installed state changed successfully, calls `tj update --host <host> --revision <commit>`.
-Codex refresh checks running engines before replacing cached plugin files. If an embedded engine cannot
-reload its approvals, refresh retains the installed files and reports the affected sessions. Reloading a
+Codex refresh checks running engines before replacing cached plugin files. An embedded engine retains
+paths to its loaded hook files, so refresh keeps those files and reports the affected sessions. Reloading a
 shared daemon cannot authorize replacement of files still loaded by a separate embedded process.
 The publish file contains the revision and a unique stamp, so separate successful publications of the
 same revision are still distinct events. `tj install` also publishes changes. An installation failure
