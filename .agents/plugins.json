@@ -10,9 +10,12 @@
     "agent@tj-agents",
     "base@tj-agents",
     "cli@tj-agents",
+    "docs@tj-agents",
     "engineering@tj-agents",
+    "github@tj-agents",
     "personal@tj-agents",
     "python@tj-agents",
+    "skill@tj-agents",
     "template@tj-agents",
     "workflow@tj-agents"
   ]
