@@ -4,6 +4,11 @@
       "cli"
     ]
   },
+  "dependencies": {
+    "cli": [
+      "tj-agents/base"
+    ]
+  },
   "resources": [
     {
       "plugin": "cli",
