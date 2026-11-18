@@ -1,4 +1,5 @@
 pub mod closeout;
+pub mod freshness;
 pub mod lifecycle;
 pub mod owner;
 pub(crate) mod store;
@@ -518,12 +519,7 @@ pub fn run(args: Args) -> Result<ExitCode> {
 fn supervise(args: &Args, launch: Launch, prebound: Option<&PreboundSession>) -> Result<ExitCode> {
     let command_cwd = args.command_cwd.as_deref().unwrap_or(&launch.cwd);
     let exe = std::env::current_exe().context("could not locate the tj executable")?;
-    let selected = tj_agents::selected(&launch.cwd);
-    let upstream = if selected && !args.successor {
-        update::upstream::start(launch.host, &launch.cwd, args.update_url.clone())
-    } else {
-        None
-    };
+    let freshness = freshness::Background::start(&launch.cwd, args.successor);
     let marks = marks(&launch.id)?;
     if !args.successor {
         let _ = std::fs::remove_dir_all(&marks);
@@ -552,6 +548,13 @@ fn supervise(args: &Args, launch: Launch, prebound: Option<&PreboundSession>) ->
         }
     }
     mark_open(&launch.id, true);
+    freshness.finish();
+    let selected = tj_agents::selected(&launch.cwd);
+    let upstream = if selected && !args.successor {
+        update::upstream::start(launch.host, &launch.cwd, args.update_url.clone())
+    } else {
+        None
+    };
     if selected {
         prepare(&launch, command_cwd, &args.agent);
     }
