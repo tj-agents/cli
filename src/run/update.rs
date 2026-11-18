@@ -21,8 +21,10 @@ pub(crate) use watch::Watcher;
 pub(crate) enum ApplyError {
     #[error("could not type into the agent's console")]
     Typing(#[source] std::io::Error),
-    #[error("the Codex app-server did not take the update")]
-    AppServer(#[source] Box<dyn std::error::Error + Send + Sync>),
+    #[error(
+        "the managed Codex engine cannot reload through the shared daemon; plugin activation remains unverified until a native restart"
+    )]
+    NativeReloadUnavailable,
 }
 
 /// The host's own way to load newly installed plugins, skills, hooks and config into the running session.

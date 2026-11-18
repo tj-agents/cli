@@ -43,13 +43,16 @@ changes. See [Agent's installation and scope rules](https://github.com/tj-agents
 
 Each running wrapper watches its host's publication file. Claude waits until its turn and input are
 idle, then types `/reload-plugins` and Enter into the shared console. Unsubmitted text in the console
-is not visible to the wrapper and the command can be appended to it. Codex requests
-`config/batchWrite` with `reloadUserConfig: true` over WebSocket through the shared app-server proxy. This reaches
-sessions using that daemon; an embedded Codex session, such as one started with `--no-daemon`, is not
-addressed by this request. The server
-refreshes loaded threads' runtime configuration; it retains some session settings and does not rewrite
-instructions already delivered in previous turns. A successful request alone does not prove that each
-thread refreshed successfully. Codex's completion lists may require a restart to reflect changes.
+is not visible to the wrapper and the command can be appended to it. Managed Codex uses an owned embedded
+engine, which the shared daemon cannot reload. Its wrapper leaves activation unverified, reports that a
+native restart is required and retains the current process. It does not acknowledge a reload against an
+unrelated daemon as an update to that window. Automatic adoption by an already-running embedded Codex
+interface remains unsupported.
+
+The daemon observer above uses `config/batchWrite` with `reloadUserConfig: true` for threads actually
+loaded in its daemon. The server retains some session settings and does not rewrite instructions already
+delivered in previous turns. A successful request alone does not prove that each thread refreshed
+successfully. Codex's completion lists may require a restart to reflect changes.
 
 The wrapper separately detects a replacement `tj` binary. It can resume an idle Claude session under
 the new binary with the same conversation; Codex currently takes the new binary on its next start.
