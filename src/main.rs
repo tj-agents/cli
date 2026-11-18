@@ -74,6 +74,9 @@ enum Command {
     /// Draws cr's preview pane (run by fzf, not by hand)
     #[command(hide = true)]
     CrPreview(cr::PreviewArgs),
+    /// Fast-forwards a clean, behind default branch and reports anything else stale (run before a plain host)
+    #[command(name = "_checkout-freshness", hide = true)]
+    CheckoutFreshness(run::freshness::Args),
     /// Runs `tj-<name>` from PATH, so `tj item` runs `tj-item`
     #[command(external_subcommand)]
     External(Vec<OsString>),
@@ -102,6 +105,7 @@ fn main() -> ExitCode {
         Command::MessageReceipt(args) => message::bridge::receipt(args),
         Command::Feed(args) => feed::run(&args),
         Command::CrPreview(args) => cr::preview(args),
+        Command::CheckoutFreshness(args) => run::freshness::run(args),
         Command::External(arguments) => external::run(arguments),
     };
     match result {
