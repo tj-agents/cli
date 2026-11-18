@@ -21,6 +21,12 @@ enum ProcessCommand {
         #[arg(long)]
         launch_id: String,
     },
+    Spawned {
+        #[arg(long)]
+        launch_id: String,
+        #[arg(long)]
+        session: String,
+    },
     Inspect,
 }
 
@@ -43,6 +49,13 @@ pub(crate) fn run(args: ProcessArgs) -> Result<ExitCode> {
             let chain = agent::ancestry().context("cannot inspect process ancestry")?;
             let identity = owner(&launch_id, &data, &chain, agent::started_at)?;
             println!("{}", json!({"pid": identity.pid, "started_at": identity.started_at}));
+        }
+        ProcessCommand::Spawned { launch_id, session } => {
+            let data = run::store::call(&["show", "--launch-id", &launch_id])?;
+            let wrapper = verified_wrapper(&launch_id, &data, &agent::started_at)?;
+            let children = agent::direct_children(wrapper).context("cannot inspect native children")?;
+            let observed = spawned(&launch_id, &session, &data, &children, agent::started_at)?;
+            println!("{}", observed.unwrap_or(Value::Null));
         }
         ProcessCommand::Inspect => {
             let input: Value = serde_json::from_reader(io::stdin().lock()).context("invalid identities")?;
@@ -82,6 +95,22 @@ fn owner(
     chain: &[(u32, String)],
     started_at: impl Fn(u32) -> io::Result<Option<SystemTime>>,
 ) -> Result<Identity> {
+    let wrapper = verified_wrapper(launch_id, data, &started_at)?;
+    let index = chain.iter().position(|(pid, _)| *pid == wrapper).context("wrapper is not an observable ancestor")?;
+    ensure!(index > 1, "no native child above the caller");
+    let native = &chain[index - 1];
+    let host = data["launch"]["host"].as_str().and_then(Host::from_name).context("unknown launch host")?;
+    ensure!(Host::from_ancestry(std::slice::from_ref(native)) == Some(host), "direct child is not the native host");
+    let created = started_at(native.0)?.context("native child is not running")?;
+    let created: chrono::DateTime<chrono::Utc> = created.into();
+    Ok(Identity { pid: native.0, started_at: created.to_rfc3339() })
+}
+
+fn verified_wrapper(
+    launch_id: &str,
+    data: &Value,
+    started_at: &impl Fn(u32) -> io::Result<Option<SystemTime>>,
+) -> Result<u32> {
     let row = &data["launch"];
     ensure!(
         row["launch_id"].as_str() == Some(launch_id) && row["state"].as_str() == Some("active"),
@@ -98,14 +127,43 @@ fn owner(
         recorded.timestamp_subsec_nanos() == 0 && recorded.timestamp() == actual.timestamp(),
         "wrapper identity does not match"
     );
-    let index = chain.iter().position(|(pid, _)| *pid == wrapper).context("wrapper is not an observable ancestor")?;
-    ensure!(index > 1, "no native child above the caller");
-    let native = &chain[index - 1];
-    let host = row["host"].as_str().and_then(Host::from_name).context("unknown launch host")?;
-    ensure!(Host::from_ancestry(std::slice::from_ref(native)) == Some(host), "direct child is not the native host");
-    let created = started_at(native.0)?.context("native child is not running")?;
-    let created: chrono::DateTime<chrono::Utc> = created.into();
-    Ok(Identity { pid: native.0, started_at: created.to_rfc3339() })
+    Ok(wrapper)
+}
+
+fn spawned(
+    launch_id: &str,
+    session: &str,
+    data: &Value,
+    children: &[agent::ChildIdentity],
+    started_at: impl Fn(u32) -> io::Result<Option<SystemTime>>,
+) -> Result<Option<Value>> {
+    verified_wrapper(launch_id, data, &started_at)?;
+    let launch = &data["launch"];
+    let bound = &data["session"];
+    let host = launch["host"].as_str().and_then(Host::from_name).context("unknown launch host")?;
+    let (session_host, native_id) = session.split_once(':').context("invalid native session")?;
+    ensure!(
+        session_host == host.name()
+            && !native_id.is_empty()
+            && launch["session"].as_str() == Some(session)
+            && bound["session"].as_str() == Some(session)
+            && bound["host"].as_str() == Some(host.name())
+            && bound["native_id"].as_str() == Some(native_id)
+            && bound["launch_id"].as_str() == Some(launch_id)
+            && bound["state"].as_str() == Some("active")
+            && bound["wrapper"] == launch["wrapper"],
+        "native session is not reciprocally bound to this launch"
+    );
+    let mut native =
+        children.iter().filter(|child| Host::from_ancestry(&[(child.pid, child.image.clone())]) == Some(host));
+    let Some(child) = native.next() else { return Ok(None) };
+    ensure!(native.next().is_none(), "more than one native child belongs to the wrapper");
+    ensure!(started_at(child.pid)? == Some(child.started_at), "native process identity changed");
+    let created: chrono::DateTime<chrono::Utc> = child.started_at.into();
+    Ok(Some(json!({
+        "launch_id": launch_id, "session": session,
+        "native": {"pid": child.pid, "started_at": created.to_rfc3339()}
+    })))
 }
 
 fn inspect(
@@ -129,7 +187,7 @@ fn inspect(
 
 #[cfg(test)]
 mod tests {
-    use super::{Identity, inspect, owner, parse_identities};
+    use super::{Identity, inspect, owner, parse_identities, spawned};
     use serde_json::json;
     use std::io;
     use std::time::{Duration, UNIX_EPOCH};
@@ -183,6 +241,9 @@ mod tests {
         let mut child = std::process::Command::new("sleep").arg("30").spawn().unwrap();
         let pid = child.id();
         let created: chrono::DateTime<chrono::Utc> = tj_cli::process::agent::started_at(pid).unwrap().unwrap().into();
+        let children = tj_cli::process::agent::direct_children(std::process::id()).unwrap();
+        let observed = children.iter().find(|observed| observed.pid == pid).unwrap();
+        assert_eq!(chrono::DateTime::<chrono::Utc>::from(observed.started_at), created);
         child.kill().unwrap();
         child.wait().unwrap();
         let stopped = Identity { pid, started_at: created.to_rfc3339() };
@@ -233,5 +294,62 @@ mod tests {
         assert!(owner("right", &invalid, &chain, read).is_err());
         let other = [(3, "tj".into()), (2, "shell".into()), (1, "tj".into())];
         assert!(owner("right", &row, &other, read).is_err());
+    }
+
+    fn prepared_binding() -> serde_json::Value {
+        let wrapper = json!({"pid":1,"started_at":"1970-01-01T00:00:01Z"});
+        json!({
+            "launch":{"launch_id":"right","host":"codex","session":"codex:thread","state":"active","wrapper":wrapper},
+            "session":{"session":"codex:thread","host":"codex","native_id":"thread","launch_id":"right","state":"active","wrapper":wrapper}
+        })
+    }
+
+    fn native_child(pid: u32, image: &str) -> tj_cli::process::agent::ChildIdentity {
+        tj_cli::process::agent::ChildIdentity {
+            pid,
+            image: image.to_owned(),
+            started_at: UNIX_EPOCH + Duration::from_secs(u64::from(pid)),
+        }
+    }
+
+    #[test]
+    fn spawned_native_is_observable_without_a_hook_or_calling_ancestry() {
+        let row = prepared_binding();
+        let children = [native_child(2, "codex.exe"), native_child(3, "python.exe")];
+        let read = |pid| Ok(Some(UNIX_EPOCH + Duration::from_secs(u64::from(pid))));
+        let receipt = spawned("right", "codex:thread", &row, &children, read).unwrap().unwrap();
+        assert_eq!(receipt["native"]["pid"], 2);
+        assert_eq!(receipt["session"], "codex:thread");
+        assert_eq!(receipt["launch_id"], "right");
+        assert!(spawned("right", "codex:thread", &row, &[], read).unwrap().is_none());
+        assert!(spawned("right", "codex:thread", &row, &children[1..], read).unwrap().is_none());
+    }
+
+    #[test]
+    fn spawned_native_refuses_other_bindings_ambiguity_and_reused_processes() {
+        let row = prepared_binding();
+        let child = [native_child(2, "codex")];
+        let read = |pid| Ok(Some(UNIX_EPOCH + Duration::from_secs(u64::from(pid))));
+        assert!(spawned("wrong", "codex:thread", &row, &child, read).is_err());
+        assert!(spawned("right", "codex:other", &row, &child, read).is_err());
+        for field in ["session", "host", "native_id", "launch_id", "state", "wrapper"] {
+            let mut wrong = row.clone();
+            wrong["session"][field] = json!("wrong");
+            assert!(spawned("right", "codex:thread", &wrong, &child, read).is_err(), "{field}");
+        }
+        let competing = [native_child(2, "codex"), native_child(3, "codex")];
+        assert!(spawned("right", "codex:thread", &row, &competing, read).is_err());
+        assert!(
+            spawned("right", "codex:thread", &row, &child, |pid| {
+                Ok(Some(UNIX_EPOCH + Duration::from_secs(if pid == 2 { 3 } else { 1 })))
+            })
+            .is_err()
+        );
+        assert!(
+            spawned("right", "codex:thread", &row, &child, |pid| {
+                if pid == 2 { Err(io::Error::other("denied")) } else { read(pid) }
+            })
+            .is_err()
+        );
     }
 }
