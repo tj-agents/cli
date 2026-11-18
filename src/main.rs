@@ -42,6 +42,8 @@ enum Command {
     /// Internal root process shared by all managed launch paths
     #[command(name = "_session", hide = true)]
     Session(Box<run::Args>),
+    #[command(name = "_resume-check", hide = true)]
+    ResumeCheck(run::recovery::Args),
     /// Request completion after this native turn delivers its final response
     Finish,
     /// Record a genuine pending answer, child, CI, or approval
@@ -88,6 +90,7 @@ fn main() -> ExitCode {
         Command::Claude(args) => external::host(host::Host::Claude, args),
         Command::Codex(args) => external::host(host::Host::Codex, args),
         Command::Session(args) => run::run(*args),
+        Command::ResumeCheck(args) => run::recovery::check(args),
         Command::Finish => run::lifecycle::finish(),
         Command::Wait(args) => run::lifecycle::wait(args),
         Command::Hold(args) => run::lifecycle::hold(args),
