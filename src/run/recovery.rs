@@ -1,6 +1,7 @@
 //! Admission checks for continuing a stopped native conversation in a new launch.
 
 use std::io;
+use std::path::PathBuf;
 use std::process::{ExitCode, Stdio};
 use std::time::SystemTime;
 
@@ -8,7 +9,8 @@ use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 use tj_cli::process::agent;
 
-use super::{Launch, hidden, store};
+use super::{Launch, hidden, owner, store};
+use crate::host::Host;
 
 #[derive(clap::Args)]
 pub struct Args {
@@ -16,6 +18,16 @@ pub struct Args {
     session: String,
     #[arg(long)]
     launch_id: String,
+}
+
+#[derive(clap::Args)]
+pub struct BindArgs {
+    #[arg(long)]
+    session: String,
+    #[arg(long)]
+    launch_id: String,
+    #[arg(long)]
+    from_launch_id: String,
 }
 
 #[derive(Debug)]
@@ -77,6 +89,10 @@ fn require_stopped(prior: &Predecessor, inspect: impl FnOnce(u32) -> io::Result<
 }
 
 pub fn inspect(session: &str, launch_id: &str) -> Result<Predecessor> {
+    inspect_native(session, launch_id, None)
+}
+
+fn inspect_native(session: &str, launch_id: &str, replacement: Option<u32>) -> Result<Predecessor> {
     let current = store::call(&["show", session])?;
     let bound = store::call(&["show", "--launch-id", launch_id])?;
     let prior = predecessor(session, launch_id, &current, &bound)?;
@@ -94,12 +110,24 @@ pub fn inspect(session: &str, launch_id: &str) -> Result<Predecessor> {
         serde_json::from_slice(&output.stdout).context("invalid predecessor native liveness response")?;
     if native["session"].as_str() != Some(session)
         || native["launch_id"].as_str() != Some(launch_id)
-        || native["state"].as_str() != Some("dead")
+        || !native_stopped(&native, replacement)
     {
         bail!("the predecessor native conversation is still running or unverified");
     }
     require_stopped(&prior, agent::started_at)?;
     Ok(prior)
+}
+
+fn native_stopped(native: &Value, replacement: Option<u32>) -> bool {
+    match native["state"].as_str() {
+        Some("dead") => replacement.is_none(),
+        Some("live") => replacement.is_some_and(|pid| {
+            native["process_ids"].as_array().is_some_and(|processes| {
+                !processes.is_empty() && processes.iter().all(|value| value.as_u64() == Some(u64::from(pid)))
+            })
+        }),
+        _ => false,
+    }
 }
 
 pub fn check(args: Args) -> Result<ExitCode> {
@@ -112,9 +140,9 @@ pub fn check(args: Args) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-pub fn admit(prior: &Predecessor, launch: &Launch, pid: u32, started_at: &str) -> Result<()> {
+pub fn admit(prior: &Predecessor, launch: &Launch, pid: u32, started_at: &str) -> Result<Value> {
     require_stopped(prior, agent::started_at)?;
-    store::call(&[
+    let response = store::call(&[
         "resume",
         "--session",
         &prior.session,
@@ -131,7 +159,57 @@ pub fn admit(prior: &Predecessor, launch: &Launch, pid: u32, started_at: &str) -
         "--wrapper-started-at",
         started_at,
     ])?;
-    Ok(())
+    // Resume atomically binds the destination and transfers its claims. Registering
+    // again would add a failure window after that transaction has already committed.
+    store::exact_session(&response["session"], launch, &prior.session)?;
+    if response["session"]["wrapper"]["pid"].as_u64() != Some(u64::from(pid))
+        || response["session"]["wrapper"]["started_at"].as_str() != Some(started_at)
+    {
+        bail!("agent-store resume returned a different wrapper");
+    }
+    Ok(response["session"].clone())
+}
+
+/// The native startup hook already runs below the replacement process. Exclude
+/// only that verified process when proving the predecessor no longer runs.
+pub fn bind(args: BindArgs) -> Result<ExitCode> {
+    let native_id = args.session.strip_prefix("claude:").context("hook resume requires a Claude session")?;
+    if !super::canonical_uuid(native_id) || args.from_launch_id == args.launch_id {
+        bail!("hook resume requires a different launch and a canonical native session");
+    }
+    if owner::launch().as_deref() != Some(args.launch_id.as_str()) {
+        bail!("only the replacement native process can bind its launch");
+    }
+    let target = store::call(&["show", "--launch-id", &args.launch_id])?;
+    let row = &target["launch"];
+    let pid = row["wrapper"]["pid"]
+        .as_u64()
+        .and_then(|pid| u32::try_from(pid).ok())
+        .context("missing replacement wrapper")?;
+    let started = row["wrapper"]["started_at"].as_str().context("missing replacement creation time")?;
+    let chain = agent::ancestry()?;
+    let at =
+        chain.iter().position(|(ancestor, _)| *ancestor == pid).context("replacement wrapper is not an ancestor")?;
+    let native = at.checked_sub(1).context("the wrapper cannot bind itself")?;
+    if row["launch_id"].as_str() != Some(args.launch_id.as_str())
+        || row["host"].as_str() != Some("claude")
+        || row["state"].as_str() != Some("active")
+        || Host::from_ancestry(&chain[native..at]) != Some(Host::Claude)
+        || agent::started_at(pid)?.map(super::rfc3339).as_deref() != Some(started)
+    {
+        bail!("replacement launch does not match the calling native process");
+    }
+    let prior = inspect_native(&args.session, &args.from_launch_id, Some(chain[native].0))?;
+    let launch = Launch {
+        id: args.launch_id,
+        host: Host::Claude,
+        title: row["title"].as_str().context("missing replacement title")?.to_owned(),
+        cwd: PathBuf::from(row["cwd"].as_str().context("missing replacement directory")?),
+        item: None,
+    };
+    let session = admit(&prior, &launch, pid, started)?;
+    println!("{}", json!({"session":session}));
+    Ok(ExitCode::SUCCESS)
 }
 
 #[cfg(test)]
@@ -141,7 +219,24 @@ mod tests {
 
     use serde_json::json;
 
-    use super::{Predecessor, predecessor, require_stopped};
+    use super::{Predecessor, native_stopped, predecessor, require_stopped};
+
+    #[test]
+    fn hook_admission_excludes_only_its_verified_native_process() {
+        assert!(native_stopped(&json!({"state":"dead"}), None));
+        assert!(!native_stopped(&json!({"state":"dead"}), Some(42)));
+        assert!(native_stopped(&json!({"state":"live", "process_ids":[42]}), Some(42)));
+        for reply in [
+            json!({"state":"unknown"}),
+            json!({"state":"live"}),
+            json!({"state":"live", "process_ids":[]}),
+            json!({"state":"live", "process_ids":[42,43]}),
+            json!({"state":"live", "process_ids":["42"]}),
+        ] {
+            assert!(!native_stopped(&reply, Some(42)), "{reply}");
+        }
+        assert!(!native_stopped(&json!({"state":"live", "process_ids":[42]}), None));
+    }
 
     fn prior() -> Predecessor {
         Predecessor {

@@ -48,6 +48,8 @@ enum Command {
     Process(process_command::ProcessArgs),
     #[command(name = "_resume-check", hide = true)]
     ResumeCheck(run::recovery::Args),
+    #[command(name = "_resume-bind", hide = true)]
+    ResumeBind(run::recovery::BindArgs),
     /// Request completion after this native turn delivers its final response
     Finish,
     /// Record a genuine pending answer, child, CI, or approval
@@ -96,6 +98,7 @@ fn main() -> ExitCode {
         Command::Session(args) => run::run(*args),
         Command::Process(args) => process_command::run(args),
         Command::ResumeCheck(args) => run::recovery::check(args),
+        Command::ResumeBind(args) => run::recovery::bind(args),
         Command::Finish => run::lifecycle::finish(),
         Command::Wait(args) => run::lifecycle::wait(args),
         Command::Hold(args) => run::lifecycle::hold(args),

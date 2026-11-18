@@ -47,9 +47,9 @@ def prebound_reply(
         source = json.loads(source_file.read_text(encoding="utf-8"))
         return {"ok": True, "data": source}
     if command == "resume":
-        if reply["ok"]:
-            bound_file.touch()
-        return reply
+        if not reply["ok"]:
+            return reply
+        bound_file.touch()
     if command == "launch":
         launch = {
             "launch_id": value(arguments, "--launch-id"),
@@ -71,7 +71,7 @@ def prebound_reply(
             return reply
         bound_file.touch()
         return {"ok": True, "data": {}}
-    if command != "show":
+    if command not in {"show", "resume"}:
         return None
     launch = json.loads(launch_file.read_text(encoding="utf-8"))
     host = configuration_data.get("host", "codex")

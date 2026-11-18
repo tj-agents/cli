@@ -526,11 +526,10 @@ fn supervise(args: &Args, launch: Launch, prebound: Option<&PreboundSession>, ad
         return Err(error).context("managed launch was not recorded; the native host was not started");
     }
     if let Some(prebound) = prebound {
-        let bound = predecessor
-            .as_ref()
-            .map(|prior| recovery::admit(prior, &launch, pid, &started_at))
-            .transpose()
-            .and_then(|_| store::prebind(&launch, &prebound.handle, pid, &started_at));
+        let bound = match predecessor.as_ref() {
+            Some(prior) => recovery::admit(prior, &launch, pid, &started_at).map(drop),
+            None => store::prebind(&launch, &prebound.handle, pid, &started_at),
+        };
         if let Err(error) = bound {
             end_not_started(&launch, Some(prebound), pid, &started_at);
             return Err(error);

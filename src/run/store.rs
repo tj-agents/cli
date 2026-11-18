@@ -85,7 +85,7 @@ pub(super) fn exact_launch(data: &Value, launch: &Launch, wrapper_pid: u32, wrap
 }
 
 /// `session` is the session row; agent-store's `show <handle>` returns it without a launch row.
-fn exact_session(session: &Value, launch: &Launch, handle: &str) -> Result<()> {
+pub(super) fn exact_session(session: &Value, launch: &Launch, handle: &str) -> Result<()> {
     let native_id = handle
         .strip_prefix(&format!("{}:", launch.host.name()))
         .context("prebound session does not match the launch host")?;

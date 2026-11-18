@@ -1707,14 +1707,28 @@ fn recovery_admits_the_source_before_native_execution_for_both_hosts() {
         let output = finish(spawn(&sandbox, &arguments, &sandbox.root), Duration::from_secs(30));
         assert!(!output.status.success());
         let log = log(&sandbox, "stubs/agent-store.log");
-        let resume = log
-            .find(&format!("resume --session {host}:{PREBOUND} --from-launch-id prior --launch-id resumed"))
-            .expect(&log);
-        let registered = log.find(&format!("register --session {host}:{PREBOUND}")).expect(&log);
-        assert!(resume < registered, "{log}");
+        assert!(
+            log.contains(&format!("resume --session {host}:{PREBOUND} --from-launch-id prior --launch-id resumed")),
+            "{log}"
+        );
+        assert!(!log.contains("register --session"), "{log}");
         assert!(log.contains("end --launch-id resumed --reason exited"), "{log}");
         assert!(!log.contains("release-worktree") && !log.contains("end --launch-id prior"), "{log}");
     }
+}
+
+#[test]
+fn recovery_does_not_reregister_after_the_atomic_transfer() {
+    let sandbox = sandbox();
+    let arguments = recovery_admission(&sandbox, "codex", "dead", false);
+    set_reply(&sandbox, "agent-store-register.json", r#"{"ok":false,"error":{"message":"registration unavailable"}}"#);
+    let output = finish(spawn(&sandbox, &arguments, &sandbox.root), Duration::from_secs(30));
+    assert!(!output.status.success());
+    let log = log(&sandbox, "stubs/agent-store.log");
+    assert!(log.contains("resume --session"), "{log}");
+    assert!(!log.contains("register --session"), "{log}");
+    assert!(log.contains("end --launch-id resumed --reason exited"), "{log}");
+    assert!(!log.contains("--reason not_started"), "{log}");
 }
 
 #[test]
