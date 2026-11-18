@@ -1,9 +1,0 @@
-{
-  "schema_version": 1,
-  "tier": "cli",
-  "stack": "any project",
-  "applies": "always",
-  "owner_repository": [
-    "tj-agents/cli"
-  ]
-}
