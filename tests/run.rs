@@ -316,6 +316,7 @@ fn prebound_arguments_with_prompt(sandbox: &Sandbox, launch: &str, prompt: &str)
             sandbox.worktree.to_string_lossy().into_owned(),
             "resume".to_owned(),
             PREBOUND.to_owned(),
+            "--no-daemon".to_owned(),
             "--".to_owned(),
             prompt.to_owned(),
         ],
@@ -1579,40 +1580,53 @@ fn recovery_admission(sandbox: &Sandbox, host: &str, native_state: &str, live_wr
 
 #[test]
 fn public_resume_accepts_an_interpreter_only_when_native_inventory_proves_its_pid() {
-    let sandbox = sandbox();
-    recovery_admission(&sandbox, "claude", "live", false);
-    let child = start(&sandbox, "resumed", "claude", "ignore", "10");
-    let pid =
-        log(&sandbox, "dummy.log").lines().find_map(|line| line.strip_prefix("pid ")?.parse::<u32>().ok()).unwrap();
-    let arguments = [
-        "_resume-bind",
-        "--session",
-        &format!("claude:{PREBOUND}"),
-        "--launch-id",
-        "resumed",
-        "--from-launch-id",
-        "prior",
-    ];
-    for processes in [serde_json::json!([pid, child.id()]), serde_json::json!([pid])] {
-        set_reply(
-            &sandbox,
-            "tj-session-liveness.json",
-            &serde_json::json!({
-                "session": format!("claude:{PREBOUND}"), "launch_id":"prior",
-                "state":"live", "process_ids": processes,
-            })
-            .to_string(),
-        );
-        let (code, detail) = in_agent(&sandbox, &arguments);
-        if processes.as_array().unwrap().len() == 1 {
-            assert_eq!(code, 0, "{detail}");
-            assert!(log(&sandbox, "stubs/agent-store.log").contains("resume --session"));
-        } else {
-            assert_ne!(code, 0, "{detail}");
-            assert!(!log(&sandbox, "stubs/agent-store.log").contains("resume --session"));
+    for host in ["claude", "codex"] {
+        let sandbox = sandbox();
+        recovery_admission(&sandbox, host, "live", false);
+        let child = start(&sandbox, "resumed", host, "ignore", "10");
+        let pid =
+            log(&sandbox, "dummy.log").lines().find_map(|line| line.strip_prefix("pid ")?.parse::<u32>().ok()).unwrap();
+        let session = format!("{host}:{PREBOUND}");
+        let arguments = ["_resume-bind", "--session", &session, "--launch-id", "resumed", "--from-launch-id", "prior"];
+        for (state, processes) in [
+            ("unknown", serde_json::json!([pid])),
+            ("live", serde_json::json!([pid, child.id()])),
+            ("live", serde_json::json!([pid])),
+        ] {
+            set_reply(
+                &sandbox,
+                "tj-session-liveness.json",
+                &serde_json::json!({
+                    "session": session, "launch_id":"prior", "state":state, "process_ids": processes,
+                })
+                .to_string(),
+            );
+            if state == "live" && processes.as_array().unwrap().len() == 1 {
+                let wrong = if host == "claude" { "codex" } else { "claude" };
+                let wrong_session = format!("{wrong}:{PREBOUND}");
+                let wrong_args = [
+                    "_resume-bind",
+                    "--session",
+                    &wrong_session,
+                    "--launch-id",
+                    "resumed",
+                    "--from-launch-id",
+                    "prior",
+                ];
+                let (code, detail) = in_agent(&sandbox, &wrong_args);
+                assert_ne!(code, 0, "wrong target host accepted: {detail}");
+            }
+            let (code, detail) = in_agent(&sandbox, &arguments);
+            if state == "live" && processes.as_array().unwrap().len() == 1 {
+                assert_eq!(code, 0, "{host}: {detail}");
+                assert!(log(&sandbox, "stubs/agent-store.log").contains("resume --session"));
+            } else {
+                assert_ne!(code, 0, "{host}: {detail}");
+                assert!(!log(&sandbox, "stubs/agent-store.log").contains("resume --session"));
+            }
         }
+        drop(child);
     }
-    drop(child);
 }
 
 #[test]
@@ -1682,10 +1696,10 @@ fn a_prebound_codex_accepts_model_and_effort_before_the_literal_prompt() {
     let sandbox = sandbox();
     prebind(&sandbox, false);
     let mut arguments = prebound_arguments_with_prompt(&sandbox, "lane-model", "--model=literal-prompt");
-    let delimiter = arguments.len() - 2;
+    let delimiter = arguments.iter().position(|argument| argument == "--no-daemon").unwrap();
     arguments.splice(
         delimiter..delimiter,
-        ["--model", "chosen-model", "-c", "model_reasoning_effort=xhigh", "--remote", "unix://"].map(str::to_owned),
+        ["--model", "chosen-model", "-c", "model_reasoning_effort=xhigh"].map(str::to_owned),
     );
     let output = finish(spawn(&sandbox, &arguments, &sandbox.root), Duration::from_secs(30));
     assert!(!output.status.success());

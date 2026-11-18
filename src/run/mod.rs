@@ -272,19 +272,25 @@ fn prebound_session(args: &Args, launch: &Launch) -> Result<Option<PreboundSessi
             remaining = rest;
         }
     }
-    if let [option, endpoint, rest @ ..] = remaining {
-        if option == "--remote" && endpoint == "unix://" {
+    let embedded = if let [option, rest @ ..] = remaining {
+        if option == "--no-daemon" {
             remaining = rest;
+            true
+        } else {
+            false
         }
-    }
+    } else {
+        false
+    };
     let prompt_is_delimited = match remaining {
         [] => true,
         [delimiter, _] => delimiter == OsStr::new("--"),
         _ => false,
     };
-    if !prompt_is_delimited || args.agent.iter().take(expected.len()).map(OsString::as_os_str).ne(expected) {
+    if !embedded || !prompt_is_delimited || args.agent.iter().take(expected.len()).map(OsString::as_os_str).ne(expected)
+    {
         bail!(
-            "--session requires `codex --cd <cwd> resume <UUID> [--model <model>] [-c model_reasoning_effort=<effort>] [--remote unix://] [-- <prompt>]`"
+            "--session requires `codex --cd <cwd> resume <UUID> [--model <model>] [-c model_reasoning_effort=<effort>] --no-daemon [-- <prompt>]`"
         );
     }
     Ok(Some(PreboundSession { handle: handle.clone() }))
@@ -814,8 +820,7 @@ mod tests {
         launch.item = Some(crate::domain::item::Reference::parse("azure-devops:dev.azure.com/contoso:461").unwrap());
         let agent = vec![
             executable(),
-            "--remote".into(),
-            "unix://".into(),
+            "--no-daemon".into(),
             "resume".into(),
             "123e4567-e89b-12d3-a456-426614174000".into(),
             "--".into(),
@@ -847,6 +852,7 @@ mod tests {
             launch.cwd.clone().into_os_string(),
             OsString::from("resume"),
             OsString::from("123e4567-e89b-12d3-a456-426614174000"),
+            OsString::from("--no-daemon"),
         ]);
         assert_eq!(
             prebound_session(&without_prompt, &launch).unwrap().unwrap().handle,
@@ -859,6 +865,7 @@ mod tests {
             launch.cwd.clone().into_os_string(),
             OsString::from("resume"),
             OsString::from("123e4567-e89b-12d3-a456-426614174000"),
+            OsString::from("--no-daemon"),
             OsString::from("--"),
             OsString::from("Prompt"),
         ]);
@@ -872,8 +879,7 @@ mod tests {
             vec!["--model", "chosen"],
             vec!["-c", "model_reasoning_effort=xhigh"],
             vec!["--model", "chosen", "-c", "model_reasoning_effort=high"],
-            vec!["--model", "chosen", "-c", "model_reasoning_effort=high", "--remote", "unix://"],
-            vec!["--remote", "unix://"],
+            vec![],
         ] {
             let mut agent = vec![
                 executable(),
@@ -883,10 +889,11 @@ mod tests {
                 "123e4567-e89b-12d3-a456-426614174000".into(),
             ];
             agent.extend(overrides.into_iter().map(OsString::from));
-            agent.extend(["--".into(), "--model=literal-prompt".into()]);
+            agent.extend(["--no-daemon".into(), "--".into(), "--model=literal-prompt".into()]);
             assert!(prebound_session(&prebound_args(agent), &launch).is_ok());
         }
         for overrides in [
+            vec![],
             vec!["--model", ""],
             vec!["--model", "--last"],
             vec!["-c", "model_reasoning_effort="],
@@ -894,7 +901,9 @@ mod tests {
             vec!["--last"],
             vec!["--model", "chosen", "--model", "other"],
             vec!["--remote", "ws://localhost:9000"],
+            vec!["--remote", "unix://"],
             vec!["--remote", "unix:///another-daemon.sock"],
+            vec!["--no-daemon"],
         ] {
             let mut agent = vec![
                 executable(),
@@ -903,7 +912,10 @@ mod tests {
                 "resume".into(),
                 "123e4567-e89b-12d3-a456-426614174000".into(),
             ];
-            agent.extend(overrides.into_iter().map(OsString::from));
+            if !overrides.is_empty() {
+                agent.extend(overrides.into_iter().map(OsString::from));
+                agent.push("--no-daemon".into());
+            }
             assert!(prebound_session(&prebound_args(agent), &launch).is_err());
         }
     }
@@ -918,6 +930,7 @@ mod tests {
                 launch.cwd.clone().into_os_string(),
                 OsString::from("resume"),
                 OsString::from("123e4567-e89b-12d3-a456-426614174000"),
+                OsString::from("--no-daemon"),
                 OsString::from("--"),
                 OsString::from(prompt),
             ]);
@@ -934,6 +947,7 @@ mod tests {
             launch.cwd.clone().into_os_string(),
             OsString::from("resume"),
             OsString::from("123e4567-e89b-12d3-a456-426614174000"),
+            OsString::from("--no-daemon"),
             OsString::from("Prompt"),
         ]);
         assert!(prebound_session(&bare_prompt, &launch).is_err());
@@ -944,6 +958,7 @@ mod tests {
             launch.cwd.clone().into_os_string(),
             OsString::from("resume"),
             OsString::from("123e4567-e89b-12d3-a456-426614174000"),
+            OsString::from("--no-daemon"),
             OsString::from("--model=other"),
         ]);
         assert!(prebound_session(&bare_option, &launch).is_err());
@@ -954,6 +969,7 @@ mod tests {
             launch.cwd.clone().into_os_string(),
             OsString::from("resume"),
             OsString::from("123e4567-e89b-12d3-a456-426614174000"),
+            OsString::from("--no-daemon"),
             OsString::from("--"),
         ]);
         assert!(prebound_session(&bare_delimiter, &launch).is_err());
@@ -964,6 +980,7 @@ mod tests {
             launch.cwd.clone().into_os_string(),
             OsString::from("resume"),
             OsString::from("123e4567-e89b-12d3-a456-426614174000"),
+            OsString::from("--no-daemon"),
             OsString::from("--"),
             OsString::from("Prompt"),
             OsString::from("extra"),
@@ -976,6 +993,7 @@ mod tests {
             launch.cwd.clone().into_os_string(),
             OsString::from("--cd"),
             OsString::from("123e4567-e89b-12d3-a456-426614174000"),
+            OsString::from("--no-daemon"),
         ]);
         assert!(prebound_session(&reordered, &launch).is_err());
         assert!(!canonical_uuid("123E4567-e89b-12d3-a456-426614174000"));
@@ -986,6 +1004,7 @@ mod tests {
             launch.cwd.clone().into_os_string(),
             OsString::from("resume"),
             OsString::from("123e4567-e89b-12d3-a456-426614174000"),
+            OsString::from("--no-daemon"),
         ]);
         wrong_host.host = Some(Host::Claude);
         assert!(prebound_session(&wrong_host, &launch).is_err());
@@ -996,6 +1015,7 @@ mod tests {
             OsString::from("/other"),
             OsString::from("resume"),
             OsString::from("123e4567-e89b-12d3-a456-426614174000"),
+            OsString::from("--no-daemon"),
         ]);
         assert!(prebound_session(&wrong_cwd, &launch).is_err());
     }

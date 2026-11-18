@@ -90,6 +90,41 @@ pub fn ancestry() -> io::Result<Vec<(u32, String)>> {
     Ok(ancestry_from(os::processes()?, std::process::id(), os::started_at))
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub struct ChildIdentity {
+    pub pid: u32,
+    pub image: String,
+    pub started_at: SystemTime,
+}
+
+pub fn direct_children(pid: u32) -> io::Result<Vec<ChildIdentity>> {
+    children_from(os::processes()?, pid, os::started_at)
+}
+
+fn children_from(
+    table: HashMap<u32, (u32, String)>,
+    pid: u32,
+    mut read_started: impl FnMut(u32) -> io::Result<Option<SystemTime>>,
+) -> io::Result<Vec<ChildIdentity>> {
+    let parent_started =
+        read_started(pid)?.ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "parent process is not running"))?;
+    let mut children = Vec::new();
+    for (child, (parent, image)) in table {
+        if parent != pid || child == pid {
+            continue;
+        }
+        if let Some(started_at) = read_started(child)?
+            && started_at >= parent_started
+        {
+            children.push(ChildIdentity { pid: child, image, started_at });
+        }
+    }
+    if read_started(pid)? != Some(parent_started) {
+        return Err(io::Error::new(io::ErrorKind::NotFound, "parent process identity changed"));
+    }
+    Ok(children)
+}
+
 fn ancestry_from(
     mut table: HashMap<u32, (u32, String)>,
     mut pid: u32,
@@ -147,7 +182,7 @@ pub fn hidden(program: &str, hook: &Path) -> Command {
 
 #[cfg(test)]
 mod tests {
-    use super::{ancestry, ancestry_from, started_at};
+    use super::{ancestry, ancestry_from, children_from, started_at};
     use std::io;
     use std::time::{Duration, UNIX_EPOCH};
 
@@ -209,6 +244,55 @@ mod tests {
         let pid = std::process::id();
         let first = started_at(pid).unwrap().unwrap();
         assert_eq!(started_at(pid).unwrap(), Some(first));
+    }
+
+    #[test]
+    fn direct_children_exclude_reused_parent_links_and_exited_processes() {
+        let table = [
+            (2, (1, "old.exe".to_owned())),
+            (3, (1, "codex.exe".to_owned())),
+            (4, (3, "shell.exe".to_owned())),
+            (5, (1, "exited.exe".to_owned())),
+        ]
+        .into_iter()
+        .collect();
+        let children = children_from(table, 1, |pid| {
+            Ok(match pid {
+                1 => Some(UNIX_EPOCH + Duration::from_secs(20)),
+                2 => Some(UNIX_EPOCH + Duration::from_secs(10)),
+                3 => Some(UNIX_EPOCH + Duration::from_nanos(30_123_456_700)),
+                _ => None,
+            })
+        })
+        .unwrap();
+        assert_eq!(children.len(), 1);
+        assert_eq!(children[0].pid, 3);
+        assert_eq!(children[0].started_at, UNIX_EPOCH + Duration::from_nanos(30_123_456_700));
+    }
+
+    #[test]
+    fn direct_children_refuse_unobservable_children_or_a_changed_parent() {
+        let table = || [(3, (1, "codex.exe".to_owned()))].into_iter().collect();
+        assert!(
+            children_from(table(), 1, |pid| {
+                if pid == 3 {
+                    Err(io::Error::new(io::ErrorKind::PermissionDenied, "unobservable child"))
+                } else {
+                    Ok(Some(UNIX_EPOCH))
+                }
+            })
+            .is_err()
+        );
+        let mut reads = 0;
+        assert!(
+            children_from(table(), 1, |pid| {
+                if pid == 1 {
+                    reads += 1;
+                }
+                Ok((reads < 2).then_some(UNIX_EPOCH))
+            })
+            .is_err()
+        );
     }
 
     #[test]
