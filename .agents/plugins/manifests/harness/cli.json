@@ -11,10 +11,6 @@
         "repository": "tj-agents/marketplace"
       }
     ],
-    "plugins": [
-      "tj-agents/cli",
-      "tj-agents/base"
-    ],
     "hooks": [],
     "permissions": {
       "claude_allow": [],

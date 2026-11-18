@@ -11,8 +11,5 @@
     "cli",
     "terminal",
     "worktree"
-  ],
-  "dependencies": [
-    "base@tj-agents"
   ]
 }
