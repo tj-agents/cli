@@ -106,7 +106,7 @@ pub fn hidden(program: &str) -> Command {
     command
 }
 
-fn preparation(launch: &Launch, directory: &Path, arguments: &[OsString]) -> Result<()> {
+fn prepare(launch: &Launch, directory: &Path, arguments: &[OsString]) -> Result<()> {
     let arguments = arguments[1..]
         .iter()
         .map(|argument| argument.to_str().context("host arguments must be UTF-8 for standards preparation"))
@@ -136,12 +136,6 @@ fn preparation(launch: &Launch, directory: &Path, arguments: &[OsString]) -> Res
         eprint!("{}", String::from_utf8_lossy(&output.stderr));
     }
     Ok(())
-}
-
-fn prepare(launch: &Launch, directory: &Path, arguments: &[OsString]) {
-    if let Err(error) = preparation(launch, directory, arguments) {
-        eprintln!("TJ: repository standards preparation failed: {error:#}");
-    }
 }
 
 /// The agent's SessionStart registers against this row, so it must exist before the agent starts.
@@ -557,7 +551,7 @@ pub fn run(args: Args) -> Result<ExitCode> {
     }
     agent::prepare_wrapper().context("could not prepare the console")?;
     let id = launch.id.clone();
-    let mut admitted = false;
+    let mut admitted = args.successor;
     let result = supervise(&args, launch, prebound.as_ref(), &mut admitted);
     if admitted && !agent::session_ending() {
         mark_open(&id, false);
@@ -588,6 +582,10 @@ fn supervise(args: &Args, launch: Launch, prebound: Option<&PreboundSession>, ad
     let command_cwd = args.command_cwd.as_deref().unwrap_or(&launch.cwd);
     let exe = std::env::current_exe().context("could not locate the tj executable")?;
     let selected = tj_agents::selected(&launch.cwd);
+    if selected {
+        prepare(&launch, command_cwd, &args.agent)
+            .context("repository standards preparation failed; the native host was not started")?;
+    }
     let upstream = if selected && !args.successor {
         update::upstream::start(launch.host, &launch.cwd, args.update_url.clone())
     } else {
@@ -628,9 +626,6 @@ fn supervise(args: &Args, launch: Launch, prebound: Option<&PreboundSession>, ad
     let closed = launch.id.clone();
     agent::on_tab_closed(Box::new(move || mark_closed(&closed)));
     mark_open(&launch.id, true);
-    if selected {
-        prepare(&launch, command_cwd, &args.agent);
-    }
     match upstream.map(std::thread::JoinHandle::join) {
         Some(Ok(Ok(Some(line)))) => eprintln!("TJ: {line}"),
         Some(Ok(Err(error))) => {

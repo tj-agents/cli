@@ -31,6 +31,9 @@ outside this observer's reach.
 Agent's plugin update checks the configured marketplaces, fetches changed ones and brings the host's
 installed plugins to their pins. It checks repository standards, updates the Agent command runtime and,
 when the installed state changed successfully, calls `tj update --host <host> --revision <commit>`.
+Codex refresh checks running engines before replacing cached plugin files. If an embedded engine cannot
+reload its approvals, refresh retains the installed files and reports the affected sessions. Reloading a
+shared daemon cannot authorize replacement of files still loaded by a separate embedded process.
 The publish file contains the revision and a unique stamp, so separate successful publications of the
 same revision are still distinct events. `tj install` also publishes changes. An installation failure
 does not publish a successful update.
@@ -40,6 +43,8 @@ primary and linked checkouts. Drift reports the explicit `tj prepare --host <hos
 command. Successful plugin activation can still report repository drift; that warning is separate from a
 failed native installation. Explicit repository adoption and install reconciliation own configuration
 changes. See [Agent's installation and scope rules](https://github.com/tj-agents/agent#install).
+Failed startup preparation stops before launching the provider or transferring recovery ownership;
+advisory repository drift alone does not fail preparation.
 
 Each running wrapper watches its host's publication file. Claude waits until its turn and input are
 idle, then types `/reload-plugins` and Enter into the shared console. Unsubmitted text in the console

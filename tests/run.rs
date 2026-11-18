@@ -1524,37 +1524,86 @@ fn the_launch_is_recorded_before_the_agent_starts() {
 
 #[test]
 fn repository_preparation_finishes_before_the_agent_starts() {
-    let sandbox = sandbox();
-    select_tj_agents_checked(&sandbox);
-    let mut arguments = run_arguments(&sandbox, "prepared", "codex", "exit", "10");
-    arguments.truncate(arguments.iter().position(|argument| argument == "--").unwrap() + 1);
-    let preparation_log = sandbox.stubs.join("tj-prepare.log");
-    arguments.extend([
-        python().to_owned(),
-        "-c".to_owned(),
-        format!("import os, shutil; shutil.copyfile(r'{}', os.environ['DUMMY_LOG'])", preparation_log.display()),
-        "multiline\nprompt & | < > ^ %".to_owned(),
-    ]);
-    let child = spawn(&sandbox, &arguments, &sandbox.root);
-    let output = finish(child, Duration::from_secs(30));
-    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
-    let prepared = log(&sandbox, "dummy.log");
-    assert!(prepared.contains("--host codex --cwd"), "{prepared}");
-    assert!(prepared.contains(sandbox.worktree.to_str().unwrap()), "{prepared}");
-    let input: Vec<String> = serde_json::from_str(&log(&sandbox, "stubs/prepare-input.json")).unwrap();
-    assert_eq!(input.last().unwrap(), "multiline\nprompt & | < > ^ %");
+    for host in ["claude", "codex"] {
+        let sandbox = sandbox();
+        select_tj_agents_checked(&sandbox);
+        observe_preparation(&sandbox);
+        let mut arguments = run_arguments(&sandbox, "prepared", host, "exit", "10");
+        arguments.truncate(arguments.iter().position(|argument| argument == "--").unwrap() + 1);
+        let preparation_log = sandbox.stubs.join("tj-prepare.log");
+        let preparation_store = sandbox.stubs.join("prepare-store.log");
+        arguments.extend([
+            python().to_owned(),
+            "-c".to_owned(),
+            format!(
+                "import os, shutil; from pathlib import Path; assert Path(r'{}').is_file(); shutil.copyfile(r'{}', os.environ['DUMMY_LOG'])",
+                preparation_store.display(), preparation_log.display()
+            ),
+            "multiline\nprompt & | < > ^ %".to_owned(),
+        ]);
+        let child = spawn(&sandbox, &arguments, &sandbox.root);
+        let output = finish(child, Duration::from_secs(30));
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        let prepared = log(&sandbox, "dummy.log");
+        assert!(prepared.contains(&format!("--host {host} --cwd")), "{prepared}");
+        assert!(prepared.contains(sandbox.worktree.to_str().unwrap()), "{prepared}");
+        let input: Vec<String> = serde_json::from_str(&log(&sandbox, "stubs/prepare-input.json")).unwrap();
+        assert_eq!(input.last().unwrap(), "multiline\nprompt & | < > ^ %");
+        assert_eq!(log(&sandbox, "stubs/prepare-store.log"), "");
+        assert!(log(&sandbox, "stubs/agent-store.log").contains("launch --launch-id prepared"));
+    }
 }
 
 #[test]
-fn repository_preparation_failure_warns_and_still_starts_the_agent() {
-    let sandbox = sandbox();
-    select_tj_agents_checked(&sandbox);
-    std::fs::write(sandbox.stubs.join("prepare-failure"), "failed").unwrap();
-    let child = start(&sandbox, "prepare-failed", "claude", "exit", "10");
-    let output = finish(child, Duration::from_secs(30));
-    assert_eq!(output.status.code(), Some(3));
-    assert!(String::from_utf8_lossy(&output.stderr).contains("standards preparation failed"));
-    assert!(log(&sandbox, "dummy.log").contains("agent prepare-failed"));
+fn repository_preparation_failure_blocks_native_launch_for_both_hosts() {
+    for host in ["claude", "codex"] {
+        let sandbox = sandbox();
+        select_tj_agents_checked(&sandbox);
+        std::fs::write(sandbox.stubs.join("prepare-failure"), "failed").unwrap();
+        let arguments = run_arguments(&sandbox, "prepare-failed", host, "exit", "10");
+        let output = finish(spawn(&sandbox, &arguments, &sandbox.root), Duration::from_secs(30));
+        assert!(!output.status.success());
+        let error = String::from_utf8_lossy(&output.stderr);
+        assert!(error.contains("standards preparation failed"), "{error}");
+        assert!(error.contains("simulated preparation failure"), "{error}");
+        assert!(sandbox.stubs.join("prepare-input.json").is_file());
+        assert!(!sandbox.log.exists(), "native provider started after preparation failed");
+        assert_eq!(log(&sandbox, "stubs/agent-store.log"), "");
+    }
+}
+
+#[test]
+fn repository_preparation_failure_closes_only_the_existing_successor_open_flag() {
+    for host in ["claude", "codex"] {
+        let sandbox = sandbox();
+        select_tj_agents_checked(&sandbox);
+        std::fs::write(sandbox.stubs.join("prepare-failure"), "failed").unwrap();
+        let mut arguments = run_arguments(&sandbox, "prepare-failed", host, "exit", "10");
+        let separator = arguments.iter().position(|argument| argument == "--").unwrap();
+        arguments.insert(separator, "--successor".to_owned());
+        let output = finish(spawn(&sandbox, &arguments, &sandbox.root), Duration::from_secs(30));
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("simulated preparation failure"));
+        assert!(!sandbox.log.exists(), "native provider started after preparation failed");
+        assert_eq!(log(&sandbox, "stubs/agent-store.log").trim(), "set-open --launch-id prepare-failed --open false");
+    }
+}
+
+fn observe_preparation(sandbox: &Sandbox) {
+    std::fs::write(
+        sandbox.stubs.join("prepare.py"),
+        r#"import json
+import sys
+from pathlib import Path
+
+directory = Path(__file__).parent
+arguments = json.load(sys.stdin.buffer)
+(directory / "prepare-input.json").write_text(json.dumps(arguments), encoding="utf-8")
+store = directory / "agent-store.log"
+(directory / "prepare-store.log").write_text(store.read_text(encoding="utf-8") if store.exists() else "", encoding="utf-8")
+"#,
+    )
+    .unwrap();
 }
 
 #[test]
@@ -1690,9 +1739,15 @@ fn public_resume_accepts_an_interpreter_only_when_native_inventory_proves_its_pi
 fn recovery_admits_the_source_before_native_execution_for_both_hosts() {
     for host in ["claude", "codex"] {
         let sandbox = sandbox();
+        select_tj_agents_checked(&sandbox);
+        observe_preparation(&sandbox);
         let arguments = recovery_admission(&sandbox, host, "dead", false);
         let output = finish(spawn(&sandbox, &arguments, &sandbox.root), Duration::from_secs(30));
         assert!(!output.status.success());
+        assert!(sandbox.stubs.join("prepare-store.log").is_file());
+        let prepared = log(&sandbox, "stubs/prepare-store.log");
+        assert!(!prepared.contains("launch --launch-id") && !prepared.contains("resume --session"), "{prepared}");
+        assert!(!prepared.contains("register --session") && !prepared.contains("set-open"), "{prepared}");
         let log = log(&sandbox, "stubs/agent-store.log");
         assert!(
             log.contains(&format!("resume --session {host}:{PREBOUND} --from-launch-id prior --launch-id resumed")),
@@ -1701,6 +1756,51 @@ fn recovery_admits_the_source_before_native_execution_for_both_hosts() {
         assert!(!log.contains("register --session"), "{log}");
         assert!(log.contains("end --launch-id resumed --reason exited"), "{log}");
         assert!(!log.contains("release-worktree") && !log.contains("end --launch-id prior"), "{log}");
+    }
+}
+
+#[test]
+fn repository_preparation_failure_preserves_prebound_ownership_and_claims() {
+    for host in ["claude", "codex"] {
+        for recovering in [false, true] {
+            let sandbox = sandbox();
+            select_tj_agents_checked(&sandbox);
+            let mut arguments = recovery_admission(&sandbox, host, "dead", false);
+            if !recovering {
+                let at = arguments.iter().position(|argument| argument == "--resume-from").unwrap();
+                arguments.drain(at..at + 2);
+            }
+            set_store_list(
+                &sandbox.stubs,
+                "worktrees",
+                serde_json::json!([{"path": sandbox.worktree, "session": format!("{host}:{PREBOUND}"), "launch_id": "prior"}]),
+            );
+            let prior = log(&sandbox, "stubs/agent-store-prebind-source.json");
+            let claims = log(&sandbox, "stubs/agent-store-worktrees.json");
+            std::fs::write(sandbox.stubs.join("prepare-failure"), "failed").unwrap();
+            let output = finish(spawn(&sandbox, &arguments, &sandbox.root), Duration::from_secs(30));
+            assert!(!output.status.success());
+            let error = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                error.contains("standards preparation failed") && error.contains("simulated preparation failure"),
+                "{error}"
+            );
+            let store = log(&sandbox, "stubs/agent-store.log");
+            for operation in [
+                "launch --launch-id",
+                "register --session",
+                "resume --session",
+                "set-open",
+                "end --launch-id",
+                "release-worktree",
+            ] {
+                assert!(!store.contains(operation), "{host}, recovery={recovering}: {store}");
+            }
+            assert!(!sandbox.stubs.join("agent-store-prebind-bound").exists());
+            assert!(!sandbox.stubs.join("agent-store-prebind-launch.json").exists());
+            assert_eq!(log(&sandbox, "stubs/agent-store-prebind-source.json"), prior);
+            assert_eq!(log(&sandbox, "stubs/agent-store-worktrees.json"), claims);
+        }
     }
 }
 
