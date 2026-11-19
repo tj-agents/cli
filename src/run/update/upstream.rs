@@ -240,7 +240,7 @@ mod tests {
 
     use super::{Answer, CheckError, OwnedUpdate, TIMEOUT, converged, install, recent, record_probe_failure, request};
 
-    const SHA: &str = "3f0578aa4000485aa25477e36592978fa5fa750f";
+    const SHA: &str = "e555013e5e7bab455193e79be12a15e588bdd221";
 
     #[test]
     fn owned_updater_is_terminated_when_the_observer_exits() {

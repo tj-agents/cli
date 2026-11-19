@@ -2550,7 +2550,7 @@ fn an_unclaimed_linked_worktree_requires_recovery_before_closing() {
     assert!(String::from_utf8_lossy(&output.stderr).contains("no recorded ownership; recovery required"));
 }
 
-const MARKETPLACE_SHA: &str = "3f0578aa4000485aa25477e36592978fa5fa750f";
+const MARKETPLACE_SHA: &str = "e555013e5e7bab455193e79be12a15e588bdd221";
 const UPSTREAM_SHA: &str = "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678";
 
 struct Upstream {
