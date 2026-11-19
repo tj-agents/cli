@@ -351,8 +351,11 @@ mod tests {
     #[test]
     fn claude_transcript() {
         let s = claude(&fixture("claude.jsonl"));
+        assert_eq!(s.preview, "fix the AB#1234 login bug");
+        assert_eq!(s.story, "AB#1234");
         assert_eq!(s.branch, "main");
         assert_eq!(s.cwd, "/work/repo");
+        assert!(s.haystack.contains("fix the AB#1234 login bug"));
         assert!(s.haystack.contains("The login handler"));
         assert!(!s.haystack.contains("secret file body"), "tool output must not reach the haystack");
         assert!(!s.haystack.contains("injected context"), "isMeta lines are skipped");
