@@ -215,8 +215,11 @@ A public launch is independent: it does not inherit a calling agent's parent or 
 optional. To delegate into a named Windows Terminal or tmux tab, use
 [Agent's handoff](https://github.com/tj-agents/agent/blob/main/.agents/agent/utility/handoff/SKILL.md), which
 requires exactly one of `--parent <host:id>` and `--independent`. `tj start` supplies the work-item launch
-workflow. A plain `claude` or `codex` command starts the provider directly and does not add TJ supervision
-or closeout receipts.
+workflow. After Agent installation, plain `claude` and `codex` commands also forward through `tj` via
+the installed PowerShell, POSIX shell and PATH bindings. See
+[Agent's installation guidance](https://github.com/tj-agents/agent#install) for binding setup.
+Calling the provider's native executable by its absolute path bypasses those bindings
+and does not add TJ supervision or closeout receipts.
 
 The managed wrapper owns the native child process: a Job Object on Windows or a foreground process group
 on Linux. It records a launch and binds the native session through Agent's SessionStart hook. The title
