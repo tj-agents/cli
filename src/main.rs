@@ -12,6 +12,7 @@ mod item_cli;
 mod message;
 mod native_bridge;
 mod paths;
+mod process_command;
 mod run;
 
 use std::ffi::OsString;
@@ -43,6 +44,8 @@ enum Command {
     /// Internal root process shared by all managed launch paths
     #[command(name = "_session", hide = true)]
     Session(Box<run::Args>),
+    #[command(name = "_process", hide = true)]
+    Process(process_command::ProcessArgs),
     /// Request completion after this native turn delivers its final response
     Finish,
     /// Record a genuine pending answer, child, CI, or approval
@@ -89,6 +92,7 @@ fn main() -> ExitCode {
         Command::Claude(args) => external::host(host::Host::Claude, args),
         Command::Codex(args) => external::host(host::Host::Codex, args),
         Command::Session(args) => run::run(*args),
+        Command::Process(args) => process_command::run(args),
         Command::Finish => run::lifecycle::finish(),
         Command::Wait(args) => run::lifecycle::wait(args),
         Command::Hold(args) => run::lifecycle::hold(args),

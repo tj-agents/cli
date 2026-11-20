@@ -20,6 +20,7 @@ pub(crate) struct Watcher {
     exe: PathBuf,
     running: Option<Stamp>,
     candidate: Option<(Stamp, Instant)>,
+    binary_reported: bool,
     published: PathBuf,
     applied: Option<String>,
 }
@@ -28,15 +29,14 @@ impl Watcher {
     pub(crate) fn new(exe: PathBuf, published: PathBuf) -> Self {
         let running = Stamp::of(&exe);
         let applied = std::fs::read_to_string(&published).ok();
-        Self { exe, running, candidate: None, published, applied }
-    }
-
-    pub(crate) fn exe(&self) -> &Path {
-        &self.exe
+        Self { exe, running, candidate: None, binary_reported: false, published, applied }
     }
 
     /// A replaced executable counts once it has stopped changing and runs.
-    pub(crate) fn binary(&mut self, settle: Duration) -> bool {
+    pub(crate) fn binary_notice(&mut self, settle: Duration) -> bool {
+        if self.binary_reported {
+            return false;
+        }
         let Some(now) = Stamp::of(&self.exe) else { return false };
         if Some(now) == self.running {
             self.candidate = None;
@@ -44,20 +44,25 @@ impl Watcher {
         }
         match self.candidate {
             Some((seen, since)) if seen == now => {
-                since.elapsed() >= settle
+                self.binary_reported = since.elapsed() >= settle
                     && Command::new(&self.exe)
                         .arg("--version")
                         .stdin(Stdio::null())
                         .stdout(Stdio::null())
                         .stderr(Stdio::null())
                         .status()
-                        .is_ok_and(|status| status.success())
+                        .is_ok_and(|status| status.success());
+                self.binary_reported
             }
             _ => {
                 self.candidate = Some((now, Instant::now()));
                 false
             }
         }
+    }
+
+    pub(crate) fn applied_revision(&self) -> Option<&str> {
+        self.applied.as_deref()
     }
 
     pub(crate) fn revision(&self) -> Option<String> {
@@ -97,9 +102,9 @@ mod tests {
         let exe = directory.path().join("tj");
         std::fs::write(&exe, "old").unwrap();
         let mut updates = Watcher::new(exe.clone(), directory.path().join("published"));
-        assert!(!updates.binary(Duration::ZERO));
+        assert!(!updates.binary_notice(Duration::ZERO));
         std::fs::write(&exe, "a newer build").unwrap();
-        assert!(!updates.binary(Duration::ZERO));
-        assert!(!updates.binary(Duration::ZERO), "a file that cannot run was taken for a new binary");
+        assert!(!updates.binary_notice(Duration::ZERO));
+        assert!(!updates.binary_notice(Duration::ZERO), "a file that cannot run was taken for a new binary");
     }
 }

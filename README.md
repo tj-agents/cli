@@ -335,15 +335,8 @@ merged PR set gets a new event.
 ### Runtime updates
 
 The [plugin update flow](docs/plugin-updates.md) owns marketplace checks, installation and reloads in
-running sessions. Separately, the wrapper detects a replacement `tj` executable. Once the new file has
-settled and runs, Claude and input have been idle for 30 seconds, and no background shell remains, it
-hands over to the new binary and resumes the same conversation. The original options remain; the prompt
-and earlier session choice are removed. Completion already awaiting closeout prevents that restart.
-
-Linux replaces the wrapper in place. Windows keeps the old wrapper as the tab's root while its successor
-runs. Launch identity and the conversation remain. Without a bound native session, the current agent
-continues and the wrapper reports the missing binding. A failed resume leaves the reason visible. Codex
-currently takes a replacement binary on its next start.
+running sessions. When a replacement `tj` executable is installed, each open wrapper reports once that
+its next launch will use the new binary. Both hosts keep the same native frontend during plugin refresh.
 
 ## `tj message` and `tj feed`: messaging between sessions
 

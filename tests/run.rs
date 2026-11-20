@@ -175,8 +175,7 @@ fn python() -> &'static str {
 }
 
 fn search_path(sandbox: &Sandbox) -> std::ffi::OsString {
-    let worktrunk = which::which("git-wt").expect("git-wt is not on PATH: python -m tj_cli.worktrunk_install");
-    let mut entries = vec![sandbox.stubs.clone(), worktrunk.parent().unwrap().to_path_buf()];
+    let mut entries = vec![sandbox.stubs.clone()];
     entries.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap()));
     std::env::join_paths(entries).unwrap()
 }
@@ -191,6 +190,7 @@ fn environment(sandbox: &Sandbox) -> Vec<(&'static str, std::ffi::OsString)> {
         ("DUMMY_TJ", std::ffi::OsString::from(env!("CARGO_BIN_EXE_tj"))),
         ("CLAUDE_CONFIG_DIR", sandbox.root.join("claude").into_os_string()),
         ("CODEX_HOME", sandbox.root.join("codex").into_os_string()),
+        ("FAKE_CODEX_LOG", sandbox.root.join("maintenance.jsonl").into_os_string()),
         ("CODEX_THREAD_ID", std::ffi::OsString::new()),
         ("CODEX_SESSION_ID", std::ffi::OsString::new()),
         ("CLAUDECODE", std::ffi::OsString::new()),
@@ -228,8 +228,6 @@ fn run_arguments(sandbox: &Sandbox, launch: &str, host: &str, mode: &str, grace:
         grace,
         "--native-exit-seconds",
         "2",
-        "--restart-grace-seconds",
-        "2",
         "--input-idle-seconds",
         "0",
         "--",
@@ -246,7 +244,24 @@ fn native_codex(sandbox: &Sandbox) -> PathBuf {
     std::fs::create_dir(&directory).unwrap();
     let name = if cfg!(windows) { "codex.exe" } else { "codex" };
     let executable = directory.join(name);
-    std::fs::copy(std::env::current_exe().unwrap(), &executable).unwrap();
+    static IMAGE: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+    let image = IMAGE.get_or_init(|| {
+        let temporary = tempfile::tempdir().unwrap();
+        let output = temporary.path().join(name);
+        let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        let result = Command::new("rustc")
+            .arg("--edition=2024")
+            .arg(fixtures.join("native_codex.rs"))
+            .arg("-o")
+            .arg(&output)
+            .env("TJ_FIXTURE_PYTHON", which::which(python()).unwrap())
+            .env("TJ_FIXTURE_CODEX", fixtures.join("fake_codex.py"))
+            .output()
+            .unwrap();
+        assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stderr));
+        std::fs::read(output).unwrap()
+    });
+    std::fs::write(&executable, image).unwrap();
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -274,8 +289,8 @@ fn prebound_arguments_with_prompt(sandbox: &Sandbox, launch: &str, prompt: &str)
             sandbox.worktree.to_string_lossy().into_owned(),
             "resume".to_owned(),
             PREBOUND.to_owned(),
-            "--no-daemon".to_owned(),
-            "--dangerously-bypass-hook-trust".to_owned(),
+            "--remote".to_owned(),
+            "unix://".to_owned(),
             "--".to_owned(),
             prompt.to_owned(),
         ],
@@ -911,13 +926,11 @@ fn kill_dummy(sandbox: &Sandbox) {
 }
 
 #[test]
-fn merge_notice_identity_survives_successor_restarts_and_new_launches_of_the_same_session() {
+fn merge_notice_identity_survives_new_launches_of_the_same_session() {
     for host in ["claude", "codex"] {
         let sandbox = sandbox();
         set_reply(&sandbox, "tj-item-prs.json", MERGED);
-        for (number, launch, successor) in
-            [(0, "original", false), (1, "original", true), (2, "new-launch", false), (3, "another-item", false)]
-        {
+        for (number, launch) in [(0, "original"), (2, "new-launch"), (3, "another-item")] {
             // A real new launch replaces the binding, while the native session and its feed persist.
             if number >= 2 {
                 std::fs::remove_file(sandbox.stubs.join("agent-store-show.json")).unwrap();
@@ -941,10 +954,6 @@ fn merge_notice_identity_survives_successor_restarts_and_new_launches_of_the_sam
                     "tj-item-prs.json",
                     r#"{"ref":"github:github.com/acme/app:2","all_merged":true,"prs":[{"url":"u"}]}"#,
                 );
-            }
-            if successor {
-                let separator = arguments.iter().position(|argument| argument == "--").unwrap();
-                arguments.splice(separator..separator, ["--successor"].map(str::to_owned));
             }
             let starts = log(&sandbox, "dummy.log").lines().filter(|line| line.starts_with("pid ")).count();
             let child = spawn(&sandbox, &arguments, &sandbox.root);
@@ -1602,11 +1611,62 @@ fn a_prebound_native_codex_session_registers_and_verifies_before_spawning() {
 }
 
 #[test]
+fn prebound_receipt_identifies_only_the_verified_frontend() {
+    let sandbox = sandbox();
+    prebind(&sandbox, false);
+    let arguments = prebound_arguments_with_prompt(&sandbox, "frontend", "hold receipt fixture");
+    let child = spawn(&sandbox, &arguments, &sandbox.root);
+    wait_until("native frontend did not start", || log(&sandbox, "maintenance.jsonl").contains("frontend"));
+    let receipt = || {
+        Command::new(env!("CARGO_BIN_EXE_tj"))
+            .args(["_process", "spawned", "--launch-id", "frontend", "--session", &format!("codex:{PREBOUND}")])
+            .envs(environment(&sandbox))
+            .output()
+            .unwrap()
+    };
+    let output = receipt();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let observed: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let transport = sandbox.root.join("cache/run/frontend/transport.json");
+    let mut recorded: serde_json::Value = serde_json::from_slice(&std::fs::read(&transport).unwrap()).unwrap();
+    assert_eq!(observed["native"], recorded["native"]);
+    assert!(observed["native"]["pid"].as_u64().unwrap() > 0);
+    assert_eq!(observed["launch_id"], "frontend");
+    assert_eq!(observed["session"], format!("codex:{PREBOUND}"));
+    assert_eq!(observed["codex_transport"], "local-daemon");
+    assert_eq!(
+        Path::new(observed["endpoint"].as_str().unwrap()),
+        sandbox.root.join("codex/app-server-control/app-server-control.sock")
+    );
+    recorded["native"]["started_at"] = serde_json::json!("2000-01-01T00:00:00Z");
+    std::fs::write(&transport, serde_json::to_vec(&recorded).unwrap()).unwrap();
+    assert!(!receipt().status.success());
+    recorded["native"] = serde_json::Value::Null;
+    std::fs::write(&transport, serde_json::to_vec(&recorded).unwrap()).unwrap();
+    assert_eq!(serde_json::from_slice::<serde_json::Value>(&receipt().stdout).unwrap(), serde_json::Value::Null);
+    std::fs::write(sandbox.root.join("maintenance.exit"), "").unwrap();
+    assert!(finish(child, Duration::from_secs(30)).status.success());
+}
+
+#[test]
+fn prebound_daemon_start_failure_closes_the_unstarted_launch_and_reports_stderr() {
+    let sandbox = sandbox();
+    prebind(&sandbox, false);
+    std::fs::write(sandbox.root.join("maintenance.fail"), "").unwrap();
+    let args = prebound_arguments_with_prompt(&sandbox, "daemon-failure", "hold receipt fixture");
+    let output = finish(spawn(&sandbox, &args, &sandbox.root), Duration::from_secs(30));
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("fixture daemon start refused"));
+    assert!(!log(&sandbox, "maintenance.jsonl").contains("frontend"));
+    assert!(log(&sandbox, "stubs/agent-store.log").contains("end --launch-id daemon-failure --reason not_started"));
+}
+
+#[test]
 fn a_prebound_codex_accepts_model_and_effort_before_the_literal_prompt() {
     let sandbox = sandbox();
     prebind(&sandbox, false);
     let mut arguments = prebound_arguments_with_prompt(&sandbox, "lane-model", "--model=literal-prompt");
-    let delimiter = arguments.iter().position(|argument| argument == "--no-daemon").unwrap();
+    let delimiter = arguments.iter().position(|argument| argument == "--remote").unwrap();
     arguments.splice(
         delimiter..delimiter,
         ["--model", "chosen-model", "-c", "model_reasoning_effort=xhigh"].map(str::to_owned),
@@ -2120,7 +2180,7 @@ fn missing_claude_adapter_or_completion_receipt_never_applies_or_types_an_update
 fn a_managed_codex_update_stays_unverified_without_reloading_an_unrelated_daemon() {
     let sandbox = sandbox();
     let codex = fake_codex(&sandbox);
-    let diagnostic = "plugin activation remains unverified until a native restart";
+    let diagnostic = "this command has no verified default-daemon attachment";
     let stderr_path = sandbox.root.join("wrapper-stderr.log");
     set_reply(&sandbox, "agent-store-show.json", BOUND);
     let keys = cfg!(windows);
@@ -2158,67 +2218,71 @@ fn a_managed_codex_update_stays_unverified_without_reloading_an_unrelated_daemon
 }
 
 #[test]
-fn a_new_tj_binary_resumes_the_same_conversation_in_the_same_tab() {
-    let sandbox = sandbox();
-    let bin = sandbox.root.join("bin");
-    std::fs::create_dir(&bin).unwrap();
-    let name = |stem: &str| format!("{stem}{}", std::env::consts::EXE_SUFFIX);
-    let install = |extra: &[u8]| {
-        let target = bin.join(name("tj"));
-        if target.exists() {
-            std::fs::rename(&target, bin.join(format!("{}.old", name("tj")))).unwrap();
-        }
-        let mut binary = std::fs::read(env!("CARGO_BIN_EXE_tj")).unwrap();
-        binary.extend_from_slice(extra);
-        std::fs::write(&target, binary).unwrap();
-        #[cfg(unix)]
+fn a_binary_and_plugin_publication_keep_the_same_frontend_and_announce_the_next_launch_once() {
+    for host in ["claude", "codex"] {
+        let sandbox = sandbox();
+        let bin = sandbox.root.join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let name = |stem: &str| format!("{stem}{}", std::env::consts::EXE_SUFFIX);
+        let install = |extra: &[u8]| {
+            let target = bin.join(name("tj"));
+            if target.exists() {
+                std::fs::rename(&target, bin.join(format!("{}.old", name("tj")))).unwrap();
+            }
+            let mut binary = std::fs::read(env!("CARGO_BIN_EXE_tj")).unwrap();
+            binary.extend_from_slice(extra);
+            std::fs::write(&target, binary).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+        };
+        install(b"");
+        #[cfg(windows)]
+        std::fs::copy(env!("CARGO_BIN_EXE_tj_hook"), bin.join(name("tj_hook"))).unwrap();
+        set_reply(&sandbox, "agent-store-show.json", BOUND);
+        let arguments = with_prompt(&sandbox, "upgrade", host, "signal");
+        let stderr = sandbox.root.join("upgrade-stderr.log");
+        let mut command = Command::new(bin.join(name("tj")));
+        command
+            .args(arguments)
+            .current_dir(&sandbox.root)
+            .envs(environment(&sandbox))
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(std::fs::File::create(&stderr).unwrap());
+        #[cfg(windows)]
         {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
+            use std::os::windows::process::CommandExt;
+            command.creation_flags(0x0800_0000);
         }
-    };
-    install(b"");
-    #[cfg(windows)]
-    std::fs::copy(env!("CARGO_BIN_EXE_tj_hook"), bin.join(name("tj_hook"))).unwrap();
-    set_reply(&sandbox, "agent-store-show.json", BOUND);
-    let mut arguments = with_prompt(&sandbox, "upgrade", "claude", "signal");
-    let restart = arguments.iter().position(|argument| argument == "--restart-grace-seconds").unwrap();
-    arguments[restart + 1] = "0".to_owned();
-    let mut command = Command::new(bin.join(name("tj")));
-    command
-        .args(arguments)
-        .current_dir(&sandbox.root)
-        .envs(environment(&sandbox))
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        command.creation_flags(0x0800_0000);
+        let mut child = Child::new(command.spawn().unwrap(), &sandbox);
+        wait_for_log(&sandbox, "pid ");
+        let adapter = (host == "claude").then(|| NativeAdapter::start(&sandbox));
+        set_status(&sandbox, "idle");
+        install(b"\0");
+        publish(&sandbox, host, "plugins with new binary");
+        if let Some(adapter) = adapter {
+            let request = adapter.request();
+            adapter.receipt(&sandbox, &request);
+        } else {
+            // The arbitrary dummy command lacks a daemon attachment; reload must still be attempted.
+            wait_until("missing plugin refresh diagnostic", || {
+                log(&sandbox, "upgrade-stderr.log").contains("no verified default-daemon attachment")
+            });
+        }
+        let notice = "A new tj binary is installed. Your next launch will use it.";
+        wait_until("missing pending binary notice", || log(&sandbox, "upgrade-stderr.log").contains(notice));
+        still_running(&mut child, Duration::from_secs(2));
+        let native = log(&sandbox, "dummy.log");
+        assert_eq!(native.lines().filter(|line| line.starts_with("pid ")).count(), 1, "{native}");
+        assert!(!native.contains("graceful"), "{native}");
+        assert_no_prompt_delivery(&sandbox);
+        assert_eq!(in_agent(&sandbox, &["exit-native"]).0, 0);
+        assert!(finish(child, Duration::from_secs(60)).status.success());
+        assert_eq!(log(&sandbox, "upgrade-stderr.log").matches(notice).count(), 1);
     }
-    let mut child = Child::new(command.spawn().unwrap(), &sandbox);
-    wait_for_log(&sandbox, "pid ");
-    assert_eq!(in_agent(&sandbox, &["hold"]).0, 0);
-    set_status(&sandbox, "busy");
-    install(b"\0");
-    still_running(&mut child, Duration::from_secs(6));
-    assert!(!log(&sandbox, "dummy.log").contains("graceful"), "restarted mid-turn");
-    set_status(&sandbox, "idle");
-    wait_for_log(&sandbox, "args --model m --resume sess-1");
-    still_running(&mut child, Duration::from_secs(1));
-    let agent = log(&sandbox, "dummy.log");
-    assert!(agent.contains("graceful"), "the agent was not stopped gracefully: {agent}");
-    assert_eq!(agent.matches("agent upgrade Test tab").count(), 2, "{agent}");
-    let store = log(&sandbox, "stubs/agent-store.log");
-    assert_eq!(store.matches("launch --launch-id upgrade ").count(), 1, "{store}");
-    assert!(!store.contains("end --launch-id upgrade"), "{store}");
-    done(&sandbox);
-    still_running(&mut child, Duration::from_secs(6));
-    assert!(sandbox.worktree.exists(), "the successor lost the keep-open hold");
-    assert_eq!(in_agent(&sandbox, &["hold", "--release"]).0, 0);
-    let output = finish(child, Duration::from_secs(60));
-    assert_closed_out(&sandbox, &output, "upgrade");
 }
 
 #[test]
@@ -3035,7 +3099,7 @@ fn pending_codex_activation_does_not_suppress_periodic_checks_or_repeat_the_warn
     let output = finish(child, Duration::from_secs(30));
     assert!(output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert_eq!(stderr.matches("plugin activation remains unverified until a native restart").count(), 1, "{stderr}");
+    assert_eq!(stderr.matches("this command has no verified default-daemon attachment").count(), 1, "{stderr}");
 }
 
 #[test]

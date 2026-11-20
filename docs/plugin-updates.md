@@ -60,23 +60,26 @@ without editing or submitting the user's composer. Missing adapters, failed relo
 receipts leave activation unverified. Adapter replacement can reconcile a reload once; message
 requests are never replayed.
 
-Managed Codex uses an embedded `--no-daemon` engine. The wrapper reports that plugin activation remains
-unverified until a native restart; it cannot refresh that engine through an unrelated shared daemon.
-The external daemon observer still requests `config/batchWrite` with `reloadUserConfig: true` for its
-own daemon. That request alone does not prove each loaded thread refreshed successfully or replace
-instructions delivered in earlier turns. Neither path types into or submits a draft.
+Managed Codex attaches its native TUI to the default local daemon with `--remote unix://`.
+The wrapper runs the selected absolute executable to start or verify the service before supervising
+the TUI. A startup or version mismatch is a launch error. Codex reports incompatible native arguments.
+The wrapper and daemon observer coordinate each published revision at the socket. They request
+`config/batchWrite` with `reloadUserConfig: true`, then read `hooks/list` for each loaded thread.
+The adjacent `.tj-reload.json` receipt records the observed hook keys, source paths, hashes and trust
+states by thread. Agent checks expected plugin content against the project selection. The native TUI
+keeps its composer throughout refresh, and prior conversation history retains its original instructions.
 
-The wrapper separately detects a replacement `tj` binary. It can resume an idle Claude session under
-the new binary with the same conversation; Codex currently takes the new binary on its next start.
+A replacement `tj` binary takes effect on the next launch. The running wrapper reports the pending
+change once and continues to process plugin publications through the current frontend.
 
 ## Acceptance checks
 
 - Merge a marketplace pin change with `tj claude` and `tj codex` sessions already open. Without a manual
   update, observe the installation and each host's publication. For Claude, keep an unsent draft,
   observe the native completion receipt when idle, and exercise changed behavior in the same
-  conversation with the draft intact. Managed Codex must report activation as unverified until a
-  native restart. For external daemon sessions, exercise changed behavior in a later turn instead of
-  relying on an RPC acknowledgement or completion list.
+  conversation with the draft intact. For Codex, check the loaded thread's hooks and the skill
+  content in its next request. Publish a binary replacement with the plugins and verify the same
+  frontend PID, one pending notice and the original draft on submission.
 - Start and resume a Codex session in a selecting repository. Confirm its SessionStart hooks finish
   within their timeouts and its repository standards are available.
 - Exercise `tj claude`, `tj codex`, `tj plugins update`, `tj install`, `tj start`, `tj status`, `tj recover`,

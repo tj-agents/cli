@@ -149,6 +149,15 @@ pub fn prebind(launch: &Launch, handle: &str, wrapper_pid: u32, wrapper_started_
     exact_session(&call(&["show", handle])?["session"], launch, handle)
 }
 
+pub fn end_not_started_unbound(launch: &Launch, wrapper_pid: u32, wrapper_started_at: &str) -> Result<()> {
+    let data = call(&["show", "--launch-id", &launch.id])?;
+    exact_launch(&data, launch, wrapper_pid, wrapper_started_at)?;
+    if !data["launch"]["session"].is_null() {
+        bail!("unstarted launch already has a session binding");
+    }
+    end(&launch.id, "not_started")
+}
+
 pub fn end_not_started(launch: &Launch, handle: &str, wrapper_pid: u32, wrapper_started_at: &str) -> Result<()> {
     let data = call(&["show", "--launch-id", &launch.id])?;
     launch_has_no_foreign_binding(&data, launch, handle, wrapper_pid, wrapper_started_at)?;

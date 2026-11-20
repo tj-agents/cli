@@ -10,7 +10,7 @@ use fs4::FileExt;
 use serde_json::{Value, json};
 use tj_cli::process::{self, agent};
 
-use super::{Watcher, published, upstream};
+use super::{Watcher, published, refresh, upstream};
 use crate::app_server::Server;
 use crate::host::Host;
 
@@ -20,6 +20,9 @@ const START_TIMEOUT: Duration = Duration::from_secs(12);
 
 #[derive(clap::Args)]
 pub struct Args {
+    /// Absolute native Codex executable selected by the adapter.
+    #[arg(long)]
+    codex: PathBuf,
     /// Existing daemon control socket; this command never starts a daemon.
     #[arg(long)]
     socket: PathBuf,
@@ -36,7 +39,7 @@ pub struct Args {
     foreground: bool,
 }
 
-fn sibling(socket: &Path, suffix: &str) -> Result<PathBuf> {
+pub(super) fn sibling(socket: &Path, suffix: &str) -> Result<PathBuf> {
     let mut name = socket.file_name().context("socket has no file name")?.to_os_string();
     name.push(suffix);
     Ok(socket.with_file_name(name))
@@ -50,24 +53,24 @@ fn ready_path(socket: &Path) -> Result<PathBuf> {
 }
 
 #[cfg(windows)]
-fn socket_identity(socket: &Path) -> Result<(u64, u64)> {
+pub(super) fn socket_identity(socket: &Path) -> Result<(u64, u64)> {
     use std::os::windows::fs::MetadataExt;
     let metadata = fs::metadata(socket).context("could not inspect daemon socket")?;
     Ok((metadata.creation_time(), metadata.last_write_time()))
 }
 
 #[cfg(target_os = "linux")]
-struct SocketGuard(File);
+pub(super) struct SocketGuard(File);
 
 #[cfg(target_os = "linux")]
 impl SocketGuard {
-    fn open(socket: &Path) -> Result<Self> {
+    pub(super) fn open(socket: &Path) -> Result<Self> {
         use rustix::fs::{Mode, OFlags, open};
         let fd = open(socket, OFlags::PATH | OFlags::CLOEXEC, Mode::empty()).context("could not pin daemon socket")?;
         Ok(Self(File::from(fd)))
     }
 
-    fn identity(&self) -> Result<(u64, u64)> {
+    pub(super) fn identity(&self) -> Result<(u64, u64)> {
         use std::os::unix::fs::MetadataExt;
         let metadata = self.0.metadata().context("could not inspect pinned daemon socket")?;
         Ok((metadata.dev(), metadata.ino()))
@@ -75,20 +78,20 @@ impl SocketGuard {
 }
 
 #[cfg(not(target_os = "linux"))]
-struct SocketGuard((u64, u64));
+pub(super) struct SocketGuard((u64, u64));
 
 #[cfg(not(target_os = "linux"))]
 impl SocketGuard {
-    fn open(socket: &Path) -> Result<Self> {
+    pub(super) fn open(socket: &Path) -> Result<Self> {
         socket_identity(socket).map(Self)
     }
-    fn identity(&self) -> Result<(u64, u64)> {
+    pub(super) fn identity(&self) -> Result<(u64, u64)> {
         Ok(self.0)
     }
 }
 
 #[cfg(unix)]
-fn socket_identity(socket: &Path) -> Result<(u64, u64)> {
+pub(super) fn socket_identity(socket: &Path) -> Result<(u64, u64)> {
     use std::os::unix::fs::MetadataExt;
     let metadata = fs::metadata(socket).context("could not inspect daemon socket")?;
     Ok((metadata.dev(), metadata.ino()))
@@ -138,22 +141,14 @@ fn owner_ready(socket: &Path) -> Result<bool> {
 }
 
 fn loaded(server: &mut Server) -> Result<bool> {
-    let result = server.request("thread/loaded/list", json!({})).context("could not list daemon threads")?;
-    Ok(!result["data"].as_array().context("daemon returned an invalid thread list")?.is_empty())
+    Ok(!refresh::threads(server)?.is_empty())
 }
 
-fn reload(server: &mut Server) -> Result<()> {
-    server
-        .request("config/batchWrite", json!({"edits": [], "reloadUserConfig": true}))
-        .context("could not reload daemon configuration")?;
-    Ok(())
-}
-
-fn status(socket: &Path) -> Result<u8> {
+fn status(codex: &Path, socket: &Path) -> Result<u8> {
     if !socket.exists() {
         return Ok(3);
     }
-    let mut server = Server::connect_socket(socket).context("could not connect to existing Codex daemon")?;
+    let mut server = Server::connect_socket(codex, socket).context("could not connect to existing Codex daemon")?;
     if !loaded(&mut server)? {
         return Ok(3);
     }
@@ -171,7 +166,7 @@ impl Drop for Starting {
 }
 
 fn start(args: &Args) -> Result<ExitCode> {
-    match status(&args.socket)? {
+    match status(&args.codex, &args.socket)? {
         0 => return Ok(ExitCode::SUCCESS),
         3 => return Ok(ExitCode::from(3)),
         _ => {}
@@ -183,6 +178,8 @@ fn start(args: &Args) -> Result<ExitCode> {
         OsString::from("--"),
         exe.into_os_string(),
         OsString::from("observe-codex-updates"),
+        OsString::from("--codex"),
+        args.codex.clone().into_os_string(),
         OsString::from("--socket"),
         args.socket.clone().into_os_string(),
         OsString::from("--cwd"),
@@ -194,7 +191,7 @@ fn start(args: &Args) -> Result<ExitCode> {
     let deadline = Instant::now() + START_TIMEOUT;
     loop {
         if owner_ready(&args.socket)? {
-            match status(&args.socket)? {
+            match status(&args.codex, &args.socket)? {
                 0 => {
                     child.0.take();
                     return Ok(ExitCode::SUCCESS);
@@ -221,9 +218,15 @@ fn stop_check(check: Option<JoinHandle<Result<Option<upstream::OwnedUpdate>, ups
     }
 }
 
+struct Location<'a> {
+    cwd: &'a Path,
+    socket: &'a Path,
+    identity: (u64, u64),
+}
+
 fn observe(
     server: &mut Server,
-    cwd: &Path,
+    location: Location<'_>,
     mut watcher: Watcher,
     settings: (Duration, bool),
     current_socket: impl Fn() -> Result<bool>,
@@ -241,17 +244,19 @@ fn observe(
                 if !current_socket()? {
                     return Ok(());
                 }
-                if !loaded(server)? {
+                let loaded = refresh::threads(server)?;
+                if loaded.is_empty() {
                     return Ok(());
                 }
-                if let Some(revision) = watcher.revision() {
-                    reload(server)?;
+                if let Some(revision) = watcher.revision()
+                    && refresh::apply(server, location.socket, location.identity, Some(&revision), &loaded)?
+                {
                     watcher.applied(Some(revision));
                 }
                 next_poll = now + poll;
             }
             if check_updates && now >= next_upstream && check.is_none() && updater.is_none() {
-                check = upstream::start_owned(Host::Codex, cwd, upstream::MARKETPLACE.to_owned());
+                check = upstream::start_owned(Host::Codex, location.cwd, upstream::MARKETPLACE.to_owned());
                 next_upstream = now + UPSTREAM;
             }
             if check.as_ref().is_some_and(JoinHandle::is_finished) {
@@ -303,7 +308,8 @@ fn foreground(args: &Args) -> Result<ExitCode> {
     }
     let socket_guard = SocketGuard::open(&args.socket)?;
     let socket = socket_guard.identity()?;
-    let mut server = Server::connect_socket(&args.socket).context("could not connect to existing Codex daemon")?;
+    let mut server =
+        Server::connect_socket(&args.codex, &args.socket).context("could not connect to existing Codex daemon")?;
     if socket_identity(&args.socket)? != socket {
         bail!("daemon socket changed during observer startup");
     }
@@ -316,14 +322,23 @@ fn foreground(args: &Args) -> Result<ExitCode> {
         &mut server,
         |server| {
             let watcher = Watcher::new(std::env::current_exe()?, published(Host::Codex)?);
-            reload(server)?;
+            loop {
+                let loaded = refresh::threads(server)?;
+                if loaded.is_empty() {
+                    return Ok(());
+                }
+                if refresh::apply(server, &args.socket, socket, watcher.applied_revision(), &loaded)? {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
             fs::write(
                 &marker,
                 serde_json::to_vec(&json!({"pid": pid, "started": identity, "socket": [socket.0, socket.1]}))?,
             )?;
             observe(
                 server,
-                &args.cwd,
+                Location { cwd: &args.cwd, socket: &args.socket, identity: socket },
                 watcher,
                 (POLL, true),
                 || Ok(socket_identity(&args.socket)? == socket),
@@ -337,11 +352,14 @@ fn foreground(args: &Args) -> Result<ExitCode> {
 }
 
 pub(crate) fn run(args: Args) -> Result<ExitCode> {
+    if !args.codex.is_absolute() {
+        bail!("observer requires an absolute Codex executable");
+    }
     if !args.socket.is_absolute() || !args.cwd.is_absolute() || !args.cwd.is_dir() {
         bail!("observer requires an absolute socket and existing absolute working directory");
     }
     if args.status {
-        return Ok(ExitCode::from(status(&args.socket)?));
+        return Ok(ExitCode::from(status(&args.codex, &args.socket)?));
     }
     if args.start {
         return start(&args);
@@ -398,11 +416,13 @@ mod tests {
         let log = directory.path().join("daemon.jsonl");
         let publication = directory.path().join("published");
         fs::write(&publication, "old-revision").unwrap();
+        let socket = directory.path().join("daemon.sock");
+        fs::write(&socket, "socket").unwrap();
         let mut server = fake(&log, &publication, "observer");
-        let watcher = Watcher::new(std::env::current_exe().unwrap(), publication);
+        let watcher = Watcher::new(std::env::current_exe().unwrap(), publication.clone());
         observe(
             &mut server,
-            directory.path(),
+            Location { cwd: directory.path(), socket: &socket, identity: socket_identity(&socket).unwrap() },
             watcher,
             (Duration::from_millis(20), false),
             || Ok(true),
@@ -422,12 +442,14 @@ mod tests {
         let log = directory.path().join("daemon.jsonl");
         let publication = directory.path().join("published");
         fs::write(&publication, "old-revision").unwrap();
+        let socket = directory.path().join("daemon.sock");
+        fs::write(&socket, "socket").unwrap();
         let mut server = fake(&log, &publication, "observer-disconnect");
-        let watcher = Watcher::new(std::env::current_exe().unwrap(), publication);
+        let watcher = Watcher::new(std::env::current_exe().unwrap(), publication.clone());
         assert!(
             observe(
                 &mut server,
-                directory.path(),
+                Location { cwd: directory.path(), socket: &socket, identity: socket_identity(&socket).unwrap() },
                 watcher,
                 (Duration::from_millis(20), false),
                 || Ok(true),
@@ -444,7 +466,7 @@ mod tests {
     #[test]
     fn absent_socket_is_not_applicable_without_starting_a_daemon() {
         let directory = tempfile::tempdir().unwrap();
-        assert_eq!(status(&directory.path().join("missing.sock")).unwrap(), 3);
+        assert_eq!(status(&directory.path().join("unused"), &directory.path().join("missing.sock")).unwrap(), 3);
         assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 0);
     }
 
@@ -510,7 +532,11 @@ mod tests {
                     let watcher = Watcher::new(std::env::current_exe()?, publication.clone());
                     observe(
                         server,
-                        &cwd,
+                        Location {
+                            cwd: &cwd,
+                            socket: &cwd.join("daemon.sock"),
+                            identity: socket_identity(&cwd.join("daemon.sock")).unwrap(),
+                        },
                         watcher,
                         (Duration::from_millis(20), false),
                         || Ok(true),

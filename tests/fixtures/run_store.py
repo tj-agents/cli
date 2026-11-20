@@ -72,6 +72,7 @@ def prebound_reply(
             "native_id": session,
             "host": host,
             "launch_id": launch["launch_id"],
+            "wrapper": launch["wrapper"],
             "state": "active",
         }
         if bound

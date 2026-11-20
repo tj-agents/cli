@@ -42,6 +42,8 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --all-targets --locked -- -D warnings
       - run: cargo test --locked
+      - name: Verify the pinned native Codex daemon and loaded thread refresh
+        run: python tests/fixtures/native_refresh.py
 
       - name: Verify managed PowerShell (Linux x64)
         if: runner.os == 'Linux' && runner.arch == 'X64'

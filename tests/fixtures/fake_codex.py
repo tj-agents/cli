@@ -237,11 +237,68 @@ def proxy(
                 {"id": request["id"], "error": {"message": "fixture rejected request"}},
             )
         else:
-            result = request["params"] if method == "test/echo" else {}
+            result: dict[str, object]
+            if method == "initialize":
+                result = {
+                    "codexHome": os.environ.get("CODEX_HOME", ""),
+                    "userAgent": "fixture/0.169.0",
+                }
+            elif method == "config/batchWrite":
+                result = {"status": "ok"}
+            elif method == "hooks/list":
+                result = {
+                    "data": [
+                        {
+                            "cwd": str(Path.cwd()),
+                            "errors": [],
+                            "hooks": [],
+                            "warnings": [],
+                        }
+                    ]
+                }
+            else:
+                result = request["params"] if method == "test/echo" else {}
             reply(source, target, log, {"id": request["id"], "result": result})
 
 
 def main() -> None:
+    if sys.argv[1:3] == ["app-server", "daemon"]:
+        operation = sys.argv[3]
+        append(Path(os.environ["FAKE_CODEX_LOG"]), {"daemon": operation})
+        socket = (
+            Path(os.environ["CODEX_HOME"])
+            / "app-server-control/app-server-control.sock"
+        )
+        if (
+            operation == "start"
+            and Path(os.environ["FAKE_CODEX_LOG"]).with_suffix(".fail").exists()
+        ):
+            sys.exit("fixture daemon start refused")
+        if operation == "start":
+            socket.parent.mkdir(parents=True, exist_ok=True)
+            socket.touch()
+        if not socket.exists():
+            sys.exit("fixture daemon is offline")
+        print(
+            json.dumps(
+                {
+                    "status": "running",
+                    "socketPath": str(socket),
+                    "backend": "pid",
+                    "cliVersion": "0.169.0",
+                    "appServerVersion": os.environ.get(
+                        "FAKE_DAEMON_VERSION", "0.169.0"
+                    ),
+                }
+            )
+        )
+        return
+    if sys.argv[1:2] == ["--cd"] and sys.argv[-1] == "hold receipt fixture":
+        log = Path(os.environ["FAKE_CODEX_LOG"])
+        append(log, {"frontend": sys.argv[1:]})
+        while not log.with_suffix(".exit").exists():
+            threading.Event().wait(0.1)
+        return
     if sys.argv[1:] == ["hold-open"]:
         threading.Event().wait()
         return
@@ -254,8 +311,12 @@ def main() -> None:
         sys.stdout.buffer,
         log,
         os.environ.get("FAKE_CODEX_SCENARIO", "normal"),
-        Path(os.environ["FAKE_OBSERVER_PUBLICATION"]) if "FAKE_OBSERVER_PUBLICATION" in os.environ else None,
-        Path(os.environ["FAKE_OBSERVER_SHUTDOWN"]) if "FAKE_OBSERVER_SHUTDOWN" in os.environ else None,
+        Path(os.environ["FAKE_OBSERVER_PUBLICATION"])
+        if "FAKE_OBSERVER_PUBLICATION" in os.environ
+        else None,
+        Path(os.environ["FAKE_OBSERVER_SHUTDOWN"])
+        if "FAKE_OBSERVER_SHUTDOWN" in os.environ
+        else None,
     )
 
 
