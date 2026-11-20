@@ -13,7 +13,7 @@ pub(super) struct Journal {
     pub(super) removals: Vec<Removal>,
 }
 
-fn path(launch_id: &str) -> Result<PathBuf> {
+pub(in crate::run) fn path(launch_id: &str) -> Result<PathBuf> {
     Ok(super::super::marks(launch_id)?.with_extension("closeout.json"))
 }
 

@@ -9,7 +9,7 @@ use super::{Launch, hidden, lifecycle, store};
 use crate::completion::{State, Step};
 use crate::{feed, item_cli, paths};
 
-mod journal;
+pub(super) mod journal;
 
 fn repository(launch: &Launch) -> Result<PathBuf> {
     if launch.cwd.is_dir() {

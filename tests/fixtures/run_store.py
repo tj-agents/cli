@@ -38,6 +38,22 @@ def prebound_reply(
         raise ValueError("prebound session must be text")
     launch_file = root / "agent-store-prebind-launch.json"
     bound_file = root / "agent-store-prebind-bound"
+    source_file = root / "agent-store-prebind-source.json"
+    source_id = configuration_data.get("resume_from")
+    if (
+        command == "show"
+        and source_id
+        and (
+            arguments[:2] == ["--launch-id", source_id]
+            or (arguments[:1] != ["--launch-id"] and not bound_file.exists())
+        )
+    ):
+        source = json.loads(source_file.read_text(encoding="utf-8"))
+        return {"ok": True, "data": source}
+    if command == "resume":
+        if not reply["ok"]:
+            return reply
+        bound_file.touch()
     if command == "launch":
         launch = {
             "launch_id": value(arguments, "--launch-id"),
@@ -59,7 +75,7 @@ def prebound_reply(
             return reply
         bound_file.touch()
         return {"ok": True, "data": {}}
-    if command != "show":
+    if command not in {"show", "resume"}:
         return None
     launch = json.loads(launch_file.read_text(encoding="utf-8"))
     host = configuration_data.get("host", "codex")

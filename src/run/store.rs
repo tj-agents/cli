@@ -53,8 +53,9 @@ pub fn launch(launch: &Launch, parent: Option<&str>, wrapper_pid: u32, wrapper_s
     call(&arguments).map(drop)
 }
 
-pub fn recorded(launch_id: &str) -> bool {
-    call(&["show", "--launch-id", launch_id]).is_ok()
+pub fn recorded_for(launch: &Launch, wrapper_pid: u32, wrapper_started_at: &str) -> bool {
+    call(&["show", "--launch-id", &launch.id])
+        .is_ok_and(|data| exact_launch(&data, launch, wrapper_pid, wrapper_started_at).is_ok())
 }
 
 fn text<'a>(value: &'a Value, field: &str) -> Result<&'a str> {
@@ -84,8 +85,10 @@ pub(super) fn exact_launch(data: &Value, launch: &Launch, wrapper_pid: u32, wrap
 }
 
 /// `session` is the session row; agent-store's `show <handle>` returns it without a launch row.
-fn exact_session(session: &Value, launch: &Launch, handle: &str) -> Result<()> {
-    let native_id = handle.strip_prefix("codex:").context("prebound session is not codex")?;
+pub(super) fn exact_session(session: &Value, launch: &Launch, handle: &str) -> Result<()> {
+    let native_id = handle
+        .strip_prefix(&format!("{}:", launch.host.name()))
+        .context("prebound session does not match the launch host")?;
     if text(session, "session")? != handle
         || text(session, "native_id")? != native_id
         || text(session, "host")? != launch.host.name()
@@ -135,6 +138,7 @@ fn register_arguments(launch: &Launch, handle: &str) -> Result<Vec<String>> {
         cwd.to_owned(),
         "--launch-id".to_owned(),
         launch.id.clone(),
+        "--require-unowned".to_owned(),
     ])
 }
 
@@ -196,7 +200,7 @@ pub struct Claim {
     pub path: PathBuf,
 }
 
-fn item(row: &Value) -> Result<Option<item::Reference>> {
+pub(super) fn item(row: &Value) -> Result<Option<item::Reference>> {
     let value = row.get("item").context("agent-store launch is missing its item field")?;
     if value.is_null() {
         return Ok(None);
@@ -266,16 +270,23 @@ pub fn predecessors(launch: &Launch, owner: &Ownership) -> Result<Vec<Row>> {
     let Some(current_item) = owner.item.as_ref() else {
         return Ok(Vec::new());
     };
+    previous_launches(&launch.id, launch.host, &owner.session, current_item)
+}
+
+pub(super) fn previous_launches(
+    launch_id: &str,
+    host: Host,
+    session: &str,
+    current_item: &item::Reference,
+) -> Result<Vec<Row>> {
     let data = call(&["launches"])?;
     let rows = data["launches"].as_array().context("agent-store launches returned no list")?;
     let mut predecessors: Vec<Row> = Vec::new();
     for value in rows {
-        if value["launch_id"].as_str() == Some(launch.id.as_str())
-            || value["session"].as_str() != Some(owner.session.as_str())
-        {
+        if value["launch_id"].as_str() == Some(launch_id) || value["session"].as_str() != Some(session) {
             continue;
         }
-        if value["host"].as_str() != Some(launch.host.name()) {
+        if value["host"].as_str() != Some(host.name()) {
             bail!("historical launch host does not match its session");
         }
         if item(value)?.as_ref() != Some(current_item) {
@@ -390,7 +401,7 @@ mod tests {
     }
 
     #[test]
-    fn registration_has_only_the_prebound_session_and_launch_fields() {
+    fn prebinding_requires_an_unowned_session() {
         assert_eq!(
             register_arguments(&launch(), "codex:123e4567-e89b-12d3-a456-426614174000").unwrap(),
             [
@@ -400,7 +411,8 @@ mod tests {
                 "--cwd",
                 "C:/worktree",
                 "--launch-id",
-                "launch"
+                "launch",
+                "--require-unowned"
             ]
         );
     }

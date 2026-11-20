@@ -1,6 +1,7 @@
 pub mod closeout;
 pub mod lifecycle;
 pub mod owner;
+pub mod recovery;
 pub(crate) mod store;
 mod tj_agents;
 mod turn;
@@ -68,9 +69,12 @@ pub struct Args {
     /// The session that handed this work off, as `host:id`.
     #[arg(long)]
     parent: Option<String>,
-    /// Bind a pre-created native Codex session, as `codex:UUID`.
+    /// Bind the exact prepared native session, as `host:UUID`.
     #[arg(long)]
     session: Option<String>,
+    /// Continue this session's stopped predecessor and retain its worktree claims.
+    #[arg(long, requires = "session")]
+    resume_from: Option<String>,
     #[arg(long, hide = true, default_value_t = 120)]
     poll_seconds: u64,
     #[arg(long, hide = true, default_value_t = 10)]
@@ -136,7 +140,7 @@ fn record_launch(launch: &Launch, parent: Option<&str>, wrapper_pid: u32, wrappe
         std::thread::sleep(delay);
         match store::launch(launch, parent, wrapper_pid, wrapper_started_at) {
             Ok(()) => return Ok(()),
-            Err(_) if store::recorded(&launch.id) => return Ok(()),
+            Err(_) if store::recorded_for(launch, wrapper_pid, wrapper_started_at) => return Ok(()),
             Err(error) => failure = Some(error),
         }
     }
@@ -206,21 +210,34 @@ fn canonical_uuid(value: &str) -> bool {
 
 fn prebound_session(args: &Args, launch: &Launch) -> Result<Option<PreboundSession>> {
     let Some(handle) = &args.session else { return Ok(None) };
-    let Some(native_id) = handle.strip_prefix("codex:") else {
-        bail!("--session must be codex:UUID");
+    let Some(native_id) = handle.strip_prefix(&format!("{}:", launch.host.name())) else {
+        bail!("--session must match the native host");
     };
     if !canonical_uuid(native_id) {
         bail!("--session must contain a canonical lowercase UUID");
     }
-    if args.host != Some(Host::Codex) || launch.host != Host::Codex {
-        bail!("--session requires --host codex");
+    if args.host != Some(launch.host) {
+        bail!("--session requires an explicit matching --host");
     }
     let executable = Path::new(&args.agent[0]);
     if !executable.is_absolute()
-        || Host::from_program(executable.as_os_str()) != Some(Host::Codex)
+        || Host::from_program(executable.as_os_str()) != Some(launch.host)
         || executable.extension().is_some_and(|extension| !extension.to_string_lossy().eq_ignore_ascii_case("exe"))
     {
-        bail!("--session requires an absolute native codex executable");
+        bail!("--session requires an absolute matching native executable");
+    }
+    if launch.host == Host::Claude {
+        let expected = [
+            args.agent[0].as_os_str(),
+            OsStr::new("--resume"),
+            OsStr::new(native_id),
+            OsStr::new("--name"),
+            OsStr::new(&launch.title),
+        ];
+        if args.agent != expected {
+            bail!("Claude --session requires recovery with its exact --resume UUID --name title command");
+        }
+        return Ok(Some(PreboundSession { handle: handle.clone() }));
     }
     let expected = [
         args.agent[0].as_os_str(),
@@ -461,20 +478,32 @@ fn mark_closed(launch_id: &str) {
     let _ = store::set_open(launch_id, false);
 }
 
+fn track_tab_closure(launch_id: &str) {
+    let closed = launch_id.to_owned();
+    agent::on_tab_closed(Box::new(move || mark_closed(&closed)));
+}
+
 pub fn run(args: Args) -> Result<ExitCode> {
     let launch = launch(&args)?;
     let prebound = prebound_session(&args, &launch)?;
+    if args.resume_from.as_deref() == Some(launch.id.as_str()) {
+        bail!("recovery must create a new launch");
+    }
     let id = launch.id.clone();
-    let closed = launch.id.clone();
-    agent::on_tab_closed(Box::new(move || mark_closed(&closed)));
-    let result = supervise(&args, launch, prebound.as_ref());
-    if !agent::session_ending() {
+    let mut admitted = false;
+    let result = supervise(&args, launch, prebound.as_ref(), &mut admitted);
+    if admitted && !agent::session_ending() {
         mark_open(&id, false);
     }
     result
 }
 
-fn supervise(args: &Args, launch: Launch, prebound: Option<&PreboundSession>) -> Result<ExitCode> {
+fn supervise(args: &Args, launch: Launch, prebound: Option<&PreboundSession>, admitted: &mut bool) -> Result<ExitCode> {
+    let predecessor = args
+        .resume_from
+        .as_deref()
+        .map(|from| recovery::inspect(&prebound.context("recovery requires an exact native session")?.handle, from))
+        .transpose()?;
     let command_cwd = args.command_cwd.as_deref().unwrap_or(&launch.cwd);
     let exe = std::env::current_exe().context("could not locate the tj executable")?;
     let mut watcher = update::Watcher::new(exe, update::published(launch.host)?);
@@ -501,11 +530,12 @@ fn supervise(args: &Args, launch: Launch, prebound: Option<&PreboundSession>) ->
         }
         return Err(error).context("managed launch was not recorded; the native host was not started");
     }
-    if let Some(prebound) = prebound {
-        if let Err(error) = store::prebind(&launch, &prebound.handle, pid, &started_at) {
-            end_not_started(&launch, Some(prebound), pid, &started_at);
-            return Err(error);
-        }
+    if let Some(prebound) = prebound
+        && predecessor.is_none()
+        && let Err(error) = store::prebind(&launch, &prebound.handle, pid, &started_at)
+    {
+        end_not_started(&launch, Some(prebound), pid, &started_at);
+        return Err(error);
     }
     // Ensure the native service before Linux adopts or Windows owns TUI descendants.
     let prepare_host = || {
@@ -525,7 +555,11 @@ fn supervise(args: &Args, launch: Launch, prebound: Option<&PreboundSession>) ->
     };
     let upstream =
         if selected { update::upstream::start(launch.host, &launch.cwd, args.update_url.clone()) } else { None };
-    mark_open(&launch.id, true);
+    if predecessor.is_none() {
+        *admitted = true;
+        track_tab_closure(&launch.id);
+        mark_open(&launch.id, true);
+    }
     match upstream.map(std::thread::JoinHandle::join) {
         Some(Ok(Ok(Some(line)))) => eprintln!("TJ: {line}"),
         Some(Ok(Err(error))) => {
@@ -533,15 +567,30 @@ fn supervise(args: &Args, launch: Launch, prebound: Option<&PreboundSession>) ->
         }
         _ => {}
     }
+    if let Some(predecessor) = predecessor.as_ref() {
+        let bound = recovery::inspect(&predecessor.session, &predecessor.launch_id).and_then(|prior| {
+            let _record = OPEN_RECORD.lock().unwrap_or_else(PoisonError::into_inner);
+            track_tab_closure(&launch.id);
+            recovery::admit(&prior, &launch, pid, &started_at)
+        });
+        if let Err(error) = bound {
+            end_not_started(&launch, prebound, pid, &started_at);
+            return Err(error);
+        }
+    }
     let mut agent = match Agent::start(&args.agent, command_cwd, &environment)
         .with_context(|| format!("could not start {}", args.agent[0].to_string_lossy()))
     {
         Ok(agent) => agent,
         Err(error) => {
             end_not_started(&launch, prebound, pid, &started_at);
+            if args.resume_from.is_some() {
+                return Err(error).context("the recovered session can be retried with tj recover --open");
+            }
             return Err(error);
         }
     };
+    *admitted = true;
     if let Some(endpoint) = host.endpoint() {
         let record = agent::started_at(agent.pid()).map_err(anyhow::Error::from).and_then(|born| {
             if let Some(born) = born {
@@ -735,6 +784,7 @@ mod tests {
             plugin_grace_seconds: 2,
             input_idle_seconds: 2,
             update_url: String::new(),
+            resume_from: None,
             agent,
         }
     }
