@@ -145,6 +145,7 @@ def proxy(
     target: BinaryIO,
     log: Path,
     scenario: str,
+    codex_home: str,
     publication: Path | None,
     shutdown: Path | None,
 ) -> None:
@@ -240,7 +241,7 @@ def proxy(
             result: dict[str, object]
             if method == "initialize":
                 result = {
-                    "codexHome": os.environ.get("CODEX_HOME", ""),
+                    "codexHome": codex_home,
                     "userAgent": "fixture/0.169.0",
                 }
             elif method == "config/batchWrite":
@@ -311,6 +312,7 @@ def main() -> None:
         sys.stdout.buffer,
         log,
         os.environ.get("FAKE_CODEX_SCENARIO", "normal"),
+        os.environ.get("CODEX_HOME", ""),
         Path(os.environ["FAKE_OBSERVER_PUBLICATION"])
         if "FAKE_OBSERVER_PUBLICATION" in os.environ
         else None,

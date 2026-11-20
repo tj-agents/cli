@@ -156,7 +156,7 @@ fn pinned_native_refresh() -> Result<()> {
 }
 
 #[test]
-#[ignore = "run with the Linux tmux draft fixture"]
+#[ignore = "run with the native terminal draft fixture"]
 fn refresh_thread_with_draft() -> Result<()> {
     let root = PathBuf::from(std::env::var_os("TJ_FIXTURE_ROOT").context("fixture root required")?);
     let native = PathBuf::from(std::env::var_os("TJ_FIXTURE_CODEX").context("fixture executable required")?);

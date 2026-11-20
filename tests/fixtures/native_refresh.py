@@ -2,8 +2,10 @@
 
 import argparse
 import http.server
+import importlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -11,9 +13,10 @@ import tempfile
 import threading
 import time
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, ClassVar
+from typing import Any, ClassVar, NamedTuple
 
 VERSION = "0.169.0"
 MODEL = "gpt-6.2-astra"
@@ -82,11 +85,14 @@ def install(native: Path, root: Path, version: str) -> None:
 
 class Provider(http.server.BaseHTTPRequestHandler):
     bodies: ClassVar[list[dict[str, Any]]] = []
+    received: ClassVar[threading.Condition] = threading.Condition()
 
     def do_POST(self) -> None:
         body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
-        self.bodies.append(body)
-        index = str(len(self.bodies))
+        with self.received:
+            self.bodies.append(body)
+            index = str(len(self.bodies))
+            self.received.notify_all()
         events = [
             {"type": "response.created", "response": {"id": "resp-" + index}},
             {
@@ -118,54 +124,114 @@ class Provider(http.server.BaseHTTPRequestHandler):
         self.wfile.write(payload)
 
 
-def tmux_draft(
-    native: Path,
-    root: Path,
-    env: dict[str, str],
-    refresh: Callable[[], None],
-) -> None:
-    thread = (root / "thread-id").read_text(encoding="utf-8")
-    tmux = ["tmux", "-S", str(root / "draft.sock"), "-f", "/dev/null"]
+class Terminal(NamedTuple):
+    screen: Callable[[], str]
+    write: Callable[[str], None]
+    enter: Callable[[], None]
+    pid: Callable[[], int]
 
-    def pane(*args: str) -> str:
-        return subprocess.check_output([*tmux, *args], env=env, text=True, timeout=10)
 
-    def displayed(text: str) -> None:
-        deadline = time.monotonic() + 30
-        while text not in (screen := pane("capture-pane", "-p")):
-            if time.monotonic() >= deadline:
-                raise AssertionError(f"Missing {text!r} in native TUI: {screen}")
-            time.sleep(0.1)
+@contextmanager
+def tmux(args: list[str], project: Path, env: dict[str, str]) -> Iterator[Terminal]:
+    command = ["tmux", "-S", str(project.parent / "draft.sock"), "-f", "/dev/null"]
 
-    draft = f"TJ unsent draft {uuid.uuid4().hex}"
-    before = len(Provider.bodies)
-    try:
-        pane(
-            "new-session",
-            "-d",
-            "-x",
-            "140",
-            "-y",
-            "45",
-            "-c",
-            str(root / "project"),
-            str(native),
-            "--cd",
-            str(root / "project"),
-            "resume",
-            thread,
-            "--model",
-            MODEL,
-            "-c",
-            "model_reasoning_effort=high",
-            "--remote",
-            "unix://",
+    def pane(*options: str) -> str:
+        return subprocess.check_output(
+            [*command, *options], env=env, text=True, timeout=10
         )
+
+    def pid() -> int:
+        native_pid = int(pane("display-message", "-p", "#{pane_pid}"))
+        assert Path(f"/proc/{native_pid}/exe").samefile(args[0])
+        return native_pid
+
+    def send(text: str) -> None:
+        pane("send-keys", "-l", "--", text)
+
+    def enter() -> None:
+        pane("send-keys", "Enter")
+
+    try:
+        pane("new-session", "-d", "-x", "160", "-y", "40", "-c", str(project), *args)
+        yield Terminal(lambda: pane("capture-pane", "-p"), send, enter, pid)
+    finally:
+        subprocess.run([*command, "kill-server"], env=env, check=False, timeout=10)
+
+
+@contextmanager
+def conpty(args: list[str], project: Path, env: dict[str, str]) -> Iterator[Terminal]:
+    # pywinpty is a Windows-only fixture dependency.
+    process = importlib.import_module("winpty").PtyProcess.spawn(
+        args,
+        cwd=str(project),
+        env=env,
+        dimensions=(40, 160),
+        backend=1,
+    )
+    output: list[str] = []
+
+    def read() -> None:
+        try:
+            while process.isalive():
+                chunk = process.read()
+                output.append(chunk)
+                if "\x1b[6n" in chunk:
+                    process.write("\x1b[1;1R")
+        except (EOFError, OSError):
+            return
+
+    def pid() -> int:
+        assert process.isalive(), "native frontend exited"
+        return int(process.pid)
+
+    def screen() -> str:
+        return re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", "".join(output))
+
+    reader = threading.Thread(target=read, daemon=True)
+    reader.start()
+    try:
+        yield Terminal(screen, process.write, lambda: process.write("\r"), pid)
+    finally:
+        process.close(force=True)
+        reader.join(timeout=5)
+
+
+def draft(
+    native: Path, root: Path, env: dict[str, str], refresh: Callable[[], None]
+) -> None:
+    project = root / "project"
+    thread = (root / "thread-id").read_text(encoding="utf-8")
+    args = [
+        str(native),
+        "--cd",
+        str(project),
+        "resume",
+        thread,
+        "--model",
+        MODEL,
+        "-c",
+        "model_reasoning_effort=high",
+        "--remote",
+        "unix://",
+    ]
+    terminal = conpty if os.name == "nt" else tmux
+    text = f"TJ unsent draft {uuid.uuid4().hex}"
+    with terminal(args, project, env) as ui:
+
+        def displayed(marker: str) -> None:
+            for _ in range(300):
+                if marker in ui.screen():
+                    return
+                time.sleep(0.1)
+            raise AssertionError(
+                f"Missing {marker!r} in native TUI: {ui.screen()[-4000:]}"
+            )
+
         displayed("Fixture complete.")
-        pid = pane("display-message", "-p", "#{pane_pid}").strip()
-        assert Path(f"/proc/{pid}/exe").samefile(native), pid
-        pane("send-keys", "-l", "--", draft)
-        displayed(draft)
+        pid = ui.pid()
+        before = len(Provider.bodies)
+        ui.write(text)
+        displayed(text)
         subprocess.run(
             [sys.executable, __file__, "--install", "3.0.0"],
             env=env,
@@ -173,31 +239,23 @@ def tmux_draft(
             timeout=60,
         )
         refresh()
-        assert pane("display-message", "-p", "#{pane_pid}").strip() == pid
-        displayed(draft)
+        assert ui.pid() == pid
+        displayed(text)
         assert len(Provider.bodies) == before, "draft submitted before Enter"
-        pane("send-keys", "Enter")
-        deadline = time.monotonic() + 30
-        while len(Provider.bodies) == before:
-            if time.monotonic() >= deadline:
-                raise AssertionError(
-                    f"Draft never reached loopback: {pane('capture-pane', '-p')}"
-                )
-            time.sleep(0.1)
+        ui.enter()
+        with Provider.received:
+            assert Provider.received.wait_for(
+                lambda: len(Provider.bodies) > before, timeout=30
+            ), ui.screen()[-4000:]
         request = Provider.bodies[before]
-        assert any(
-            part.get("text") == draft
-            for item in request["input"]
-            if item.get("role") == "user"
-            for part in item["content"]
-        ), "submitted draft changed"
+        user = [item for item in request["input"] if item.get("role") == "user"][-1]
+        assert user["content"] == [{"type": "input_text", "text": text}], user
         assert "fixture revision 3.0.0" in json.dumps(request)
-        assert pane("display-message", "-p", "#{pane_pid}").strip() == pid
-    finally:
-        subprocess.run([*tmux, "kill-server"], env=env, check=False, timeout=10)
+        assert request["model"] == MODEL and request["reasoning"]["effort"] == "high"
+        assert ui.pid() == pid
 
 
-def run(native: Path, root: Path, port: int) -> None:
+def run(native: Path, root: Path, port: int, environment: dict[str, str]) -> None:
     version = subprocess.check_output(
         [native, "--version"], text=True, timeout=10
     ).strip()
@@ -229,7 +287,7 @@ trust_level = "trusted"
     write(project / ".codex/config.toml", '[plugins."smoke@fixture"]\nenabled = true\n')
     env = {
         key: value
-        for key, value in os.environ.items()
+        for key, value in environment.items()
         if key
         not in {
             "OPENAI_API_KEY",
@@ -248,6 +306,7 @@ trust_level = "trusted"
         HTTPS_PROXY="http://127.0.0.1:9",
         NO_PROXY="127.0.0.1,localhost",
         OTEL_SDK_DISABLED="true",
+        TERM="xterm-256color",
     )
     env["PATH"] = os.pathsep.join([str(Path("target/debug").resolve()), env["PATH"]])
     # Native maintenance creates the private state directory with the correct ACL.
@@ -318,8 +377,7 @@ trust_level = "trusted"
             strict=True,
         ):
             assert marker in json.dumps(body), marker
-        if sys.platform == "linux":
-            tmux_draft(native, root, env, lambda: check("refresh_thread_with_draft"))
+        draft(native, root, env, lambda: check("refresh_thread_with_draft"))
     finally:
         subprocess.run(
             [native, "app-server", "daemon", "stop"], env=env, check=True, timeout=60
@@ -368,7 +426,12 @@ def main() -> None:
         worker = threading.Thread(target=provider.serve_forever, daemon=True)
         worker.start()
         try:
-            run(native.resolve(strict=True), root, provider.server_port)
+            run(
+                native.resolve(strict=True),
+                root,
+                provider.server_port,
+                dict(os.environ),
+            )
         finally:
             provider.shutdown()
             worker.join()
