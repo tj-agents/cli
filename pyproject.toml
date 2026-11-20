@@ -184,11 +184,6 @@ rule = "PY016"
 reason = "Executable fixture reads process state to emulate an external command."
 
 [[tool.python-standards.exceptions]]
-path = "tests/fixtures/updater_writer.py"
-rule = "PY016"
-reason = "Executable fixture reads process identity to prove native updater descendant cleanup."
-
-[[tool.python-standards.exceptions]]
 path = "tests/fixtures/fake_inbox.py"
 rule = "PY016"
 reason = "Executable fixture reads process state to emulate an external command."
