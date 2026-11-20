@@ -13,17 +13,36 @@ const MERGED: &str = r#"{"prs":[{"url":"u","state":"merged"}],"all_merged":true}
 /// Own the wrapper until its output is collected, including assertion unwinding.
 struct Child {
     process: Option<ProcessChild>,
+    root: PathBuf,
     #[cfg(unix)]
     log: PathBuf,
 }
 
 impl Child {
-    fn new(process: ProcessChild, _sandbox: &Sandbox) -> Self {
+    fn new(process: ProcessChild, sandbox: &Sandbox) -> Self {
         Self {
             process: Some(process),
+            root: sandbox.root.clone(),
             #[cfg(unix)]
-            log: _sandbox.log.clone(),
+            log: sandbox.log.clone(),
         }
+    }
+
+    fn diagnostics(&self) -> String {
+        let mut snapshots = Vec::new();
+        for relative in ["dummy.log", "stubs/agent-store.log", "stubs/tj-item.log"] {
+            let text = std::fs::read_to_string(self.root.join(relative)).unwrap_or_default();
+            let lines: Vec<_> = text.lines().collect();
+            snapshots.push(format!("{relative}:\n{}", lines[lines.len().saturating_sub(20)..].join("\n")));
+        }
+        if let Ok(entries) = std::fs::read_dir(self.root.join("state/completion")) {
+            for entry in entries.flatten().filter(|entry| entry.path().extension().is_some_and(|ext| ext == "json")) {
+                if let Ok(text) = std::fs::read_to_string(entry.path()) {
+                    snapshots.push(format!("completion: {text}"));
+                }
+            }
+        }
+        snapshots.join("\n")
     }
 
     fn kill(&mut self) -> std::io::Result<()> {
@@ -357,9 +376,13 @@ fn finish(mut child: Child, timeout: Duration) -> Output {
     let deadline = Instant::now() + timeout;
     while child.try_wait().unwrap().is_none() {
         if Instant::now() > deadline {
+            let diagnostics = child.diagnostics();
             child.kill().unwrap();
             let output = child.wait_with_output().unwrap();
-            panic!("TJ did not exit; stderr: {}", String::from_utf8_lossy(&output.stderr));
+            panic!(
+                "TJ did not exit within {timeout:?}; stderr: {}\n{diagnostics}",
+                String::from_utf8_lossy(&output.stderr)
+            );
         }
         std::thread::sleep(Duration::from_millis(100));
     }
@@ -2868,7 +2891,11 @@ fn tracker_and_launch_finalization_failures_can_be_retried_after_all_releases() 
         let launch = format!("finalize-{stage}");
         let child = start(&sandbox, &launch, "claude", "signal", "2");
         done(&sandbox);
-        let output = finish(child, Duration::from_secs(60));
+        // This exercises both real Git/worktrunk preflights before injecting the finalization failure.
+        // Windows CI exceeded the old 60-second fixture budget on the identical tree that passed the PR.
+        let started = Instant::now();
+        let output = finish(child, Duration::from_secs(120));
+        eprintln!("{stage} finalization reached its injected failure in {:?}", started.elapsed());
         assert_eq!(output.status.code(), Some(1), "{}", String::from_utf8_lossy(&output.stderr));
         assert!(!sandbox.worktree.exists());
         assert!(sandbox.stubs.join("released.json").is_file());
