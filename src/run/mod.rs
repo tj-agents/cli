@@ -553,6 +553,9 @@ fn supervise(args: &Args, launch: Launch, prebound: Option<&PreboundSession>, ad
     };
     let upstream =
         if selected { update::upstream::start(launch.host, &launch.cwd, args.update_url.clone()) } else { None };
+    *admitted = true;
+    let closed = launch.id.clone();
+    agent::on_tab_closed(Box::new(move || mark_closed(&closed)));
     mark_open(&launch.id, true);
     match upstream.map(std::thread::JoinHandle::join) {
         Some(Ok(Ok(Some(line)))) => eprintln!("TJ: {line}"),
