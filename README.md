@@ -269,13 +269,11 @@ when a final result is available. The hold survives new input and resuming that 
 `tj hold --release` releases it, and release alone does not request completion.
 
 Submitted native input cancels pending completion and invalidates closeout authorization for the previous turn.
-Before stopping the host, TJ also requires readable native idle state, no running background shell and a
-short quiet period. It rechecks those conditions during shutdown. Idleness creates no user messages,
-nudges or model turns.
+Idleness creates no user messages, nudges or model turns.
 
-Codex's rollout cannot verify unsent drafts, other loaded conversations or all background work. TJ therefore
-delivers the final result but retains the Codex window and worktrees, with the reason visible in its receipt.
-Exit Codex normally after checking its native work; TJ then rechecks the final result, native liveness and
+Neither provider's idle record proves the absence of unsent drafts or excludes new input during shutdown.
+TJ therefore delivers the final result but retains the native window and worktrees, with the reason visible
+in its receipt. Exit Claude or Codex normally after checking its native work; TJ then rechecks the final result, native liveness and
 repository state before cleanup. A finish request does not authorize TJ to discard unobservable native work.
 
 The completion record retains the final response, session and launch identity, wait or hold state, and
@@ -293,7 +291,7 @@ and the exact recorded parent. Independent sessions retain their native final re
 
 ### Safe closeout and recovery
 
-Before stopping anything, TJ checks every linked worktree claimed by the exact native session for the
+After normal native exit, TJ checks every linked worktree claimed by the exact native session for the
 current launch or earlier launches of the same work item, including roots in other repositories. Earlier
 wrappers must be provably stopped. Each root must be registered, clean and integrated into its freshly
 fetched default branch; a merged item PR alone cannot authorize deletion. Worktrunk supplies the content
@@ -306,8 +304,8 @@ ownership from a neighbouring folder or adopts legacy location metadata.
 
 With a valid result receipt and closeout authorization, the wrapper:
 
-1. asks Claude to exit with a console break or SIGINT; Codex waits for a normal native exit;
-2. rechecks authorization during Claude's shutdown grace period, then ends the remaining owned process tree;
+1. waits for a normal native exit;
+2. rechecks completion authorization and native liveness;
 3. rechecks ownership and content, and runs `git-wt remove --foreground` for each safe linked worktree;
 4. releases each claim only after its worktree and branch are gone, marks the linked item Done when there
    is one, and closes the launch;

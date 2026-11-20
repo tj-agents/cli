@@ -441,11 +441,9 @@ fn done(sandbox: &Sandbox) {
     lifecycle(sandbox, &turn, "end", Some("Final result"), None);
 }
 
-/// Codex's native interface decides when it can exit; TJ must not infer that from a rollout.
-fn native_codex_exit(sandbox: &Sandbox, host: &str) {
-    if host == "codex" {
-        assert_eq!(in_agent(sandbox, &["exit-native"]).0, 0);
-    }
+/// The native interface decides when it can exit; TJ cannot verify unsent drafts.
+fn exit_native(sandbox: &Sandbox) {
+    assert_eq!(in_agent(sandbox, &["exit-native"]).0, 0);
 }
 
 fn completion_receipt(sandbox: &Sandbox, launch: &str) -> serde_json::Value {
@@ -459,20 +457,16 @@ fn completion_receipt(sandbox: &Sandbox, launch: &str) -> serde_json::Value {
     serde_json::from_slice(&output.stdout).unwrap()
 }
 
-fn refused(sandbox: &Sandbox, child: &mut Child, launch: &str) {
-    done(sandbox);
-    wait_until("closeout never recorded its refusal", || {
-        let output = Command::new(env!("CARGO_BIN_EXE_tj"))
-            .args(["receipt", "--launch", launch])
-            .envs(environment(sandbox))
-            .current_dir(&sandbox.root)
-            .output()
-            .unwrap();
-        let record: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-        record["state"]["kind"] == "attention" && record["state"]["outcome"].is_object()
-    });
-    still_running(child, Duration::from_millis(500));
-    assert!(!log(sandbox, "dummy.log").contains("graceful"), "the agent was stopped");
+fn assert_closeout_refused(sandbox: &Sandbox, output: &Output, launch: &str, reason: &str) {
+    let diagnostic = format!("{}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+    assert_eq!(output.status.code(), Some(1), "{diagnostic}");
+    assert!(diagnostic.contains(reason), "missing {reason}: {diagnostic}");
+    let receipt = completion_receipt(sandbox, launch);
+    assert_eq!(receipt["state"]["kind"], "attention");
+    assert!(receipt["state"]["reason"].as_str().unwrap().contains(reason), "{receipt}");
+    assert!(receipt["state"]["outcome"].is_object());
+    assert_unfinished(sandbox, launch);
+    assert!(!log(sandbox, "dummy.log").contains("graceful"), "TJ sent an exit signal");
 }
 
 fn wait_for_polls(sandbox: &Sandbox, file: &str, prefix: &str, count: usize) {
@@ -709,7 +703,7 @@ fn codex_final_result_reaches_its_parent_once_and_has_a_durable_receipt() {
         completion_receipt(&sandbox, launch)["state"]["kind"] == "attention"
     });
     assert_eq!(messages().len(), 1, "waiting for native exit resent the result");
-    native_codex_exit(&sandbox, "codex");
+    exit_native(&sandbox);
     assert_closed_out(&sandbox, &finish(child, Duration::from_secs(60)), launch);
 }
 
@@ -726,6 +720,7 @@ fn an_item_merged_before_the_session_started_never_stops_it() {
     bind(&sandbox, "merged-before", "claude", true);
     still_running(&mut child, Duration::from_secs(2));
     done(&sandbox);
+    exit_native(&sandbox);
     let output = finish(child, Duration::from_secs(60));
     assert_closed_out(&sandbox, &output, "merged-before");
 }
@@ -781,7 +776,7 @@ fn merge_notices_reach_both_hosts_once_per_pr_set_despite_reads_polls_and_later_
         assert!(read_feed(&sandbox, host).contains("Every PR linked"));
         assert_no_prompt_delivery(&sandbox);
         done(&sandbox);
-        native_codex_exit(&sandbox, host);
+        exit_native(&sandbox);
         let output = finish(child, Duration::from_secs(60));
         assert_closed_out(&sandbox, &output, &launch);
     }
@@ -813,7 +808,7 @@ fn idle_sessions_never_generate_notices_or_prompts() {
             bind(&sandbox, &launch, host, true);
             still_running(&mut child, Duration::from_secs(2));
             done(&sandbox);
-            native_codex_exit(&sandbox, host);
+            exit_native(&sandbox);
             let output = finish(child, Duration::from_secs(60));
             assert_eq!(output.status.code(), Some(0), "{}", String::from_utf8_lossy(&output.stderr));
             assert!(!sandbox.worktree.exists());
@@ -1046,7 +1041,7 @@ fn incomplete_or_empty_pr_sets_never_produce_a_merge_notice() {
         wait_until("a valid merged PR set never produced a notice", || feed_messages(&sandbox, host).len() == 1);
         assert_no_prompt_delivery(&sandbox);
         done(&sandbox);
-        native_codex_exit(&sandbox, host);
+        exit_native(&sandbox);
         assert_closed_out(&sandbox, &finish(child, Duration::from_secs(60)), &launch);
     }
 }
@@ -1078,7 +1073,7 @@ fn closes_out_the_worktree_bound_after_launch() {
         });
         set_reply(&sandbox, "agent-store-show.json", &binding.to_string());
         done(&sandbox);
-        native_codex_exit(&sandbox, host);
+        exit_native(&sandbox);
         let output = finish(child, Duration::from_secs(60));
         assert_closed_out(&sandbox, &output, &launch);
         let store = log(&sandbox, "stubs/agent-store.log");
@@ -1123,6 +1118,7 @@ fn an_unrelated_worktree_binding_does_not_stop_or_clean_the_agent() {
         binding["data"]["session"]["worktree"] = serde_json::json!(sandbox.worktree);
         set_reply(&sandbox, "agent-store-show.json", &binding.to_string());
         done(&sandbox);
+        exit_native(&sandbox);
         let output = finish(child, Duration::from_secs(60));
         assert_closed_out(&sandbox, &output, launch);
     }
@@ -1214,6 +1210,7 @@ fn closes_out_after_done_and_idle() {
     let sandbox = sandbox();
     let child = start(&sandbox, "idle", "claude", "signal", "10");
     done(&sandbox);
+    exit_native(&sandbox);
     let output = finish(child, Duration::from_secs(60));
     assert_closed_out(&sandbox, &output, "idle");
     assert!(log(&sandbox, "dummy.log").contains("graceful"), "the agent was not stopped gracefully");
@@ -1261,7 +1258,7 @@ fn codex_retains_unobservable_native_work_until_a_normal_exit() {
     assert!(!log(&sandbox, "stubs/tj-item.log").contains("--state Done"));
     set_reply(&sandbox, "tj-item-prs.json", MERGED);
     wait_until("retained Codex stopped receiving merge notifications", || feed_messages(&sandbox, "codex").len() == 1);
-    native_codex_exit(&sandbox, "codex");
+    exit_native(&sandbox);
     let output = finish(child, Duration::from_secs(60));
     assert_closed_out(&sandbox, &output, "idle");
 }
@@ -1282,7 +1279,7 @@ fn new_input_cancels_finish_and_explicit_closing_does_not_override_it() {
         still_running(&mut child, Duration::from_secs(2));
         assert!(sandbox.worktree.exists(), "closing overrode missing final report");
         done(&sandbox);
-        native_codex_exit(&sandbox, host);
+        exit_native(&sandbox);
         let output = finish(child, Duration::from_secs(60));
         assert_closed_out(&sandbox, &output, &launch);
     }
@@ -1299,7 +1296,7 @@ fn explicit_closing_does_not_override_a_keep_open_hold() {
     still_running(&mut child, Duration::from_secs(3));
     assert!(sandbox.worktree.exists(), "closing overrode the keep-open hold");
     assert_eq!(in_agent(&sandbox, &["hold", "--release"]).0, 0);
-    native_codex_exit(&sandbox, "codex");
+    exit_native(&sandbox);
     assert_closed_out(&sandbox, &finish(child, Duration::from_secs(60)), launch);
 }
 
@@ -1315,7 +1312,7 @@ fn finish_waits_for_the_native_turn_end_however_long_it_takes() {
         assert!(sandbox.worktree.exists(), "finish closed before the native turn ended");
         lifecycle(&sandbox, "still-running", "end", Some("Final result"), None);
         set_turn(&sandbox, true);
-        native_codex_exit(&sandbox, host);
+        exit_native(&sandbox);
         let output = finish(child, Duration::from_secs(60));
         assert_closed_out(&sandbox, &output, &launch);
     }
@@ -1332,7 +1329,7 @@ fn a_shell_left_running_under_the_agent_keeps_final_result_waiting() {
         still_running(&mut child, Duration::from_secs(6));
         assert!(sandbox.worktree.exists(), "background shell did not keep the final result open");
         assert_eq!(in_agent(&sandbox, &["shell", "stop"]).0, 0);
-        native_codex_exit(&sandbox, host);
+        exit_native(&sandbox);
         let output = finish(child, Duration::from_secs(60));
         assert_closed_out(&sandbox, &output, &launch);
     }
@@ -1482,6 +1479,7 @@ fn unmerged_commits_keep_the_session_open_until_delivered() {
     git(&sandbox.primary, &["commit", "-q", "-m", "squash work"]);
     git(&sandbox.primary, &["push", "-q", "origin", "main"]);
     done(&sandbox);
+    exit_native(&sandbox);
     let output = finish(child, Duration::from_secs(60));
     assert!(String::from_utf8_lossy(&output.stderr).contains("worktree has unmerged commits"));
     assert_eq!(output.status.code(), Some(0));
@@ -1493,6 +1491,7 @@ fn an_agent_ignoring_the_stop_is_killed_with_its_tree() {
     let sandbox = sandbox();
     let child = start(&sandbox, "stubborn", "claude", "stubborn", "2");
     done(&sandbox);
+    exit_native(&sandbox);
     let output = finish(child, Duration::from_secs(60));
     assert_closed_out(&sandbox, &output, "stubborn");
     assert!(!log(&sandbox, "dummy.log").contains("graceful"));
@@ -1552,7 +1551,7 @@ fn registration_delayed_across_watchdog_polls_is_quiet_and_then_observed() {
         wait_until("registered completion was not observed", || {
             completion_receipt(&sandbox, &launch)["state"]["kind"] == "attention"
         });
-        assert_eq!(in_agent(&sandbox, &["exit-native"]).0, 0);
+        exit_native(&sandbox);
         let output = finish(child, Duration::from_secs(30));
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert_eq!(output.status.code(), Some(0), "{stderr}");
@@ -1571,7 +1570,7 @@ fn registration_missing_at_native_exit_is_reported_and_preserves_the_exit_code()
             let child = awaiting_registration(&sandbox, &launch, host, if code == 0 { "signal" } else { "exit" });
             if code == 0 {
                 wait_for_polls(&sandbox, "stubs/agent-store.log", &format!("show --launch-id {launch}"), 3);
-                assert_eq!(in_agent(&sandbox, &["exit-native"]).0, 0);
+                exit_native(&sandbox);
             }
             let output = finish(child, Duration::from_secs(30));
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -1616,7 +1615,7 @@ fn registration_malformed_binding_and_store_errors_are_reported_while_native_is_
             let observed =
                 log(&sandbox, "stubs/agent-store.log").lines().filter(|line| line.starts_with(&prefix)).count();
             wait_for_polls(&sandbox, "stubs/agent-store.log", &prefix, observed + 3);
-            assert_eq!(in_agent(&sandbox, &["exit-native"]).0, 0);
+            exit_native(&sandbox);
             let output = finish(child, Duration::from_secs(30));
             let stderr = String::from_utf8_lossy(&output.stderr);
             let live_report = format!("TJ: completion remains unverified: {diagnostic}");
@@ -2071,7 +2070,7 @@ fn codex_normal_exit_cleans_up_a_windows_console() {
     let child = start(&sandbox, "codex", "codex", "keys", "10");
     wait_for_log(&sandbox, "raw");
     done(&sandbox);
-    native_codex_exit(&sandbox, "codex");
+    exit_native(&sandbox);
     let output = finish(child, Duration::from_secs(60));
     assert_closed_out(&sandbox, &output, "codex");
     assert!(log(&sandbox, "dummy.log").contains("native exit"));
@@ -2234,6 +2233,7 @@ fn only_the_tabs_own_agent_can_request_finish() {
     assert_eq!(in_agent(&sandbox, &["launch"]).0, 0);
     done(&sandbox);
     still_running(&mut child, Duration::from_secs(1));
+    exit_native(&sandbox);
     let output = finish(child, Duration::from_secs(60));
     assert_closed_out(&sandbox, &output, "owned");
 }
@@ -2410,6 +2410,7 @@ fn each_claude_update_uses_one_native_request_and_waits_for_its_completion_recei
     let agent = log(&sandbox, "dummy.log");
     assert_eq!(agent.matches("agent plugins Test tab").count(), 1, "the agent restarted: {agent}");
     done(&sandbox);
+    exit_native(&sandbox);
     let output = finish(child, Duration::from_secs(60));
     assert_closed_out(&sandbox, &output, "plugins");
 }
@@ -2465,6 +2466,7 @@ fn missing_claude_adapter_or_completion_receipt_never_applies_or_types_an_update
         let agent = log(&sandbox, "dummy.log");
         assert_eq!(agent.matches(&format!("agent {launch} Test tab")).count(), 1, "the agent restarted: {agent}");
         done(&sandbox);
+        exit_native(&sandbox);
         let output = finish(child, Duration::from_secs(60));
         let stderr = std::fs::read_to_string(&stderr_path).unwrap();
         assert!(stderr.contains(diagnostic), "missing {diagnostic:?}: {stderr}");
@@ -2506,7 +2508,7 @@ fn a_managed_codex_update_stays_unverified_without_reloading_an_unrelated_daemon
     let agent = log(&sandbox, "dummy.log");
     assert_eq!(agent.matches("agent codex-reload Test tab").count(), 1, "the agent restarted: {agent}");
     done(&sandbox);
-    native_codex_exit(&sandbox, "codex");
+    exit_native(&sandbox);
     let output = finish(child, Duration::from_secs(60));
     assert_closed_out(&sandbox, &output, "codex-reload");
     let stderr = std::fs::read_to_string(&stderr_path).unwrap();
@@ -2591,6 +2593,7 @@ fn a_binary_update_waits_for_preparation_before_resuming_the_same_conversation()
     still_running(&mut child, Duration::from_secs(6));
     assert!(sandbox.worktree.exists(), "the successor lost the keep-open hold");
     assert_eq!(in_agent(&sandbox, &["hold", "--release"]).0, 0);
+    exit_native(&sandbox);
     let output = finish(child, Duration::from_secs(60));
     assert_closed_out(&sandbox, &output, "upgrade");
 }
@@ -2703,7 +2706,7 @@ fn closes_out_all_owned_worktrees_across_repositories() {
         let child = spawn(&sandbox, &arguments, &sandbox.root);
         wait_for_log(&sandbox, if keys { "raw" } else { "agent " });
         done(&sandbox);
-        native_codex_exit(&sandbox, host);
+        exit_native(&sandbox);
         let output = finish(child, Duration::from_secs(120));
         assert_closed_out(&sandbox, &output, &launch);
         assert!(!extra.exists());
@@ -2802,7 +2805,7 @@ fn recovered_done_from_primary_removes_predecessor_claims_with_original_identity
             &serde_json::json!({"ok": true, "data": {"launch": {"item": item}, "session": {}}}).to_string(),
         );
         done(&sandbox);
-        native_codex_exit(&sandbox, host);
+        exit_native(&sandbox);
         let output = finish(child, Duration::from_secs(120));
         assert_closed_out(&sandbox, &output, &launch);
         assert!(git(&sandbox.primary, &["branch", "--list", "Feature/1"]).is_empty());
@@ -2847,6 +2850,7 @@ fn unlinked_recovery_keeps_historical_claims_and_cleans_only_the_current_launch(
     let child = spawn(&sandbox, &arguments, &sandbox.root);
     wait_for_log(&sandbox, "agent ");
     done(&sandbox);
+    exit_native(&sandbox);
     let output = finish(child, Duration::from_secs(120));
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
     assert!(sandbox.worktree.exists(), "unlinked historical work belongs to an unidentified task");
@@ -2917,6 +2921,7 @@ fn recovered_preflight_refuses_live_unknown_unmanaged_and_unsafe_historical_clai
     git(&sandbox.primary, &["commit", "-q", "-m", "delivered"]);
     git(&sandbox.primary, &["push", "-q", "origin", "main"]);
     done(&sandbox);
+    exit_native(&sandbox);
     let output = finish(child, Duration::from_secs(120));
     assert_closed_out(&sandbox, &output, launch);
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -2959,6 +2964,7 @@ fn recovered_journal_retries_partial_multi_launch_releases_under_original_owners
     let child = spawn(&sandbox, &arguments, &sandbox.root);
     wait_for_log(&sandbox, "agent ");
     done(&sandbox);
+    exit_native(&sandbox);
     let output = finish(child, Duration::from_secs(120));
     assert_eq!(output.status.code(), Some(1), "{}", String::from_utf8_lossy(&output.stderr));
     assert!(!sandbox.worktree.exists() && !current.exists());
@@ -3087,6 +3093,7 @@ fn one_dirty_owned_worktree_keeps_every_worktree_and_the_agent_open() {
     assert!(!log(&sandbox, "stubs/tj-item.log").contains("--state Done"));
     std::fs::remove_file(extra.join("unfinished.txt")).unwrap();
     done(&sandbox);
+    exit_native(&sandbox);
     let output = finish(child, Duration::from_secs(120));
     assert_closed_out(&sandbox, &output, "dirty-collection");
     assert!(!extra.exists());
@@ -3113,6 +3120,7 @@ fn another_live_session_blocks_closeout_even_when_its_metadata_says_ended() {
     assert!(sandbox.worktree.exists());
     set_store_list(&sandbox.stubs, "sessions", serde_json::json!([]));
     done(&sandbox);
+    exit_native(&sandbox);
     let output = finish(child, Duration::from_secs(60));
     assert_closed_out(&sandbox, &output, "live-owner");
     assert!(String::from_utf8_lossy(&output.stderr).contains("another session may still be using"));
@@ -3124,6 +3132,7 @@ fn release_failure_keeps_the_claim_and_never_marks_done() {
     set_reply(&sandbox, "agent-store-release-worktree.json", r#"{"ok":false,"error":{"message":"storage failed"}}"#);
     let child = start(&sandbox, "failed-release", "claude", "signal", "2");
     done(&sandbox);
+    exit_native(&sandbox);
     let output = finish(child, Duration::from_secs(60));
     assert_eq!(output.status.code(), Some(1));
     assert!(!sandbox.worktree.exists());
@@ -3174,6 +3183,7 @@ fn tracker_and_launch_finalization_failures_can_be_retried_after_all_releases() 
         let launch = format!("finalize-{stage}");
         let child = start(&sandbox, &launch, "claude", "signal", "2");
         done(&sandbox);
+        exit_native(&sandbox);
         let output = finish(child, Duration::from_secs(60));
         assert_eq!(output.status.code(), Some(1), "{}", String::from_utf8_lossy(&output.stderr));
         assert!(!sandbox.worktree.exists());
@@ -3223,6 +3233,7 @@ fn recovery_without_a_journal_keeps_live_or_unverified_native_sessions() {
         &serde_json::json!({"session":"claude:sess-1", "launch_id":launch, "state":"live"}).to_string(),
     );
     done(&sandbox);
+    exit_native(&sandbox);
     let output = finish(child, Duration::from_secs(60));
     assert_eq!(output.status.code(), Some(1));
     assert!(sandbox.worktree.exists());
@@ -3254,7 +3265,7 @@ fn native_daemon_idle_grace_finishes_when_the_provider_unloads() {
     let state = |state| serde_json::json!({"session":"codex:sess-1", "launch_id":launch, "state":state}).to_string();
     set_reply(&sandbox, "tj-session-liveness.json", &state("live"));
     done(&sandbox);
-    native_codex_exit(&sandbox, "codex");
+    exit_native(&sandbox);
     wait_until("wrapper never checked native teardown", || !log(&sandbox, "stubs/tj-session.log").is_empty());
     let next = sandbox.stubs.join("native-unloaded.json");
     std::fs::write(&next, state("dead")).unwrap();
@@ -3273,6 +3284,7 @@ fn changes_written_during_shutdown_are_kept_and_never_marked_done() {
     .unwrap();
     let child = start(&sandbox, "shutdown-change", "claude", "signal", "2");
     done(&sandbox);
+    exit_native(&sandbox);
     let output = finish(child, Duration::from_secs(60));
     assert_eq!(output.status.code(), Some(1));
     assert_eq!(std::fs::read_to_string(sandbox.worktree.join("unfinished.txt")).unwrap(), "unfinished");
@@ -3289,6 +3301,7 @@ fn an_unclaimed_linked_worktree_requires_recovery_before_closing() {
     assert!(sandbox.worktree.exists());
     claim(&sandbox, "unclaimed", "claude", std::slice::from_ref(&sandbox.worktree));
     done(&sandbox);
+    exit_native(&sandbox);
     let output = finish(child, Duration::from_secs(60));
     assert_closed_out(&sandbox, &output, "unclaimed");
     assert!(String::from_utf8_lossy(&output.stderr).contains("no recorded ownership; recovery required"));

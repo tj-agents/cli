@@ -300,7 +300,6 @@ const REGISTRATION_REPORT_GRACE: Duration = Duration::from_secs(300);
 
 struct Watch {
     launch: Launch,
-    marks: PathBuf,
     poll: Duration,
     idle: Duration,
     input_idle: Duration,
@@ -397,7 +396,7 @@ impl Watch {
         Ok(None)
     }
 
-    fn trigger(&mut self, agent: u32) -> Option<lifecycle::Closing> {
+    fn poll(&mut self, agent: u32) {
         let ready = self.ready();
         match ready {
             Ok(Some(record)) => {
@@ -408,7 +407,7 @@ impl Watch {
                             "Native activity changed after the final response; closeout needs a new verified turn."
                                 .into(),
                         );
-                        return None;
+                        return;
                     }
                     self.pinned = Some(turn);
                     let since = *self.ready_since.get_or_insert_with(Instant::now);
@@ -416,21 +415,9 @@ impl Watch {
                         && turn::shells(agent) == 0
                         && agent::input_idle().is_none_or(|idle| idle >= self.input_idle)
                     {
-                        // A completed Codex rollout does not expose unsent drafts, other
-                        // loaded conversations or all background work in its native UI.
-                        // Keep delivering results, but leave native exit to that UI.
-                        if self.launch.host == Host::Codex {
-                            if let Err(error) = self.retain_codex(&record) {
-                                self.report(format!("could not record pending native exit: {error:#}"));
-                            }
-                        } else {
-                            return match lifecycle::Closing::begin(self.completion.as_ref()?.clone(), &record) {
-                                Ok(closing) => Some(closing),
-                                Err(error) => {
-                                    self.report(format!("{error:#}"));
-                                    None
-                                }
-                            };
+                        // Native idle records do not cover drafts or atomically exclude new input.
+                        if let Err(error) = self.retain_native(&record) {
+                            self.report(format!("could not record pending native exit: {error:#}"));
                         }
                     }
                 } else {
@@ -441,25 +428,27 @@ impl Watch {
             Err(error) => self.report(format!("completion remains unverified: {error:#}")),
         }
         if Instant::now() < self.next_poll {
-            return None;
+            return;
         }
         self.next_poll = Instant::now() + self.poll;
         if let Err(error) = closeout::notify(&self.launch) {
             self.report(format!("could not record merge notification: {error:#}"));
         }
-        None
     }
 
-    fn retain_codex(&mut self, record: &Record) -> Result<()> {
+    fn retain_native(&mut self, record: &Record) -> Result<()> {
         use crate::completion::{Failure, Step};
 
-        let reason = "Codex remains open because drafts and other native work cannot be verified. Exit Codex normally after checking that work; TJ will then recheck cleanup.";
-        let failure = Failure::new(Step::Cleanup, reason)?;
+        let reason = format!(
+            "{} remains open because drafts and other native work cannot be verified. Exit the native interface normally after checking that work; TJ will then recheck cleanup.",
+            self.launch.host.name()
+        );
+        let failure = Failure::new(Step::Cleanup, &reason)?;
         if record.state().outcome().and_then(|outcome| outcome.outbox().failure(Step::Cleanup)) != Some(&failure) {
             let store = self.completion.as_ref().context("completion store not bound")?.clone();
-            lifecycle::Closing::begin(store, record)?.fail(Step::Cleanup, reason)?;
+            lifecycle::Closing::begin(store, record)?.fail(Step::Cleanup, &reason)?;
         }
-        self.report(reason.into());
+        self.report(reason);
         Ok(())
     }
 }
@@ -696,7 +685,6 @@ fn supervise(
         }
     };
     let poll = Duration::from_secs(args.poll_seconds);
-    let grace = Duration::from_secs(args.grace_seconds);
     let graces = update::gate::Graces {
         plugins: Duration::from_secs(args.plugin_grace_seconds),
         restart: Duration::from_secs(args.restart_grace_seconds),
@@ -705,7 +693,6 @@ fn supervise(
     let mut watcher = update::Watcher::new(exe, update::published(launch.host)?);
     let mut watch = Watch {
         launch,
-        marks,
         poll,
         idle: Duration::from_secs(args.idle_seconds),
         input_idle: Duration::from_secs(args.input_idle_seconds),
@@ -762,57 +749,7 @@ fn supervise(
             }
             return Ok(ExitCode::from(u8::try_from(code).unwrap_or(1)));
         }
-        if let Some(closing) = watch.trigger(agent.pid()) {
-            match closeout::owned_preflight(&watch.launch) {
-                Ok(removal) => {
-                    // Preflight can take time. Recheck input and native activity before ending the host.
-                    if closing.check().is_err() {
-                        watch.report("Closeout withdrawn while checking ownership; the session remains open.".into());
-                        continue;
-                    }
-                    if watch.turn(agent.pid()) != watch.pinned || turn::shells(agent.pid()) != 0 {
-                        closing.withdraw("Native activity changed during closeout preflight")?;
-                        continue;
-                    }
-                    let stopped = stop(&mut agent, watch.launch.host, grace, |pid| {
-                        if closing.check().is_err() {
-                            return Ok(false);
-                        }
-                        // The native status may disappear once the host exits. Its durable token
-                        // still rejects a final hook that recorded new input during shutdown.
-                        match watch.turn(pid) {
-                            Some(turn) if Some(turn) == watch.pinned => Ok(true),
-                            None if agent::started_at(pid)?.is_none() => Ok(true),
-                            _ => {
-                                let _ = closing.withdraw("Native activity changed while stopping the host");
-                                Ok(false)
-                            }
-                        }
-                    })?;
-                    if !stopped {
-                        watch.report("Closeout withdrawn during shutdown; no further stop signal was sent.".into());
-                        continue;
-                    }
-                    let result = closeout::await_native_exit(
-                        &watch.launch,
-                        &closing,
-                        Duration::from_secs(args.native_exit_seconds),
-                    )
-                    .and_then(|()| closeout::finish(&watch.launch, removal, &closing));
-                    let _ = std::fs::remove_dir_all(&watch.marks);
-                    if let Err(error) = result {
-                        eprintln!("tj: closeout stopped: {error:#}");
-                        wait_for_enter();
-                        return Ok(ExitCode::FAILURE);
-                    }
-                    return Ok(ExitCode::SUCCESS);
-                }
-                Err(reason) => {
-                    let _ = closing.fail(crate::completion::Step::Cleanup, &reason);
-                    watch.report(reason);
-                }
-            }
-        }
+        watch.poll(agent.pid());
         if upstream.as_ref().is_some_and(std::thread::JoinHandle::is_finished) {
             match upstream.take().map(std::thread::JoinHandle::join) {
                 Some(Ok(Ok(Some(line)))) => eprintln!("TJ: {line}"),
@@ -828,7 +765,10 @@ fn supervise(
         let finishing = watch.completion.as_ref().and_then(|store| store.load().ok().flatten()).is_some_and(|record| {
             matches!(
                 record.state(),
-                State::Active { intent: Some(_), .. } | State::Ready { .. } | State::Closing { .. }
+                State::Active { intent: Some(_), .. }
+                    | State::Ready { .. }
+                    | State::Closing { .. }
+                    | State::Attention { outcome: Some(_), .. }
             )
         });
         let due = if finishing { None } else { update::due(&mut watcher, host, agent.pid(), graces) };
@@ -908,7 +848,6 @@ mod tests {
         let deadline = start + super::REGISTRATION_REPORT_GRACE;
         let mut watch = super::Watch {
             launch: launch(),
-            marks: PathBuf::new(),
             poll: std::time::Duration::ZERO,
             idle: std::time::Duration::ZERO,
             input_idle: std::time::Duration::ZERO,
