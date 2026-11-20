@@ -10,6 +10,7 @@ use serde_json::{Value, json};
 use tj_cli::process::agent;
 
 use super::{Launch, hidden, owner, store};
+use crate::domain::item;
 use crate::host::Host;
 
 #[derive(clap::Args)]
@@ -36,6 +37,7 @@ pub struct Predecessor {
     pub launch_id: String,
     pub wrapper_pid: u32,
     pub wrapper_started_at: String,
+    item: Option<item::Reference>,
 }
 
 fn predecessor(session: &str, launch_id: &str, current: &Value, bound: &Value) -> Result<Predecessor> {
@@ -74,6 +76,7 @@ fn predecessor(session: &str, launch_id: &str, current: &Value, bound: &Value) -
         launch_id: launch_id.to_owned(),
         wrapper_pid: pid,
         wrapper_started_at: started.to_owned(),
+        item: store::item(row)?,
     })
 }
 
@@ -142,6 +145,11 @@ pub fn check(args: Args) -> Result<ExitCode> {
 
 pub fn admit(prior: &Predecessor, launch: &Launch, pid: u32, started_at: &str) -> Result<Value> {
     require_stopped(prior, agent::started_at)?;
+    if (prior.item.is_none() || prior.item != launch.item)
+        && super::closeout::journal::path(&prior.launch_id)?.try_exists()?
+    {
+        bail!("the predecessor has a pending cleanup journal; reconcile its cleanup before resuming");
+    }
     let response = store::call(&[
         "resume",
         "--session",
@@ -173,7 +181,8 @@ pub fn admit(prior: &Predecessor, launch: &Launch, pid: u32, started_at: &str) -
 /// The native startup hook already runs below the replacement process. Exclude
 /// only that verified process when proving the predecessor no longer runs.
 pub fn bind(args: BindArgs) -> Result<ExitCode> {
-    let native_id = args.session.strip_prefix("claude:").context("hook resume requires a Claude session")?;
+    let (name, native_id) = args.session.split_once(':').context("hook resume requires a native session")?;
+    let host = Host::from_name(name).context("unsupported resume host")?;
     if !super::canonical_uuid(native_id) || args.from_launch_id == args.launch_id {
         bail!("hook resume requires a different launch and a canonical native session");
     }
@@ -192,9 +201,8 @@ pub fn bind(args: BindArgs) -> Result<ExitCode> {
         chain.iter().position(|(ancestor, _)| *ancestor == pid).context("replacement wrapper is not an ancestor")?;
     let native = at.checked_sub(1).context("the wrapper cannot bind itself")?;
     if row["launch_id"].as_str() != Some(args.launch_id.as_str())
-        || row["host"].as_str() != Some("claude")
+        || row["host"].as_str() != Some(host.name())
         || row["state"].as_str() != Some("active")
-        || Host::from_ancestry(&chain[native..at]) != Some(Host::Claude)
         || agent::started_at(pid)?.map(super::rfc3339).as_deref() != Some(started)
     {
         bail!("replacement launch does not match the calling native process");
@@ -202,12 +210,13 @@ pub fn bind(args: BindArgs) -> Result<ExitCode> {
     let prior = inspect_native(&args.session, &args.from_launch_id, Some(chain[native].0))?;
     let launch = Launch {
         id: args.launch_id,
-        host: Host::Claude,
+        host,
         title: row["title"].as_str().context("missing replacement title")?.to_owned(),
         cwd: PathBuf::from(row["cwd"].as_str().context("missing replacement directory")?),
-        item: None,
+        item: store::item(row)?,
     };
     let session = admit(&prior, &launch, pid, started)?;
+    super::mark_open(&prior.launch_id, false);
     println!("{}", json!({"session":session}));
     Ok(ExitCode::SUCCESS)
 }
@@ -244,6 +253,7 @@ mod tests {
             launch_id: "old".into(),
             wrapper_pid: 42,
             wrapper_started_at: "2026-01-01T00:00:00Z".into(),
+            item: None,
         }
     }
 
@@ -265,7 +275,7 @@ mod tests {
     fn only_the_current_reciprocal_nonclosing_owner_can_resume() {
         let session = json!({"session":"codex:thread", "host":"codex", "native_id":"thread", "launch_id":"old", "state":"active", "wrapper":{"pid":42,"started_at":"2026-01-01T00:00:00Z"}});
         let current = json!({"session":session});
-        let bound = json!({"session":session,"launch":{"launch_id":"old","session":"codex:thread","host":"codex","state":"active","wrapper":session["wrapper"]}});
+        let bound = json!({"session":session,"launch":{"launch_id":"old","session":"codex:thread","host":"codex","state":"active","wrapper":session["wrapper"],"item":null}});
         assert!(predecessor("codex:thread", "old", &current, &bound).is_ok());
         for (key, value) in [("launch_id", "new"), ("state", "closing"), ("session", "codex:other")] {
             let mut changed = current.clone();

@@ -1642,7 +1642,7 @@ fn a_prebound_native_codex_session_registers_and_verifies_before_spawning() {
     assert!(!output.status.success());
     let store = log(&sandbox, "stubs/agent-store.log");
     assert!(store.contains(&format!(
-        "register --session codex:{PREBOUND} --cwd {} --launch-id prebound",
+        "register --session codex:{PREBOUND} --cwd {} --launch-id prebound --require-unowned",
         sandbox.worktree.display()
     )));
     assert!(store.matches("show ").count() >= 4, "{store}");
@@ -1687,7 +1687,7 @@ fn recovery_admission(sandbox: &Sandbox, host: &str, native_state: &str, live_wr
         &serde_json::json!({"session":PREBOUND,"host":host,"resume_from":"prior"}).to_string(),
     );
     set_reply(sandbox, "agent-store-prebind-source.json", &serde_json::json!({
-        "launch":{"launch_id":"prior","host":host,"session":format!("{host}:{PREBOUND}"),"state":"active","wrapper":wrapper},
+        "launch":{"launch_id":"prior","host":host,"session":format!("{host}:{PREBOUND}"),"state":"active","wrapper":wrapper,"item":null},
         "session":{"session":format!("{host}:{PREBOUND}"),"host":host,"native_id":PREBOUND,"launch_id":"prior","state":"active","wrapper":wrapper}
     }).to_string());
     set_reply(
@@ -1742,6 +1742,33 @@ fn recovery_rejects_a_live_or_unknown_predecessor_before_creating_a_launch() {
         assert!(!log.contains("launch --launch-id") && !log.contains("resume --session"), "{log}");
         assert!(!log.contains("set-open") && !log.contains("end --launch-id"), "{log}");
     }
+}
+
+#[test]
+fn recovery_preserves_the_old_owner_when_native_preparation_fails() {
+    let sandbox = sandbox();
+    let arguments = recovery_admission(&sandbox, "codex", "dead", false);
+    std::fs::write(sandbox.root.join("maintenance.fail"), "").unwrap();
+    let output = finish(spawn(&sandbox, &arguments, &sandbox.root), Duration::from_secs(30));
+    assert!(!output.status.success());
+    let log = log(&sandbox, "stubs/agent-store.log");
+    assert!(log.contains("end --launch-id resumed --reason not_started"), "{log}");
+    assert!(!log.contains("resume --session") && !log.contains("set-open"), "{log}");
+}
+
+#[test]
+fn recovery_keeps_the_new_owner_open_if_its_native_executable_cannot_spawn() {
+    let sandbox = sandbox();
+    let arguments = recovery_admission(&sandbox, "claude", "dead", false);
+    let native = arguments.iter().position(|value| value == "--").unwrap() + 1;
+    std::fs::remove_file(&arguments[native]).unwrap();
+    let output = finish(spawn(&sandbox, &arguments, &sandbox.root), Duration::from_secs(30));
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("tj recover --open"));
+    let log = log(&sandbox, "stubs/agent-store.log");
+    assert!(log.contains("end --launch-id resumed --reason not_started"), "{log}");
+    assert!(log.contains("set-open --launch-id resumed --open true"), "{log}");
+    assert!(!log.contains("set-open --launch-id resumed --open false"), "{log}");
 }
 
 #[test]

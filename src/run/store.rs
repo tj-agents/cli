@@ -138,6 +138,7 @@ fn register_arguments(launch: &Launch, handle: &str) -> Result<Vec<String>> {
         cwd.to_owned(),
         "--launch-id".to_owned(),
         launch.id.clone(),
+        "--require-unowned".to_owned(),
     ])
 }
 
@@ -199,7 +200,7 @@ pub struct Claim {
     pub path: PathBuf,
 }
 
-fn item(row: &Value) -> Result<Option<item::Reference>> {
+pub(super) fn item(row: &Value) -> Result<Option<item::Reference>> {
     let value = row.get("item").context("agent-store launch is missing its item field")?;
     if value.is_null() {
         return Ok(None);
@@ -393,7 +394,7 @@ mod tests {
     }
 
     #[test]
-    fn registration_has_only_the_prebound_session_and_launch_fields() {
+    fn prebinding_requires_an_unowned_session() {
         assert_eq!(
             register_arguments(&launch(), "codex:123e4567-e89b-12d3-a456-426614174000").unwrap(),
             [
@@ -403,7 +404,8 @@ mod tests {
                 "--cwd",
                 "C:/worktree",
                 "--launch-id",
-                "launch"
+                "launch",
+                "--require-unowned"
             ]
         );
     }
