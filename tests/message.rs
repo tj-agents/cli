@@ -132,7 +132,7 @@ struct NativeAdapter {
 impl NativeAdapter {
     fn start(sandbox: &Sandbox) -> Self {
         let mut child = sandbox
-            .command(&["_message-host", "--session", "claude:c1a0de00"], &FROM_CLAUDE)
+            .command(&["_native-host", "--session", "claude:c1a0de00"], &FROM_CLAUDE)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -150,7 +150,7 @@ impl NativeAdapter {
             }
         });
         let adapter = Self { child, requests };
-        let lease = sandbox.root.join("state/messages/claude-c1a0de00/host.lock");
+        let lease = sandbox.root.join("state/native/claude-c1a0de00/host.lock");
         let deadline = Instant::now() + Duration::from_secs(8);
         loop {
             if let Ok(file) = std::fs::OpenOptions::new().read(true).write(true).open(&lease)
@@ -178,11 +178,13 @@ impl Drop for NativeAdapter {
 fn native_receipt(sandbox: &Sandbox, request: &Value, result: &Value) {
     let output = sandbox.tj(
         &[
-            "_message-receipt",
+            "_native-receipt",
             "--session",
             "claude:c1a0de00",
             "--request",
             request["id"].as_str().unwrap(),
+            "--lease",
+            request["lease"].as_str().unwrap(),
             "--result",
             &result.to_string(),
         ],
@@ -250,7 +252,7 @@ fn missing_or_crashed_native_adapters_do_not_resend_or_switch_transport() {
     let arguments = ["message", "Peer", "hello", "--request-id", "stable"];
     let missing = sandbox.tj(&arguments, &FROM_CLAUDE);
     assert_eq!(missing.status.code(), Some(2));
-    assert!(stderr(&missing).contains("native message adapter is unavailable"));
+    assert!(stderr(&missing).contains("native adapter is unavailable"));
     let adapter = NativeAdapter::start(&sandbox);
     let sending =
         sandbox.command(&arguments, &FROM_CLAUDE).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();

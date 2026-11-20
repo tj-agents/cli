@@ -79,17 +79,12 @@ pub struct Args {
     grace_seconds: u64,
     #[arg(long, hide = true, default_value_t = 90)]
     native_exit_seconds: u64,
-    #[arg(long, hide = true, default_value_t = 30)]
-    restart_grace_seconds: u64,
     #[arg(long, hide = true, default_value_t = 2)]
     plugin_grace_seconds: u64,
     #[arg(long, hide = true, default_value_t = 2)]
     input_idle_seconds: u64,
     #[arg(long, hide = true, default_value = update::upstream::MARKETPLACE)]
     update_url: String,
-    /// Continues this launch in a replaced tj binary: the launch, its marks and its conversation already exist.
-    #[arg(long, hide = true)]
-    successor: bool,
     /// The agent's command line.
     #[arg(last = true, required = true)]
     agent: Vec<OsString>,
@@ -134,12 +129,6 @@ fn preparation(launch: &Launch, directory: &Path, arguments: &[OsString]) -> Res
     Ok(())
 }
 
-fn prepare(launch: &Launch, directory: &Path, arguments: &[OsString]) {
-    if let Err(error) = preparation(launch, directory, arguments) {
-        eprintln!("TJ: repository standards preparation failed: {error:#}");
-    }
-}
-
 /// The agent's SessionStart registers against this row, so it must exist before the agent starts.
 fn record_launch(launch: &Launch, parent: Option<&str>, wrapper_pid: u32, wrapper_started_at: &str) -> Result<()> {
     let mut failure = None;
@@ -154,7 +143,7 @@ fn record_launch(launch: &Launch, parent: Option<&str>, wrapper_pid: u32, wrappe
     Err(failure.unwrap_or_else(|| anyhow::anyhow!("agent-store did not record launch {}", launch.id)))
 }
 
-fn marks(launch_id: &str) -> Result<PathBuf> {
+pub(crate) fn marks(launch_id: &str) -> Result<PathBuf> {
     if launch_id.is_empty() || !launch_id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
         bail!("launch id {launch_id:?} must be letters, digits, '-' or '_'");
     }
@@ -255,29 +244,30 @@ fn prebound_session(args: &Args, launch: &Launch) -> Result<Option<PreboundSessi
             remaining = rest;
         }
     }
-    if let [option, endpoint, rest @ ..] = remaining {
-        if option == "--remote" && endpoint == "unix://" {
-            remaining = rest;
-        }
-    }
-    let prompt_is_delimited = match remaining {
-        [] => true,
-        [delimiter, _] => delimiter == OsStr::new("--"),
+    let attached = match remaining {
+        [option, target] => option == "--remote" && target == "unix://",
+        [option, target, delimiter, _] => option == "--remote" && target == "unix://" && delimiter == "--",
         _ => false,
     };
-    if !prompt_is_delimited || args.agent.iter().take(expected.len()).map(OsString::as_os_str).ne(expected) {
+    if !attached || args.agent.iter().take(expected.len()).map(OsString::as_os_str).ne(expected) {
         bail!(
-            "--session requires `codex --cd <cwd> resume <UUID> [--model <model>] [-c model_reasoning_effort=<effort>] [--remote unix://] [-- <prompt>]`"
+            "--session requires `codex --cd <cwd> resume <UUID> [--model <model>] [-c model_reasoning_effort=<effort>] --remote unix:// [-- <prompt>]`"
         );
     }
     Ok(Some(PreboundSession { handle: handle.clone() }))
 }
 
-fn end_not_started(launch: &Launch, prebound: &PreboundSession, wrapper_pid: u32, wrapper_started_at: &str) {
-    if let Err(error) = store::end_not_started(launch, &prebound.handle, wrapper_pid, wrapper_started_at) {
+fn end_not_started(launch: &Launch, prebound: Option<&PreboundSession>, wrapper_pid: u32, wrapper_started_at: &str) {
+    let result = match prebound {
+        Some(session) => store::end_not_started(launch, &session.handle, wrapper_pid, wrapper_started_at),
+        None => store::end_not_started_unbound(launch, wrapper_pid, wrapper_started_at),
+    };
+    if let Err(error) = result {
         eprintln!("TJ: could not mark unstarted launch {}: {error:#}", launch.id);
     }
 }
+
+const REGISTRATION_REPORT_GRACE: Duration = Duration::from_secs(300);
 
 struct Watch {
     launch: Launch,
@@ -288,6 +278,8 @@ struct Watch {
     next_poll: Instant,
     reported: HashSet<String>,
     completion: Option<Store>,
+    wrapper_started_at: String,
+    registration_report_at: Instant,
     revision: Option<u64>,
     ready_since: Option<Instant>,
     pinned: Option<turn::Turn>,
@@ -319,10 +311,29 @@ impl Watch {
 
     fn record(&mut self) -> Result<Option<Record>> {
         if self.completion.is_none() {
-            self.completion = Some(lifecycle::for_launch(&self.launch.id)?);
+            self.completion = lifecycle::for_startup(&self.launch, &self.wrapper_started_at)?;
+            if self.completion.is_none() {
+                self.awaiting_registration(Instant::now());
+                return Ok(None);
+            }
         }
         let store = self.completion.as_ref().context("completion store not bound")?;
         store.load()?.map(|record| lifecycle::deliver(store, record)).transpose()
+    }
+
+    fn awaiting_registration(&mut self, now: Instant) {
+        if now >= self.registration_report_at {
+            self.report("still awaiting native session registration".into());
+        }
+    }
+
+    fn exited(&mut self, agent: u32, code: i32) -> Result<Option<Record>> {
+        if self.completion.is_none() {
+            self.completion = Some(
+                lifecycle::for_launch(&self.launch.id).context("native exited without a verified session binding")?,
+            );
+        }
+        if code == 0 { self.natural_exit(agent) } else { Ok(None) }
     }
 
     fn ready(&mut self) -> Result<Option<Record>> {
@@ -426,57 +437,6 @@ fn stop(agent: &mut Agent, host: Host, grace: Duration, mut allowed: impl FnMut(
     Ok(true)
 }
 
-fn successor_arguments(args: &Args, launch: &Launch, agent: Vec<OsString>) -> Vec<OsString> {
-    let mut arguments: Vec<OsString> =
-        ["_session", "--host", launch.host.name(), "--title", &launch.title, "--cwd"].map(OsString::from).to_vec();
-    arguments.push(launch.cwd.clone().into_os_string());
-    if let Some(directory) = &args.command_cwd {
-        arguments.extend([OsString::from("--command-cwd"), directory.clone().into_os_string()]);
-    }
-    if let Some(item) = &launch.item {
-        arguments.extend(["--item", item.as_str()].map(OsString::from));
-    }
-    let seconds = [
-        ("--poll-seconds", args.poll_seconds),
-        ("--idle-seconds", args.idle_seconds),
-        ("--grace-seconds", args.grace_seconds),
-        ("--native-exit-seconds", args.native_exit_seconds),
-        ("--restart-grace-seconds", args.restart_grace_seconds),
-        ("--plugin-grace-seconds", args.plugin_grace_seconds),
-        ("--input-idle-seconds", args.input_idle_seconds),
-    ];
-    for (name, value) in seconds {
-        arguments.extend([OsString::from(name), OsString::from(value.to_string())]);
-    }
-    arguments.extend(["--launch-id", &launch.id, "--successor", "--"].map(OsString::from));
-    arguments.extend(agent);
-    arguments
-}
-
-/// Stops the agent and hands the tab to the replaced tj binary, resuming the same conversation.
-fn restart(agent: &mut Agent, watch: &mut Watch, args: &Args, exe: &Path) -> Result<Option<ExitCode>> {
-    let host = watch.launch.host;
-    let session = match store::bound_session(&watch.launch.id) {
-        Ok(Some(session)) => session,
-        Ok(None) => {
-            watch.report(format!(
-                "not updating tj: no {} session is bound to launch {} yet",
-                host.name(),
-                watch.launch.id
-            ));
-            return Ok(None);
-        }
-        Err(error) => {
-            watch.report(format!("not updating tj: {error:#}"));
-            return Ok(None);
-        }
-    };
-    eprintln!("\r\nTJ: tj was updated; resuming {}:{session} in the new version\r", host.name());
-    stop(agent, host, Duration::from_secs(args.grace_seconds), |_| Ok(true))?;
-    let resume = host.resume(&args.agent, &session);
-    update::successor::hand_over(exe, &successor_arguments(args, &watch.launch, resume)).map(Some)
-}
-
 fn wait_for_enter() {
     eprintln!("TJ: press Enter to close this tab");
     let _ = std::io::stdin().read_line(&mut String::new());
@@ -504,7 +464,6 @@ fn mark_closed(launch_id: &str) {
 pub fn run(args: Args) -> Result<ExitCode> {
     let launch = launch(&args)?;
     let prebound = prebound_session(&args, &launch)?;
-    agent::prepare_wrapper().context("could not prepare the console")?;
     let id = launch.id.clone();
     let closed = launch.id.clone();
     agent::on_tab_closed(Box::new(move || mark_closed(&closed)));
@@ -518,16 +477,10 @@ pub fn run(args: Args) -> Result<ExitCode> {
 fn supervise(args: &Args, launch: Launch, prebound: Option<&PreboundSession>) -> Result<ExitCode> {
     let command_cwd = args.command_cwd.as_deref().unwrap_or(&launch.cwd);
     let exe = std::env::current_exe().context("could not locate the tj executable")?;
+    let mut watcher = update::Watcher::new(exe, update::published(launch.host)?);
     let selected = tj_agents::selected(&launch.cwd);
-    let upstream = if selected && !args.successor {
-        update::upstream::start(launch.host, &launch.cwd, args.update_url.clone())
-    } else {
-        None
-    };
     let marks = marks(&launch.id)?;
-    if !args.successor {
-        let _ = std::fs::remove_dir_all(&marks);
-    }
+    let _ = std::fs::remove_dir_all(&marks);
     let pid = std::process::id();
     let started_at = rfc3339(agent::started_at(pid)?.context("could not identify this wrapper process")?);
     let environment = [
@@ -536,25 +489,43 @@ fn supervise(args: &Args, launch: Launch, prebound: Option<&PreboundSession>) ->
         ("TJ_RUN_LAUNCH_ID", launch.id.clone()),
         ("AGENT_CLI_TAB_TITLE", launch.title.clone()),
     ];
-    if !args.successor {
-        if let Err(error) = record_launch(&launch, args.parent.as_deref(), pid, &started_at) {
-            if let Some(prebound) = prebound {
-                end_not_started(&launch, prebound, pid, &started_at);
-                return Err(error);
-            }
-            return Err(error).context("managed launch was not recorded; the native host was not started");
+    if launch.host == Host::Codex && Host::from_program(&args.agent[0]) == Some(Host::Codex) {
+        // A maintenance command can also be a direct codex child. A pending record keeps it
+        // out of spawned receipts until the wrapper records the actual TUI's birth.
+        crate::process_command::record_transport(&marks, &launch.id, pid, &started_at, None)?;
+    }
+    if let Err(error) = record_launch(&launch, args.parent.as_deref(), pid, &started_at) {
+        if let Some(prebound) = prebound {
+            end_not_started(&launch, Some(prebound), pid, &started_at);
+            return Err(error);
         }
+        return Err(error).context("managed launch was not recorded; the native host was not started");
     }
     if let Some(prebound) = prebound {
         if let Err(error) = store::prebind(&launch, &prebound.handle, pid, &started_at) {
-            end_not_started(&launch, prebound, pid, &started_at);
+            end_not_started(&launch, Some(prebound), pid, &started_at);
             return Err(error);
         }
     }
+    // Ensure the native service before Linux adopts or Windows owns TUI descendants.
+    let prepare_host = || {
+        if selected {
+            preparation(&launch, command_cwd, &args.agent).context("repository standards preparation failed")?;
+        }
+        let host = update::host(launch.host, &args.agent, command_cwd)?;
+        agent::prepare_wrapper().context("could not prepare the console")?;
+        Ok(host)
+    };
+    let host = match prepare_host() {
+        Ok(host) => host,
+        Err(error) => {
+            end_not_started(&launch, prebound, pid, &started_at);
+            return Err(error);
+        }
+    };
+    let upstream =
+        if selected { update::upstream::start(launch.host, &launch.cwd, args.update_url.clone()) } else { None };
     mark_open(&launch.id, true);
-    if selected {
-        prepare(&launch, command_cwd, &args.agent);
-    }
     match upstream.map(std::thread::JoinHandle::join) {
         Some(Ok(Ok(Some(line)))) => eprintln!("TJ: {line}"),
         Some(Ok(Err(error))) => {
@@ -567,20 +538,34 @@ fn supervise(args: &Args, launch: Launch, prebound: Option<&PreboundSession>) ->
     {
         Ok(agent) => agent,
         Err(error) => {
-            if let Some(prebound) = prebound {
-                end_not_started(&launch, prebound, pid, &started_at);
-            }
+            end_not_started(&launch, prebound, pid, &started_at);
             return Err(error);
         }
     };
+    if let Some(endpoint) = host.endpoint() {
+        let record = agent::started_at(agent.pid()).map_err(anyhow::Error::from).and_then(|born| {
+            if let Some(born) = born {
+                crate::process_command::record_transport(
+                    &marks,
+                    &launch.id,
+                    pid,
+                    &started_at,
+                    Some((agent.pid(), born, endpoint)),
+                )?;
+            }
+            Ok(())
+        });
+        if let Err(error) = record {
+            agent.kill_tree(Duration::from_secs(30))?;
+            return Err(error).context("could not record the native Codex transport");
+        }
+    }
     let poll = Duration::from_secs(args.poll_seconds);
     let grace = Duration::from_secs(args.grace_seconds);
     let graces = update::gate::Graces {
         plugins: Duration::from_secs(args.plugin_grace_seconds),
-        restart: Duration::from_secs(args.restart_grace_seconds),
         input: Duration::from_secs(args.input_idle_seconds),
     };
-    let mut watcher = update::Watcher::new(exe, update::published(launch.host)?);
     let mut watch = Watch {
         launch,
         marks,
@@ -590,34 +575,27 @@ fn supervise(args: &Args, launch: Launch, prebound: Option<&PreboundSession>) ->
         next_poll: Instant::now() + poll,
         reported: HashSet::new(),
         completion: None,
+        wrapper_started_at: started_at,
+        registration_report_at: Instant::now() + REGISTRATION_REPORT_GRACE,
         revision: None,
         ready_since: None,
         pinned: None,
         rollout: None,
         next_lookup: Instant::now(),
     };
-    let resumed = args.successor;
     // The shared timestamp limits requests even when tabs start at different times.
     let mut next_upstream = Instant::now() + poll;
     let mut upstream = None;
     loop {
         if let Some(code) = agent.try_wait()? {
             agent.kill_tree(Duration::from_secs(30))?;
-            if resumed && code != 0 {
-                eprintln!("\r\nTJ: the resumed agent exited with code {code}\r");
-                wait_for_enter();
-            }
             // A clean process exit is not a final result. Only the exact native receipt can close.
-            let ready = if code == 0 {
-                match watch.natural_exit(agent.pid()) {
-                    Ok(ready) => ready,
-                    Err(error) => {
-                        watch.report(format!("completion remains unverified: {error:#}"));
-                        None
-                    }
+            let ready = match watch.exited(agent.pid(), code) {
+                Ok(ready) => ready,
+                Err(error) => {
+                    watch.report(format!("completion remains unverified: {error:#}"));
+                    None
                 }
-            } else {
-                None
             };
             if let Some(record) = ready {
                 let store = watch.completion.as_ref().context("completion store not bound")?.clone();
@@ -704,29 +682,28 @@ fn supervise(args: &Args, launch: Launch, prebound: Option<&PreboundSession>) ->
             next_upstream = Instant::now() + poll;
             upstream = update::upstream::start(watch.launch.host, &watch.launch.cwd, args.update_url.clone());
         }
-        let host = update::host(watch.launch.host);
         let finishing = watch.completion.as_ref().and_then(|store| store.load().ok().flatten()).is_some_and(|record| {
             matches!(
                 record.state(),
                 State::Active { intent: Some(_), .. } | State::Ready { .. } | State::Closing { .. }
             )
         });
-        let due = if finishing { None } else { update::due(&mut watcher, host, agent.pid(), graces) };
-        match due {
-            Some(update::gate::Apply::Plugins) => {
-                let revision = watcher.revision();
-                match host.apply() {
-                    Ok(()) => watcher.applied(revision),
-                    Err(error) => watch.report(format!("could not update {}: {error}", watch.launch.host.name())),
-                }
+        if watcher.binary_notice(Duration::from_secs(2)) {
+            watch.report("A new tj binary is installed. Your next launch will use it.".into());
+        }
+        if !finishing
+            && let Some(revision) = watcher.revision()
+            && update::plugins_due(host.as_ref(), agent.pid(), graces)
+        {
+            match host.apply(&watch.launch, &revision) {
+                Ok(true) => watcher.applied(Some(revision)),
+                Ok(false) => {}
+                Err(error) => watch.report(format!(
+                    "could not update {}: {:#}",
+                    watch.launch.host.name(),
+                    anyhow::Error::new(error)
+                )),
             }
-            Some(update::gate::Apply::Binary) => {
-                let exe = watcher.exe().to_path_buf();
-                if let Some(code) = restart(&mut agent, &mut watch, args, &exe)? {
-                    return Ok(code);
-                }
-            }
-            None => {}
         }
         std::thread::sleep(Duration::from_millis(500));
     }
@@ -755,11 +732,9 @@ mod tests {
             idle_seconds: 600,
             grace_seconds: 10,
             native_exit_seconds: 90,
-            restart_grace_seconds: 30,
             plugin_grace_seconds: 2,
             input_idle_seconds: 2,
             update_url: String::new(),
-            successor: false,
             agent,
         }
     }
@@ -777,26 +752,34 @@ mod tests {
     }
 
     #[test]
-    fn item_reference_survives_handover_with_the_entire_resume_command() {
-        let mut launch = launch();
-        launch.item = Some(crate::domain::item::Reference::parse("azure-devops:dev.azure.com/contoso:461").unwrap());
-        let agent = vec![
-            executable(),
-            "--remote".into(),
-            "unix://".into(),
-            "resume".into(),
-            "123e4567-e89b-12d3-a456-426614174000".into(),
-            "--".into(),
-            "--literal prompt".into(),
-        ];
-        let mut args = prebound_args(agent.clone());
-        args.item = Some("#461".into());
-        let successor = super::successor_arguments(&args, &launch, agent.clone());
-        let item = successor.iter().position(|arg| arg == "--item").unwrap() + 1;
-        assert_eq!(successor[item], launch.item.as_ref().unwrap().as_str());
-        let separator = successor.iter().position(|arg| arg == "--").unwrap();
-        assert_eq!(&successor[separator + 1..], agent);
-        assert!(successor.iter().any(|arg| arg == "--successor"));
+    fn registration_waiting_is_reported_once_only_after_its_grace() {
+        let start = std::time::Instant::now();
+        let deadline = start + super::REGISTRATION_REPORT_GRACE;
+        let mut watch = super::Watch {
+            launch: launch(),
+            marks: PathBuf::new(),
+            poll: std::time::Duration::ZERO,
+            idle: std::time::Duration::ZERO,
+            input_idle: std::time::Duration::ZERO,
+            next_poll: start,
+            reported: std::collections::HashSet::new(),
+            completion: None,
+            wrapper_started_at: String::new(),
+            registration_report_at: deadline,
+            revision: None,
+            ready_since: None,
+            pinned: None,
+            rollout: None,
+            next_lookup: start,
+        };
+        watch.awaiting_registration(start);
+        watch.awaiting_registration(deadline - std::time::Duration::from_nanos(1));
+        assert!(watch.reported.is_empty());
+        watch.awaiting_registration(deadline);
+        watch.awaiting_registration(deadline + super::REGISTRATION_REPORT_GRACE);
+        assert_eq!(watch.reported.len(), 1);
+        assert!(watch.reported.contains("still awaiting native session registration"));
+        assert!(watch.completion.is_none());
     }
 
     #[test]
@@ -815,6 +798,8 @@ mod tests {
             launch.cwd.clone().into_os_string(),
             OsString::from("resume"),
             OsString::from("123e4567-e89b-12d3-a456-426614174000"),
+            OsString::from("--remote"),
+            OsString::from("unix://"),
         ]);
         assert_eq!(
             prebound_session(&without_prompt, &launch).unwrap().unwrap().handle,
@@ -827,6 +812,8 @@ mod tests {
             launch.cwd.clone().into_os_string(),
             OsString::from("resume"),
             OsString::from("123e4567-e89b-12d3-a456-426614174000"),
+            OsString::from("--remote"),
+            OsString::from("unix://"),
             OsString::from("--"),
             OsString::from("Prompt"),
         ]);
@@ -840,8 +827,7 @@ mod tests {
             vec!["--model", "chosen"],
             vec!["-c", "model_reasoning_effort=xhigh"],
             vec!["--model", "chosen", "-c", "model_reasoning_effort=high"],
-            vec!["--model", "chosen", "-c", "model_reasoning_effort=high", "--remote", "unix://"],
-            vec!["--remote", "unix://"],
+            vec![],
         ] {
             let mut agent = vec![
                 executable(),
@@ -851,7 +837,7 @@ mod tests {
                 "123e4567-e89b-12d3-a456-426614174000".into(),
             ];
             agent.extend(overrides.into_iter().map(OsString::from));
-            agent.extend(["--".into(), "--model=literal-prompt".into()]);
+            agent.extend(["--remote".into(), "unix://".into(), "--".into(), "--model=literal-prompt".into()]);
             assert!(prebound_session(&prebound_args(agent), &launch).is_ok());
         }
         for overrides in [
@@ -861,6 +847,7 @@ mod tests {
             vec!["-c", "approval_policy=never"],
             vec!["--last"],
             vec!["--model", "chosen", "--model", "other"],
+            vec!["--remote", "unix://"],
             vec!["--remote", "ws://localhost:9000"],
             vec!["--remote", "unix:///another-daemon.sock"],
         ] {
@@ -872,6 +859,7 @@ mod tests {
                 "123e4567-e89b-12d3-a456-426614174000".into(),
             ];
             agent.extend(overrides.into_iter().map(OsString::from));
+            agent.extend(["--remote".into(), "unix://".into()]);
             assert!(prebound_session(&prebound_args(agent), &launch).is_err());
         }
     }
@@ -886,6 +874,8 @@ mod tests {
                 launch.cwd.clone().into_os_string(),
                 OsString::from("resume"),
                 OsString::from("123e4567-e89b-12d3-a456-426614174000"),
+                OsString::from("--remote"),
+                OsString::from("unix://"),
                 OsString::from("--"),
                 OsString::from(prompt),
             ]);
@@ -896,12 +886,22 @@ mod tests {
     #[test]
     fn prebound_session_rejects_undelimited_or_extra_arguments() {
         let launch = launch();
+        let missing_attachment = prebound_args(vec![
+            executable(),
+            "--cd".into(),
+            launch.cwd.clone().into_os_string(),
+            "resume".into(),
+            "123e4567-e89b-12d3-a456-426614174000".into(),
+        ]);
+        assert!(prebound_session(&missing_attachment, &launch).is_err());
         let bare_prompt = prebound_args(vec![
             executable(),
             OsString::from("--cd"),
             launch.cwd.clone().into_os_string(),
             OsString::from("resume"),
             OsString::from("123e4567-e89b-12d3-a456-426614174000"),
+            OsString::from("--remote"),
+            OsString::from("unix://"),
             OsString::from("Prompt"),
         ]);
         assert!(prebound_session(&bare_prompt, &launch).is_err());
@@ -912,6 +912,8 @@ mod tests {
             launch.cwd.clone().into_os_string(),
             OsString::from("resume"),
             OsString::from("123e4567-e89b-12d3-a456-426614174000"),
+            OsString::from("--remote"),
+            OsString::from("unix://"),
             OsString::from("--model=other"),
         ]);
         assert!(prebound_session(&bare_option, &launch).is_err());
@@ -922,6 +924,8 @@ mod tests {
             launch.cwd.clone().into_os_string(),
             OsString::from("resume"),
             OsString::from("123e4567-e89b-12d3-a456-426614174000"),
+            OsString::from("--remote"),
+            OsString::from("unix://"),
             OsString::from("--"),
         ]);
         assert!(prebound_session(&bare_delimiter, &launch).is_err());
@@ -932,6 +936,8 @@ mod tests {
             launch.cwd.clone().into_os_string(),
             OsString::from("resume"),
             OsString::from("123e4567-e89b-12d3-a456-426614174000"),
+            OsString::from("--remote"),
+            OsString::from("unix://"),
             OsString::from("--"),
             OsString::from("Prompt"),
             OsString::from("extra"),

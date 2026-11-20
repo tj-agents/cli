@@ -1,10 +1,12 @@
 use std::collections::VecDeque;
 use std::io;
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+#[cfg(any(windows, test))]
 use anyhow::Context;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
@@ -12,11 +14,14 @@ use tokio::sync::{mpsc as async_mpsc, oneshot};
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::{self, Message};
 
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
-
 /// A host CLI run without a console window, so a detached caller never flashes one.
+#[cfg(any(windows, test))]
 pub(crate) fn host_command(program: &str) -> anyhow::Result<Command> {
     let executable = which::which(program).with_context(|| format!("`{program}` is not on PATH"))?;
+    Ok(native_command(&executable))
+}
+
+pub(crate) fn native_command(executable: &Path) -> Command {
     let command = Command::new(executable);
     #[cfg(windows)]
     let command = {
@@ -26,11 +31,12 @@ pub(crate) fn host_command(program: &str) -> anyhow::Result<Command> {
         command.creation_flags(CREATE_NO_WINDOW);
         command
     };
-    Ok(command)
+    command
 }
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum Error {
+    #[cfg(windows)]
     #[error("could not find the host executable")]
     Host(#[source] anyhow::Error),
     #[error("{operation}")]
@@ -64,17 +70,12 @@ pub(crate) struct Server {
     worker: Option<JoinHandle<()>>,
     next_id: u64,
     request_timeout: Duration,
+    identity: Value,
 }
 
 impl Server {
-    pub(crate) fn connect() -> Result<Self, Error> {
-        let mut command = host_command("codex").map_err(Error::Host)?;
-        command.args(["app-server", "proxy"]);
-        Self::connect_command(command, REQUEST_TIMEOUT)
-    }
-
-    pub(crate) fn connect_socket(socket: &std::path::Path) -> Result<Self, Error> {
-        let mut command = host_command("codex").map_err(Error::Host)?;
+    pub(crate) fn connect_socket(executable: &Path, socket: &Path) -> Result<Self, Error> {
+        let mut command = native_command(executable);
         command.args(["app-server", "proxy", "--sock"]).arg(socket);
         Self::connect_command(command, Duration::from_secs(3))
     }
@@ -111,11 +112,16 @@ impl Server {
             worker: Some(worker),
             next_id: 0,
             request_timeout,
+            identity: Value::Null,
         };
         // Initialization's deadline also bounds startup and the HTTP upgrade.
-        server.request("initialize", json!({"clientInfo": {"name": "tj", "version": env!("CARGO_PKG_VERSION")}}))?;
+        server.identity = server.request("initialize", json!({"clientInfo": {"name": "tj", "version": env!("CARGO_PKG_VERSION")}, "capabilities":{"experimentalApi":true}}))?;
         server.send(json!({"method": "initialized"}))?;
         Ok(server)
+    }
+
+    pub(crate) fn identity(&self) -> &Value {
+        &self.identity
     }
 
     fn send(&self, message: Value) -> Result<(), Error> {

@@ -68,7 +68,7 @@ fn active(value: &Value, subject: &str) -> Result<()> {
     Ok(())
 }
 
-fn exact_launch(data: &Value, launch: &Launch, wrapper_pid: u32, wrapper_started_at: &str) -> Result<()> {
+pub(super) fn exact_launch(data: &Value, launch: &Launch, wrapper_pid: u32, wrapper_started_at: &str) -> Result<()> {
     let row = &data["launch"];
     let cwd = launch.cwd.to_str().context("launch cwd is not UTF-8")?;
     if text(row, "launch_id")? != launch.id
@@ -147,6 +147,15 @@ pub fn prebind(launch: &Launch, handle: &str, wrapper_pid: u32, wrapper_started_
     let by_launch = call(&["show", "--launch-id", &launch.id])?;
     exact_binding(&by_launch, launch, handle, wrapper_pid, wrapper_started_at)?;
     exact_session(&call(&["show", handle])?["session"], launch, handle)
+}
+
+pub fn end_not_started_unbound(launch: &Launch, wrapper_pid: u32, wrapper_started_at: &str) -> Result<()> {
+    let data = call(&["show", "--launch-id", &launch.id])?;
+    exact_launch(&data, launch, wrapper_pid, wrapper_started_at)?;
+    if !data["launch"]["session"].is_null() {
+        bail!("unstarted launch already has a session binding");
+    }
+    end(&launch.id, "not_started")
 }
 
 pub fn end_not_started(launch: &Launch, handle: &str, wrapper_pid: u32, wrapper_started_at: &str) -> Result<()> {

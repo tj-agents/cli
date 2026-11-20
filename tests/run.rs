@@ -1,6 +1,7 @@
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child as ProcessChild, Command, Output, Stdio};
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 const ITEM: &str = "github:github.com/acme/app:1";
@@ -174,8 +175,7 @@ fn python() -> &'static str {
 }
 
 fn search_path(sandbox: &Sandbox) -> std::ffi::OsString {
-    let worktrunk = which::which("git-wt").expect("git-wt is not on PATH: python -m tj_cli.worktrunk_install");
-    let mut entries = vec![sandbox.stubs.clone(), worktrunk.parent().unwrap().to_path_buf()];
+    let mut entries = vec![sandbox.stubs.clone()];
     entries.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap()));
     std::env::join_paths(entries).unwrap()
 }
@@ -190,6 +190,7 @@ fn environment(sandbox: &Sandbox) -> Vec<(&'static str, std::ffi::OsString)> {
         ("DUMMY_TJ", std::ffi::OsString::from(env!("CARGO_BIN_EXE_tj"))),
         ("CLAUDE_CONFIG_DIR", sandbox.root.join("claude").into_os_string()),
         ("CODEX_HOME", sandbox.root.join("codex").into_os_string()),
+        ("FAKE_CODEX_LOG", sandbox.root.join("maintenance.jsonl").into_os_string()),
         ("CODEX_THREAD_ID", std::ffi::OsString::new()),
         ("CODEX_SESSION_ID", std::ffi::OsString::new()),
         ("CLAUDECODE", std::ffi::OsString::new()),
@@ -227,8 +228,6 @@ fn run_arguments(sandbox: &Sandbox, launch: &str, host: &str, mode: &str, grace:
         grace,
         "--native-exit-seconds",
         "2",
-        "--restart-grace-seconds",
-        "2",
         "--input-idle-seconds",
         "0",
         "--",
@@ -245,7 +244,24 @@ fn native_codex(sandbox: &Sandbox) -> PathBuf {
     std::fs::create_dir(&directory).unwrap();
     let name = if cfg!(windows) { "codex.exe" } else { "codex" };
     let executable = directory.join(name);
-    std::fs::copy(std::env::current_exe().unwrap(), &executable).unwrap();
+    static IMAGE: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+    let image = IMAGE.get_or_init(|| {
+        let temporary = tempfile::tempdir().unwrap();
+        let output = temporary.path().join(name);
+        let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        let result = Command::new("rustc")
+            .arg("--edition=2024")
+            .arg(fixtures.join("native_codex.rs"))
+            .arg("-o")
+            .arg(&output)
+            .env("TJ_FIXTURE_PYTHON", which::which(python()).unwrap())
+            .env("TJ_FIXTURE_CODEX", fixtures.join("fake_codex.py"))
+            .output()
+            .unwrap();
+        assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stderr));
+        std::fs::read(output).unwrap()
+    });
+    std::fs::write(&executable, image).unwrap();
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -273,11 +289,24 @@ fn prebound_arguments_with_prompt(sandbox: &Sandbox, launch: &str, prompt: &str)
             sandbox.worktree.to_string_lossy().into_owned(),
             "resume".to_owned(),
             PREBOUND.to_owned(),
+            "--remote".to_owned(),
+            "unix://".to_owned(),
             "--".to_owned(),
             prompt.to_owned(),
         ],
     );
     arguments
+}
+
+fn completion_receipt(sandbox: &Sandbox, launch: &str) -> serde_json::Value {
+    let output = Command::new(env!("CARGO_BIN_EXE_tj"))
+        .args(["receipt", "--launch", launch])
+        .envs(environment(sandbox))
+        .current_dir(&sandbox.root)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    serde_json::from_slice(&output.stdout).unwrap()
 }
 
 fn prebind(sandbox: &Sandbox, foreign_native: bool) {
@@ -897,13 +926,11 @@ fn kill_dummy(sandbox: &Sandbox) {
 }
 
 #[test]
-fn merge_notice_identity_survives_successor_restarts_and_new_launches_of_the_same_session() {
+fn merge_notice_identity_survives_new_launches_of_the_same_session() {
     for host in ["claude", "codex"] {
         let sandbox = sandbox();
         set_reply(&sandbox, "tj-item-prs.json", MERGED);
-        for (number, launch, successor) in
-            [(0, "original", false), (1, "original", true), (2, "new-launch", false), (3, "another-item", false)]
-        {
+        for (number, launch) in [(0, "original"), (2, "new-launch"), (3, "another-item")] {
             // A real new launch replaces the binding, while the native session and its feed persist.
             if number >= 2 {
                 std::fs::remove_file(sandbox.stubs.join("agent-store-show.json")).unwrap();
@@ -927,10 +954,6 @@ fn merge_notice_identity_survives_successor_restarts_and_new_launches_of_the_sam
                     "tj-item-prs.json",
                     r#"{"ref":"github:github.com/acme/app:2","all_merged":true,"prs":[{"url":"u"}]}"#,
                 );
-            }
-            if successor {
-                let separator = arguments.iter().position(|argument| argument == "--").unwrap();
-                arguments.splice(separator..separator, ["--successor"].map(str::to_owned));
             }
             let starts = log(&sandbox, "dummy.log").lines().filter(|line| line.starts_with("pid ")).count();
             let child = spawn(&sandbox, &arguments, &sandbox.root);
@@ -1430,6 +1453,111 @@ fn the_launch_is_recorded_before_the_agent_starts() {
     assert!(seen_by_agent.contains("launch --launch-id first --host"), "{seen_by_agent}");
 }
 
+fn awaiting_registration(sandbox: &Sandbox, launch: &str, host: &str, mode: &str) -> Child {
+    let arguments = run_arguments(sandbox, launch, host, mode, "10");
+    std::fs::write(
+        sandbox.stubs.join("agent-store-prebind.json"),
+        serde_json::json!({"session":"sess-1", "host":host}).to_string(),
+    )
+    .unwrap();
+    let child = spawn(sandbox, &arguments, &sandbox.root);
+    wait_for_log(sandbox, "pid ");
+    child
+}
+
+#[test]
+fn registration_delayed_across_watchdog_polls_is_quiet_and_then_observed() {
+    for host in ["claude", "codex"] {
+        let sandbox = sandbox();
+        let launch = format!("registration-delayed-{host}");
+        let child = awaiting_registration(&sandbox, &launch, host, "signal");
+        wait_for_polls(&sandbox, "stubs/agent-store.log", &format!("show --launch-id {launch}"), 4);
+        let mut row: serde_json::Value =
+            serde_json::from_str(&log(&sandbox, "stubs/agent-store-prebind-launch.json")).unwrap();
+        row["session"] = serde_json::json!(format!("{host}:sess-1"));
+        row["created_at"] = row["wrapper"]["started_at"].clone();
+        set_store_list(&sandbox.stubs, "launches", serde_json::json!([row]));
+        std::fs::write(sandbox.stubs.join("agent-store-prebind-bound"), "").unwrap();
+        lifecycle(&sandbox, "registered", "start", None, None);
+        lifecycle(&sandbox, "registered", "end", Some("Registered final response"), None);
+        wait_until("registered completion was not observed", || {
+            completion_receipt(&sandbox, &launch)["state"]["kind"] == "attention"
+        });
+        assert_eq!(in_agent(&sandbox, &["exit-native"]).0, 0);
+        let output = finish(child, Duration::from_secs(30));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(0), "{stderr}");
+        assert!(!stderr.contains("missing session"), "{stderr}");
+        assert!(!stderr.contains("still awaiting native session registration"), "{stderr}");
+        assert!(sandbox.worktree.exists());
+    }
+}
+
+#[test]
+fn registration_missing_at_native_exit_is_reported_and_preserves_the_exit_code() {
+    for host in ["claude", "codex"] {
+        for code in [0, 3] {
+            let sandbox = sandbox();
+            let launch = format!("registration-exit-{host}-{code}");
+            let child = awaiting_registration(&sandbox, &launch, host, if code == 0 { "signal" } else { "exit" });
+            if code == 0 {
+                wait_for_polls(&sandbox, "stubs/agent-store.log", &format!("show --launch-id {launch}"), 3);
+                assert_eq!(in_agent(&sandbox, &["exit-native"]).0, 0);
+            }
+            let output = finish(child, Duration::from_secs(30));
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert_eq!(output.status.code(), Some(code), "{stderr}");
+            assert_eq!(stderr.matches("native exited without a verified session binding").count(), 1, "{stderr}");
+            assert_eq!(stderr.matches("missing session").count(), 1, "premature or absent warning: {stderr}");
+            assert!(sandbox.worktree.exists());
+            assert!(!log(&sandbox, "stubs/agent-store.log").contains("release-worktree"));
+            assert!(!log(&sandbox, "stubs/tj-item.log").contains("--state Done"));
+        }
+    }
+}
+
+#[test]
+fn registration_malformed_binding_and_store_errors_are_reported_while_native_is_live() {
+    for host in ["claude", "codex"] {
+        for failure in ["missing", "mismatched", "store"] {
+            let sandbox = sandbox();
+            let launch = format!("registration-error-{host}-{failure}");
+            let child = awaiting_registration(&sandbox, &launch, host, "signal");
+            let prefix = format!("show --launch-id {launch}");
+            wait_for_polls(&sandbox, "stubs/agent-store.log", &prefix, 3);
+            let mut reply: serde_json::Value =
+                serde_json::from_str(&log(&sandbox, "stubs/agent-store-show.json")).unwrap();
+            let diagnostic = match failure {
+                "missing" => {
+                    reply["data"]["session"] = serde_json::json!({});
+                    "missing session"
+                }
+                "mismatched" => {
+                    reply["data"]["session"]["launch_id"] = serde_json::json!("foreign");
+                    "completion requires an exact reciprocal native session binding"
+                }
+                "store" => {
+                    reply = serde_json::json!({"ok":false,"error":{"message":"store unavailable"}});
+                    "agent-store show: store unavailable"
+                }
+                _ => unreachable!(),
+            };
+            std::fs::write(sandbox.stubs.join("agent-store-show.json"), reply.to_string()).unwrap();
+            std::fs::remove_file(sandbox.stubs.join("agent-store-prebind.json")).unwrap();
+            let observed =
+                log(&sandbox, "stubs/agent-store.log").lines().filter(|line| line.starts_with(&prefix)).count();
+            wait_for_polls(&sandbox, "stubs/agent-store.log", &prefix, observed + 3);
+            assert_eq!(in_agent(&sandbox, &["exit-native"]).0, 0);
+            let output = finish(child, Duration::from_secs(30));
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let live_report = format!("TJ: completion remains unverified: {diagnostic}");
+            assert_eq!(stderr.lines().filter(|line| line.trim() == live_report).count(), 1, "{stderr}");
+            assert!(!stderr.contains("still awaiting native session registration"), "{stderr}");
+            assert!(sandbox.worktree.exists());
+        }
+    }
+}
+
 #[test]
 fn repository_preparation_finishes_before_the_agent_starts() {
     let sandbox = sandbox();
@@ -1454,15 +1582,32 @@ fn repository_preparation_finishes_before_the_agent_starts() {
 }
 
 #[test]
-fn repository_preparation_failure_warns_and_still_starts_the_agent() {
-    let sandbox = sandbox();
-    select_tj_agents_checked(&sandbox);
-    std::fs::write(sandbox.stubs.join("prepare-failure"), "failed").unwrap();
-    let child = start(&sandbox, "prepare-failed", "claude", "exit", "10");
-    let output = finish(child, Duration::from_secs(30));
-    assert_eq!(output.status.code(), Some(3));
-    assert!(String::from_utf8_lossy(&output.stderr).contains("standards preparation failed"));
-    assert!(log(&sandbox, "dummy.log").contains("agent prepare-failed"));
+fn repository_preparation_failure_ends_the_launch_before_starting_either_host() {
+    for host in ["claude", "codex"] {
+        let sandbox = sandbox();
+        select_tj_agents_checked(&sandbox);
+        std::fs::write(sandbox.stubs.join("prepare-failure"), "failed").unwrap();
+        let launch = "prepare-failed";
+        // Before SessionStart the ordinary launch has a wrapper but no session binding.
+        let setup = serde_json::json!({"host":host, "session":PREBOUND});
+        std::fs::write(sandbox.stubs.join("agent-store-prebind.json"), setup.to_string()).unwrap();
+        let args = if host == "codex" {
+            prebound_arguments_with_prompt(&sandbox, launch, "hold receipt fixture")
+        } else {
+            run_arguments(&sandbox, launch, host, "exit", "10")
+        };
+        let output = finish(spawn(&sandbox, &args, &sandbox.root), Duration::from_secs(30));
+        assert!(!output.status.success());
+        let error = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            error.contains("repository standards preparation failed")
+                && error.contains("simulated preparation failure"),
+            "{error}"
+        );
+        assert!(log(&sandbox, "dummy.log").is_empty());
+        assert!(log(&sandbox, "maintenance.jsonl").is_empty());
+        assert!(log(&sandbox, "stubs/agent-store.log").contains("end --launch-id prepare-failed --reason not_started"));
+    }
 }
 
 #[test]
@@ -1483,14 +1628,65 @@ fn a_prebound_native_codex_session_registers_and_verifies_before_spawning() {
 }
 
 #[test]
+fn prebound_receipt_identifies_only_the_verified_frontend() {
+    let sandbox = sandbox();
+    prebind(&sandbox, false);
+    let arguments = prebound_arguments_with_prompt(&sandbox, "frontend", "hold receipt fixture");
+    let child = spawn(&sandbox, &arguments, &sandbox.root);
+    wait_until("native frontend did not start", || log(&sandbox, "maintenance.jsonl").contains("frontend"));
+    let receipt = || {
+        Command::new(env!("CARGO_BIN_EXE_tj"))
+            .args(["_process", "spawned", "--launch-id", "frontend", "--session", &format!("codex:{PREBOUND}")])
+            .envs(environment(&sandbox))
+            .output()
+            .unwrap()
+    };
+    let output = receipt();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let observed: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let transport = sandbox.root.join("cache/run/frontend/transport.json");
+    let mut recorded: serde_json::Value = serde_json::from_slice(&std::fs::read(&transport).unwrap()).unwrap();
+    assert_eq!(observed["native"], recorded["native"]);
+    assert!(observed["native"]["pid"].as_u64().unwrap() > 0);
+    assert_eq!(observed["launch_id"], "frontend");
+    assert_eq!(observed["session"], format!("codex:{PREBOUND}"));
+    assert_eq!(observed["codex_transport"], "local-daemon");
+    assert_eq!(
+        Path::new(observed["endpoint"].as_str().unwrap()),
+        sandbox.root.join("codex/app-server-control/app-server-control.sock")
+    );
+    recorded["native"]["started_at"] = serde_json::json!("2000-01-01T00:00:00Z");
+    std::fs::write(&transport, serde_json::to_vec(&recorded).unwrap()).unwrap();
+    assert!(!receipt().status.success());
+    recorded["native"] = serde_json::Value::Null;
+    std::fs::write(&transport, serde_json::to_vec(&recorded).unwrap()).unwrap();
+    assert_eq!(serde_json::from_slice::<serde_json::Value>(&receipt().stdout).unwrap(), serde_json::Value::Null);
+    std::fs::write(sandbox.root.join("maintenance.exit"), "").unwrap();
+    assert!(finish(child, Duration::from_secs(30)).status.success());
+}
+
+#[test]
+fn prebound_daemon_start_failure_closes_the_unstarted_launch_and_reports_stderr() {
+    let sandbox = sandbox();
+    prebind(&sandbox, false);
+    std::fs::write(sandbox.root.join("maintenance.fail"), "").unwrap();
+    let args = prebound_arguments_with_prompt(&sandbox, "daemon-failure", "hold receipt fixture");
+    let output = finish(spawn(&sandbox, &args, &sandbox.root), Duration::from_secs(30));
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("fixture daemon start refused"));
+    assert!(!log(&sandbox, "maintenance.jsonl").contains("frontend"));
+    assert!(log(&sandbox, "stubs/agent-store.log").contains("end --launch-id daemon-failure --reason not_started"));
+}
+
+#[test]
 fn a_prebound_codex_accepts_model_and_effort_before_the_literal_prompt() {
     let sandbox = sandbox();
     prebind(&sandbox, false);
     let mut arguments = prebound_arguments_with_prompt(&sandbox, "lane-model", "--model=literal-prompt");
-    let delimiter = arguments.len() - 2;
+    let delimiter = arguments.iter().position(|argument| argument == "--remote").unwrap();
     arguments.splice(
         delimiter..delimiter,
-        ["--model", "chosen-model", "-c", "model_reasoning_effort=xhigh", "--remote", "unix://"].map(str::to_owned),
+        ["--model", "chosen-model", "-c", "model_reasoning_effort=xhigh"].map(str::to_owned),
     );
     let output = finish(spawn(&sandbox, &arguments, &sandbox.root), Duration::from_secs(30));
     assert!(!output.status.success());
@@ -1761,39 +1957,248 @@ fn only_the_tabs_own_agent_can_request_finish() {
     assert_closed_out(&sandbox, &output, "owned");
 }
 
-#[cfg(windows)]
-#[test]
-fn each_claude_update_is_applied_to_an_idle_claude_in_place_once() {
-    let sandbox = sandbox();
-    set_reply(&sandbox, "agent-store-show.json", BOUND);
-    let child = spawn(&sandbox, &with_prompt(&sandbox, "plugins", "claude", "keys"), &sandbox.root);
-    wait_for_log(&sandbox, "raw");
-    set_status(&sandbox, "busy");
-    publish(&sandbox, "claude", "plugins b");
-    std::thread::sleep(Duration::from_secs(4));
-    assert!(!log(&sandbox, "dummy.log").contains("typed"), "typed into a turn that never ended");
-    set_status(&sandbox, "idle");
-    wait_for_log(&sandbox, "typed /reload-plugins");
-    publish(&sandbox, "codex", "plugins c");
-    std::thread::sleep(Duration::from_secs(4));
-    assert_eq!(log(&sandbox, "dummy.log").matches("typed /reload-plugins").count(), 1, "a Codex update reached Claude");
-    publish(&sandbox, "claude", "plugins b");
-    wait_until("a second Claude update of the same plugins was skipped", || {
-        log(&sandbox, "dummy.log").matches("typed /reload-plugins").count() == 2
-    });
-    std::thread::sleep(Duration::from_secs(4));
-    let agent = log(&sandbox, "dummy.log");
-    assert_eq!(agent.matches("typed /reload-plugins").count(), 2, "{agent}");
-    assert_eq!(agent.matches("agent plugins Test tab").count(), 1, "the agent restarted: {agent}");
-    done(&sandbox);
-    let output = finish(child, Duration::from_secs(60));
-    assert_closed_out(&sandbox, &output, "plugins");
+/// Run the real CLI adapter against the dummy Claude binding; never start a native provider.
+struct NativeAdapter {
+    child: ProcessChild,
+    session: String,
+    requests: mpsc::Receiver<Result<serde_json::Value, String>>,
+    reader: Option<std::thread::JoinHandle<()>>,
+}
+
+impl NativeAdapter {
+    fn command(sandbox: &Sandbox, session: &str, arguments: &[&str]) -> Command {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_tj"));
+        command
+            .args(arguments)
+            .envs(environment(sandbox))
+            .env("CLAUDECODE", "1")
+            .env("CLAUDE_CODE_SESSION_ID", session.strip_prefix("claude:").unwrap())
+            .env_remove("CODEX_THREAD_ID")
+            .current_dir(&sandbox.root);
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            command.creation_flags(0x0800_0000);
+        }
+        command
+    }
+
+    fn start(sandbox: &Sandbox) -> Self {
+        let session = native_session(sandbox);
+        let mut child = Self::command(sandbox, &session, &["_native-host", "--session", &session])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(std::fs::File::create(sandbox.root.join("native-adapter-stderr.log")).unwrap())
+            .spawn()
+            .unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let (sender, requests) = mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            for line in BufReader::new(stdout).lines() {
+                let parsed = line
+                    .map_err(|error| error.to_string())
+                    .and_then(|line| serde_json::from_str(&line).map_err(|error| error.to_string()));
+                let failed = parsed.is_err();
+                if sender.send(parsed).is_err() || failed {
+                    break;
+                }
+            }
+        });
+        // Own the process before readiness assertions so a failure also cleans up its reader.
+        let mut adapter = Self { child, session, requests, reader: Some(reader) };
+        let lease = sandbox.root.join("state/native").join(adapter.session.replace(':', "-")).join("host.lock");
+        wait_until("native adapter never acquired its lease", || {
+            assert!(
+                adapter.child.try_wait().unwrap().is_none(),
+                "native adapter exited: {}",
+                log(sandbox, "native-adapter-stderr.log")
+            );
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&lease)
+                .is_ok_and(|file| matches!(fs4::FileExt::try_lock(&file), Err(fs4::TryLockError::WouldBlock)))
+        });
+        adapter
+    }
+
+    fn request(&self) -> serde_json::Value {
+        self.requests.recv_timeout(Duration::from_secs(30)).expect("native reload never reached the adapter").unwrap()
+    }
+
+    fn assert_quiet(&self) {
+        assert!(
+            matches!(self.requests.recv_timeout(Duration::from_secs(4)), Err(mpsc::RecvTimeoutError::Timeout)),
+            "the native adapter emitted another request or stopped"
+        );
+    }
+
+    fn receipt(&self, sandbox: &Sandbox, request: &serde_json::Value) {
+        assert_eq!(request["session"], self.session);
+        let result = serde_json::json!({"completed":true, "output":{"text":"Reloaded fixture plugins"}});
+        let output = Self::command(
+            sandbox,
+            &self.session,
+            &[
+                "_native-receipt",
+                "--session",
+                &self.session,
+                "--request",
+                request["id"].as_str().unwrap(),
+                "--lease",
+                request["lease"].as_str().unwrap(),
+                "--result",
+                &result.to_string(),
+            ],
+        )
+        .output()
+        .unwrap();
+        assert!(output.status.success(), "native receipt: {}", String::from_utf8_lossy(&output.stderr));
+    }
+}
+
+impl Drop for NativeAdapter {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        if let Some(reader) = self.reader.take() {
+            let _ = reader.join();
+        }
+    }
+}
+
+fn native_records(sandbox: &Sandbox) -> Vec<serde_json::Value> {
+    let path = sandbox.root.join("state/native").join(native_session(sandbox).replace(':', "-")).join("requests.jsonl");
+    let text = std::fs::read_to_string(path).unwrap_or_default();
+    let Some((complete, _)) = text.rsplit_once('\n') else { return Vec::new() };
+    complete.lines().map(|line| serde_json::from_str(line).unwrap()).collect()
 }
 
 #[test]
-fn a_codex_update_is_applied_through_its_app_server() {
+fn each_claude_update_uses_one_native_request_and_waits_for_its_completion_receipt() {
+    let sandbox = sandbox();
+    set_reply(&sandbox, "agent-store-show.json", BOUND);
+    let mode = if cfg!(windows) { "keys" } else { "signal" };
+    let child = spawn(&sandbox, &with_prompt(&sandbox, "plugins", "claude", mode), &sandbox.root);
+    wait_for_log(&sandbox, if cfg!(windows) { "raw" } else { "agent " });
+    let adapter = NativeAdapter::start(&sandbox);
+    set_status(&sandbox, "busy");
+    let commit = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    publish(&sandbox, "claude", commit);
+    let first_publication = log(&sandbox, "cache/published/claude");
+    adapter.assert_quiet();
+    assert!(
+        !native_records(&sandbox).iter().any(|record| record["kind"] == "request"),
+        "reload was queued during a busy turn"
+    );
+    assert_no_prompt_delivery(&sandbox);
+    set_status(&sandbox, "idle");
+    let first = adapter.request();
+    assert_eq!(first["operation"], "reload_plugins");
+    assert_eq!(first["session"], native_session(&sandbox));
+    assert_eq!(first["revision"], first_publication);
+    assert!(!first["lease"].as_str().unwrap().is_empty());
+    adapter.assert_quiet();
+    let pending = native_records(&sandbox);
+    assert_eq!(pending.iter().filter(|record| record["kind"] == "request").count(), 1);
+    assert!(!pending.iter().any(|record| record["kind"] == "receipt"), "completion was invented");
+    adapter.receipt(&sandbox, &first);
+    adapter.assert_quiet();
+    publish(&sandbox, "codex", "plugins c");
+    adapter.assert_quiet();
+    assert_eq!(native_records(&sandbox).iter().filter(|record| record["kind"] == "request").count(), 1);
+    assert_eq!(log(&sandbox, "cache/published/claude"), first_publication, "Codex changed Claude's publication");
+    publish(&sandbox, "claude", commit);
+    let second_publication = log(&sandbox, "cache/published/claude");
+    assert_eq!(first_publication.lines().next(), second_publication.lines().next());
+    assert_ne!(first_publication, second_publication, "a second publish reused its stamp");
+    let second = adapter.request();
+    assert_eq!(second["operation"], "reload_plugins");
+    assert_eq!(second["session"], first["session"]);
+    assert_eq!(second["revision"], second_publication);
+    assert_ne!(second["id"], first["id"], "a distinct publication reused the completed request");
+    adapter.assert_quiet();
+    assert_eq!(native_records(&sandbox).iter().filter(|record| record["kind"] == "receipt").count(), 1);
+    adapter.receipt(&sandbox, &second);
+    adapter.assert_quiet();
+    let records = native_records(&sandbox);
+    assert_eq!(records.iter().filter(|record| record["kind"] == "request").count(), 2);
+    assert_eq!(records.iter().filter(|record| record["kind"] == "receipt").count(), 2);
+    assert!(!sandbox.root.join("state/messages").exists(), "reload polluted the message binding journal");
+    assert_no_prompt_delivery(&sandbox);
+    let agent = log(&sandbox, "dummy.log");
+    assert_eq!(agent.matches("agent plugins Test tab").count(), 1, "the agent restarted: {agent}");
+    assert_eq!(in_agent(&sandbox, &["exit-native"]).0, 0);
+    let output = finish(child, Duration::from_secs(60));
+    assert!(output.status.success());
+    assert_unfinished(&sandbox, "plugins");
+}
+
+#[test]
+fn missing_claude_adapter_or_completion_receipt_never_applies_or_types_an_update() {
+    for claimed in [false, true] {
+        let sandbox = sandbox();
+        set_reply(&sandbox, "agent-store-show.json", BOUND);
+        let launch = if claimed { "reload-unverified" } else { "reload-unavailable" };
+        let mode = if cfg!(windows) { "keys" } else { "signal" };
+        let stderr_path = sandbox.root.join("wrapper-stderr.log");
+        let mut command = Command::new(env!("CARGO_BIN_EXE_tj"));
+        command
+            .args(with_prompt(&sandbox, launch, "claude", mode))
+            .envs(environment(&sandbox))
+            .current_dir(&sandbox.root)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(std::fs::File::create(&stderr_path).unwrap());
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            command.creation_flags(0x0800_0000);
+        }
+        let child = Child::new(command.spawn().unwrap(), &sandbox);
+        wait_for_log(&sandbox, if cfg!(windows) { "raw" } else { "agent " });
+        let adapter = claimed.then(|| NativeAdapter::start(&sandbox));
+        set_status(&sandbox, "idle");
+        publish(&sandbox, "claude", "plugins without a completion receipt");
+        if let Some(adapter) = adapter {
+            let request = adapter.request();
+            assert_eq!(request["operation"], "reload_plugins");
+            adapter.assert_quiet();
+            // A wrapper that marked the publication applied before completion will stop checking
+            // and fail to report the missing receipt after the adapter disappears.
+            drop(adapter);
+        }
+        let diagnostic = if claimed { "activation remains unverified" } else { "native adapter is unavailable" };
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let stderr = std::fs::read_to_string(&stderr_path).unwrap_or_default();
+            if stderr.contains(diagnostic) {
+                break;
+            }
+            assert!(Instant::now() < deadline, "missing {diagnostic:?}: {stderr}");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let records = native_records(&sandbox);
+        assert_eq!(records.iter().filter(|record| record["kind"] == "request").count(), usize::from(claimed));
+        assert!(!records.iter().any(|record| record["kind"] == "receipt"));
+        assert_no_prompt_delivery(&sandbox);
+        let agent = log(&sandbox, "dummy.log");
+        assert_eq!(agent.matches(&format!("agent {launch} Test tab")).count(), 1, "the agent restarted: {agent}");
+        assert_eq!(in_agent(&sandbox, &["exit-native"]).0, 0);
+        let output = finish(child, Duration::from_secs(60));
+        let stderr = std::fs::read_to_string(&stderr_path).unwrap();
+        assert!(stderr.contains(diagnostic), "missing {diagnostic:?}: {stderr}");
+        assert!(output.status.success());
+        assert_unfinished(&sandbox, launch);
+    }
+}
+
+#[test]
+fn a_managed_codex_update_stays_unverified_without_reloading_an_unrelated_daemon() {
     let sandbox = sandbox();
     let codex = fake_codex(&sandbox);
+    let diagnostic = "this command has no verified default-daemon attachment";
+    let stderr_path = sandbox.root.join("wrapper-stderr.log");
     set_reply(&sandbox, "agent-store-show.json", BOUND);
     let keys = cfg!(windows);
     let arguments = with_prompt(&sandbox, "codex-reload", "codex", if keys { "keys" } else { "signal" });
@@ -1805,95 +2210,96 @@ fn a_codex_update_is_applied_through_its_app_server() {
         .env("FAKE_CODEX_LOG", &codex)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        command.creation_flags(0x0800_0000);
-    }
-    let child = Child::new(command.spawn().unwrap(), &sandbox);
-    wait_for_log(&sandbox, if keys { "raw" } else { "agent " });
-    publish(&sandbox, "codex", "plugins b");
-    wait_until("the Codex app-server was never asked to take the update", || {
-        std::fs::read_to_string(&codex).unwrap_or_default().contains(r#""reloadUserConfig": true"#)
-    });
-    wait_until("the Codex WebSocket peer never completed both fragmented replies", || {
-        std::fs::read_to_string(&codex).unwrap_or_default().matches(r#""websocket": "masked-pong""#).count() == 2
-    });
-    let wire = std::fs::read_to_string(&codex).unwrap();
-    assert!(wire.contains(r#""websocket": "upgrade""#), "no HTTP upgrade: {wire}");
-    assert!(wire.contains(r#""proxy": "initialized""#), "initialization was not completed: {wire}");
-    assert_eq!(wire.matches(r#""websocket": "masked-text""#).count(), 3, "{wire}");
-    let agent = log(&sandbox, "dummy.log");
-    assert_eq!(agent.matches("agent codex-reload Test tab").count(), 1, "the agent restarted: {agent}");
-    done(&sandbox);
-    let output = finish(child, Duration::from_secs(60));
-    assert_closed_out(&sandbox, &output, "codex-reload");
-    assert!(!String::from_utf8_lossy(&output.stderr).contains("could not update codex"), "{output:?}");
-}
-
-#[test]
-fn a_new_tj_binary_resumes_the_same_conversation_in_the_same_tab() {
-    let sandbox = sandbox();
-    let bin = sandbox.root.join("bin");
-    std::fs::create_dir(&bin).unwrap();
-    let name = |stem: &str| format!("{stem}{}", std::env::consts::EXE_SUFFIX);
-    let install = |extra: &[u8]| {
-        let target = bin.join(name("tj"));
-        if target.exists() {
-            std::fs::rename(&target, bin.join(format!("{}.old", name("tj")))).unwrap();
-        }
-        let mut binary = std::fs::read(env!("CARGO_BIN_EXE_tj")).unwrap();
-        binary.extend_from_slice(extra);
-        std::fs::write(&target, binary).unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
-    };
-    install(b"");
-    #[cfg(windows)]
-    std::fs::copy(env!("CARGO_BIN_EXE_tj_hook"), bin.join(name("tj_hook"))).unwrap();
-    set_reply(&sandbox, "agent-store-show.json", BOUND);
-    let mut arguments = with_prompt(&sandbox, "upgrade", "claude", "signal");
-    let restart = arguments.iter().position(|argument| argument == "--restart-grace-seconds").unwrap();
-    arguments[restart + 1] = "0".to_owned();
-    let mut command = Command::new(bin.join(name("tj")));
-    command
-        .args(arguments)
-        .current_dir(&sandbox.root)
-        .envs(environment(&sandbox))
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .stderr(std::fs::File::create(&stderr_path).unwrap());
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
         command.creation_flags(0x0800_0000);
     }
     let mut child = Child::new(command.spawn().unwrap(), &sandbox);
-    wait_for_log(&sandbox, "pid ");
-    assert_eq!(in_agent(&sandbox, &["hold"]).0, 0);
-    set_status(&sandbox, "busy");
-    install(b"\0");
-    still_running(&mut child, Duration::from_secs(6));
-    assert!(!log(&sandbox, "dummy.log").contains("graceful"), "restarted mid-turn");
-    set_status(&sandbox, "idle");
-    wait_for_log(&sandbox, "args --model m --resume sess-1");
-    still_running(&mut child, Duration::from_secs(1));
+    wait_for_log(&sandbox, if keys { "raw" } else { "agent " });
+    publish(&sandbox, "codex", "plugins b");
+    wait_until("the wrapper never reported the unavailable native reload", || {
+        std::fs::read_to_string(&stderr_path).unwrap_or_default().contains(diagnostic)
+    });
+    still_running(&mut child, Duration::from_millis(500));
+    assert!(!codex.exists(), "the wrapper contacted a shared daemon that does not own its native engine");
     let agent = log(&sandbox, "dummy.log");
-    assert!(agent.contains("graceful"), "the agent was not stopped gracefully: {agent}");
-    assert_eq!(agent.matches("agent upgrade Test tab").count(), 2, "{agent}");
-    let store = log(&sandbox, "stubs/agent-store.log");
-    assert_eq!(store.matches("launch --launch-id upgrade ").count(), 1, "{store}");
-    assert!(!store.contains("end --launch-id upgrade"), "{store}");
-    done(&sandbox);
-    still_running(&mut child, Duration::from_secs(6));
-    assert!(sandbox.worktree.exists(), "the successor lost the keep-open hold");
-    assert_eq!(in_agent(&sandbox, &["hold", "--release"]).0, 0);
+    assert_eq!(agent.matches("agent codex-reload Test tab").count(), 1, "the agent restarted: {agent}");
+    assert_eq!(in_agent(&sandbox, &["exit-native"]).0, 0);
     let output = finish(child, Duration::from_secs(60));
-    assert_closed_out(&sandbox, &output, "upgrade");
+    assert!(output.status.success());
+    assert_unfinished(&sandbox, "codex-reload");
+    let stderr = std::fs::read_to_string(&stderr_path).unwrap();
+    assert_eq!(stderr.matches(diagnostic).count(), 1, "{stderr}");
+}
+
+#[test]
+fn a_binary_and_plugin_publication_keep_the_same_frontend_and_announce_the_next_launch_once() {
+    for host in ["claude", "codex"] {
+        let sandbox = sandbox();
+        let bin = sandbox.root.join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let name = |stem: &str| format!("{stem}{}", std::env::consts::EXE_SUFFIX);
+        let install = |extra: &[u8]| {
+            let target = bin.join(name("tj"));
+            if target.exists() {
+                std::fs::rename(&target, bin.join(format!("{}.old", name("tj")))).unwrap();
+            }
+            let mut binary = std::fs::read(env!("CARGO_BIN_EXE_tj")).unwrap();
+            binary.extend_from_slice(extra);
+            std::fs::write(&target, binary).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+        };
+        install(b"");
+        #[cfg(windows)]
+        std::fs::copy(env!("CARGO_BIN_EXE_tj_hook"), bin.join(name("tj_hook"))).unwrap();
+        set_reply(&sandbox, "agent-store-show.json", BOUND);
+        let arguments = with_prompt(&sandbox, "upgrade", host, "signal");
+        let stderr = sandbox.root.join("upgrade-stderr.log");
+        let mut command = Command::new(bin.join(name("tj")));
+        command
+            .args(arguments)
+            .current_dir(&sandbox.root)
+            .envs(environment(&sandbox))
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(std::fs::File::create(&stderr).unwrap());
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            command.creation_flags(0x0800_0000);
+        }
+        let mut child = Child::new(command.spawn().unwrap(), &sandbox);
+        wait_for_log(&sandbox, "pid ");
+        let adapter = (host == "claude").then(|| NativeAdapter::start(&sandbox));
+        set_status(&sandbox, "idle");
+        install(b"\0");
+        publish(&sandbox, host, "plugins with new binary");
+        if let Some(adapter) = adapter {
+            let request = adapter.request();
+            adapter.receipt(&sandbox, &request);
+        } else {
+            // The arbitrary dummy command lacks a daemon attachment; reload must still be attempted.
+            wait_until("missing plugin refresh diagnostic", || {
+                log(&sandbox, "upgrade-stderr.log").contains("no verified default-daemon attachment")
+            });
+        }
+        let notice = "A new tj binary is installed. Your next launch will use it.";
+        wait_until("missing pending binary notice", || log(&sandbox, "upgrade-stderr.log").contains(notice));
+        still_running(&mut child, Duration::from_secs(2));
+        let native = log(&sandbox, "dummy.log");
+        assert_eq!(native.lines().filter(|line| line.starts_with("pid ")).count(), 1, "{native}");
+        assert!(!native.contains("graceful"), "{native}");
+        assert_no_prompt_delivery(&sandbox);
+        assert_eq!(in_agent(&sandbox, &["exit-native"]).0, 0);
+        assert!(finish(child, Duration::from_secs(60)).status.success());
+        assert_eq!(log(&sandbox, "upgrade-stderr.log").matches(notice).count(), 1);
+    }
 }
 
 #[test]
@@ -2684,6 +3090,57 @@ fn a_running_tab_checks_again_and_starts_an_update() {
     assert!(child.try_wait().unwrap().is_none(), "the agent exited during the update check");
     child.kill().unwrap();
     let _ = child.wait();
+}
+
+#[test]
+fn pending_codex_activation_does_not_suppress_periodic_checks_or_repeat_the_warning() {
+    let sandbox = sandbox();
+    select_tj_agents_checked(&sandbox);
+    stub(&sandbox.stubs, "tj-plugins", "updated");
+    let upstream = Upstream::changed();
+    let mut arguments = run_arguments(&sandbox, "pending-activation", "codex", "signal", "10");
+    let separator = arguments.iter().position(|argument| argument == "--").unwrap();
+    arguments.splice(separator..separator, ["--update-url".to_owned(), upstream.url.clone()]);
+    let child = spawn(&sandbox, &arguments, &sandbox.root);
+    wait_for_log(&sandbox, "agent pending-activation");
+    publish(&sandbox, "codex", "pending revision");
+    std::fs::remove_file(update_state(&sandbox, "codex.checked")).unwrap();
+    wait_until("pending activation suppressed the updater", || {
+        log(&sandbox, "stubs/tj-plugins.log").contains("update --host codex")
+    });
+    std::fs::remove_file(update_state(&sandbox, "codex.checked")).unwrap();
+    wait_until("pending activation suppressed a later marketplace check", || upstream.requests().len() == 2);
+    assert_eq!(log(&sandbox, "stubs/tj-plugins.log").lines().count(), 1, "duplicate updater");
+    assert_no_prompt_delivery(&sandbox);
+    assert_eq!(in_agent(&sandbox, &["exit-native"]).0, 0);
+    let output = finish(child, Duration::from_secs(30));
+    assert!(output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(stderr.matches("this command has no verified default-daemon attachment").count(), 1, "{stderr}");
+}
+
+#[test]
+fn a_failed_updater_reports_failure_and_retries_without_publishing_success() {
+    let sandbox = sandbox();
+    select_tj_agents(&sandbox);
+    stub(&sandbox.stubs, "tj-plugins", "updated");
+    std::fs::write(sandbox.stubs.join("tj-plugins-update.failed"), "installation failed").unwrap();
+    let upstream = Upstream::changed();
+    launch_checking(&sandbox, &upstream, "failed-update");
+    wait_until("updater failure was not reported", || {
+        log(&sandbox, "cache/update/claude.log").contains("native updater failed")
+    });
+    assert!(!sandbox.root.join("cache/published/claude").exists());
+    std::fs::remove_file(update_state(&sandbox, "claude.checked")).unwrap();
+    launch_checking(&sandbox, &upstream, "debounced-failure");
+    assert_eq!(log(&sandbox, "stubs/tj-plugins.log").lines().count(), 1);
+    // Forget the attempt to exercise retry without waiting ten minutes. Unit tests cover the boundary.
+    std::fs::remove_file(update_state(&sandbox, "claude.checked")).unwrap();
+    std::fs::remove_file(update_state(&sandbox, "claude.started")).unwrap();
+    std::fs::remove_file(sandbox.stubs.join("tj-plugins-update.failed")).unwrap();
+    launch_checking(&sandbox, &upstream, "retry-update");
+    wait_until("failed update never retried", || log(&sandbox, "stubs/tj-plugins.log").lines().count() == 2);
+    assert!(!sandbox.root.join("cache/published/claude").exists(), "only the native updater may publish convergence");
 }
 
 #[test]

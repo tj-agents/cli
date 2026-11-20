@@ -215,8 +215,11 @@ A public launch is independent: it does not inherit a calling agent's parent or 
 optional. To delegate into a named Windows Terminal or tmux tab, use
 [Agent's handoff](https://github.com/tj-agents/agent/blob/main/.agents/agent/utility/handoff/SKILL.md), which
 requires exactly one of `--parent <host:id>` and `--independent`. `tj start` supplies the work-item launch
-workflow. A plain `claude` or `codex` command starts the provider directly and does not add TJ supervision
-or closeout receipts.
+workflow. After Agent installation, plain `claude` and `codex` commands also forward through `tj` via
+the installed PowerShell, POSIX shell and PATH bindings. See
+[Agent's installation guidance](https://github.com/tj-agents/agent#install) for binding setup.
+Calling the provider's native executable by its absolute path bypasses those bindings
+and does not add TJ supervision or closeout receipts.
 
 The managed wrapper owns the native child process: a Job Object on Windows or a foreground process group
 on Linux. It records a launch and binds the native session through Agent's SessionStart hook. The title
@@ -224,10 +227,15 @@ defaults to the repository or worktree folder name, with a numeric suffix while 
 it. Only the managed session's own agent can change its completion state; inherited environment variables
 alone do not establish ownership.
 
+Initial registration is pending while the native host starts. If TJ reports that it is still awaiting
+native session registration, check that Agent is enabled and its SessionStart hook succeeded. Invalid
+bindings and Store errors are reported immediately. Exiting without a verified binding leaves managed
+completion unverified and preserves the provider's exit code.
+
 In a repository selecting TJ plugins, startup invokes `tj prepare` to check selected plugins and the
 standards index before the host reads instructions. Startup and refresh leave authored instructions and
 repository settings untouched. Drift reports an explicit `tj prepare --host <host> --cwd <path> --write`
-command. Preparation failures warn and allow the provider to start, but missing lifecycle evidence leaves
+command. Preparation failures end the managed launch before the provider starts. Missing lifecycle evidence leaves
 completion unverified. Install and enable Agent in that repository for managed completion.
 
 Work-item launches accept a full tracker reference or URL. A bare id such as `461` or `#461` is resolved
@@ -327,15 +335,8 @@ merged PR set gets a new event.
 ### Runtime updates
 
 The [plugin update flow](docs/plugin-updates.md) owns marketplace checks, installation and reloads in
-running sessions. Separately, the wrapper detects a replacement `tj` executable. Once the new file has
-settled and runs, Claude and input have been idle for 30 seconds, and no background shell remains, it
-hands over to the new binary and resumes the same conversation. The original options remain; the prompt
-and earlier session choice are removed. Completion already awaiting closeout prevents that restart.
-
-Linux replaces the wrapper in place. Windows keeps the old wrapper as the tab's root while its successor
-runs. Launch identity and the conversation remain. Without a bound native session, the current agent
-continues and the wrapper reports the missing binding. A failed resume leaves the reason visible. Codex
-currently takes a replacement binary on its next start.
+running sessions. When a replacement `tj` executable is installed, each open wrapper reports once that
+its next launch will use the new binary. Both hosts keep the same native frontend during plugin refresh.
 
 ## `tj message` and `tj feed`: messaging between sessions
 

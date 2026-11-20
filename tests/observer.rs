@@ -25,7 +25,9 @@ fn call(root: &Path, socket: &Path, mode: &str, path: &std::ffi::OsStr) -> Outpu
         Command::new(env!("CARGO_BIN_EXE_tj"))
     };
     command
-        .args(["observe-codex-updates", "--socket"])
+        .args(["observe-codex-updates", "--codex"])
+        .arg(root.join(if cfg!(windows) { "codex.cmd" } else { "codex" }))
+        .arg("--socket")
         .arg(socket)
         .arg("--cwd")
         .arg(root)

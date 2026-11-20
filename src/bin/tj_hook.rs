@@ -9,6 +9,16 @@ const BATCH_DISPATCH: &str = "--tj-hook-batch-dispatch";
 
 fn main() {
     let arguments: Vec<_> = env::args_os().skip(1).collect();
+    if arguments.first().is_some_and(|argument| argument == "--bounded") {
+        let result = bounded(&arguments[1..]);
+        match result {
+            Ok(code) => std::process::exit(code as i32),
+            Err(error) => {
+                let _ = writeln!(io::stderr(), "tj_hook: bounded command has no cleanup receipt: {error}");
+                std::process::exit(127);
+            }
+        }
+    }
     #[cfg(windows)]
     if arguments.first().is_some_and(|argument| argument == OsStr::new(BATCH_DISPATCH)) {
         let result = if arguments.get(1).is_some_and(|argument| argument == OsStr::new("--")) {
@@ -50,4 +60,31 @@ fn main() {
             std::process::exit(127);
         }
     }
+}
+
+fn bounded(arguments: &[std::ffi::OsString]) -> io::Result<u32> {
+    let invalid = || {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "expected --bounded <milliseconds> <receipt> <attempt> -- <command>",
+        )
+    };
+    let [milliseconds, receipt, attempt, separator, command @ ..] = arguments else { return Err(invalid()) };
+    let milliseconds: u64 = milliseconds.to_str().ok_or_else(invalid)?.parse().map_err(|_| invalid())?;
+    let attempt = attempt
+        .to_str()
+        .filter(|value| {
+            !value.is_empty()
+                && value.len() <= 64
+                && value.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        })
+        .ok_or_else(invalid)?;
+    if milliseconds == 0 || separator != "--" || command.is_empty() {
+        return Err(invalid());
+    }
+    let receipt = std::path::Path::new(receipt);
+    let outcome =
+        tj_cli::process::bounded::run(command, std::time::Duration::from_millis(milliseconds), receipt, attempt);
+    outcome.record(receipt, attempt)?;
+    Ok(outcome.code())
 }

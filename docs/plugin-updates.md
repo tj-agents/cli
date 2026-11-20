@@ -12,11 +12,23 @@ checks are spaced by two minutes, limiting the two hosts' normal combined rate t
 hour. A one-second network timeout keeps the check off the session's supervision loop. A changed
 commit starts `tj plugins update --host <host>` in the background; output goes to
 `<cache>/update/<host>.log`. The same commit is retried after ten minutes if convergence did not
-publish it.
+publish it. A recorded updater PID and start time prevent overlapping updater processes for the same
+host, including across wrapper exits. A failed updater is reported in that log with its retry policy.
+
+Each updater runs inside the existing `tj_hook` helper with a five-minute lifetime and a ten-second
+cleanup allowance. Timeout, observer shutdown and normal updater exit all terminate and reap remaining
+owned descendants before publishing a matching cleanup receipt. Windows uses the helper's Job Object;
+Linux uses the existing process-group and subreaper cleanup inside that dedicated helper. A timed-out
+update remains a failure and can retry after the same ten-minute window. Missing, mismatched or unsettled
+cleanup receipts persist `<cache>/update/<host>.unsettled`, report the reason in the update log and block
+further updater launches across wrapper restarts. A dead updater PID alone does not prove cleanup.
+Retries resume only when the matching receipt confirms that the owned process tree has settled; an
+unverified tree requires explicit inspection and cleanup before its failure state can be cleared.
 
 If the lightweight GitHub probe cannot connect, it hands verification to the existing native plugin
 updater in the background. The host still starts. These unverified attempts share the ten-minute retry
-window across tabs and wrapper restarts; a newly verified changed commit can still start immediately.
+window across tabs and wrapper restarts; a newly verified changed commit can start once the previous
+updater exits.
 Only a successful native convergence publishes an installed revision. The update log records a safe
 transport category and the native updater's result, rather than a repeated terminal warning.
 
@@ -42,24 +54,32 @@ failed native installation. Explicit repository adoption and install reconciliat
 changes. See [Agent's installation and scope rules](https://github.com/tj-agents/agent#install).
 
 Each running wrapper watches its host's publication file. Claude waits until its turn and input are
-idle, then types `/reload-plugins` and Enter into the shared console. Unsubmitted text in the console
-is not visible to the wrapper and the command can be appended to it. Codex requests
-`config/batchWrite` with `reloadUserConfig: true` over WebSocket through the shared app-server proxy. This reaches
-sessions using that daemon; an embedded Codex session, such as one started with `--no-daemon`, is not
-addressed by this request. The server
-refreshes loaded threads' runtime configuration; it retains some session settings and does not rewrite
-instructions already delivered in previous turns. A successful request alone does not prove that each
-thread refreshed successfully. Codex's completion lists may require a restart to reflect changes.
+idle, then sends a durable `reload_plugins` request through Agent's native adapter. It marks the
+publication applied only after a matching completion receipt. The adapter invokes the native command
+without editing or submitting the user's composer. Missing adapters, failed reloads and missing
+receipts leave activation unverified. Adapter replacement can reconcile a reload once; message
+requests are never replayed.
 
-The wrapper separately detects a replacement `tj` binary. It can resume an idle Claude session under
-the new binary with the same conversation; Codex currently takes the new binary on its next start.
+Managed Codex attaches its native TUI to the default local daemon with `--remote unix://`.
+The wrapper runs the selected absolute executable to start or verify the service before supervising
+the TUI. A startup or version mismatch is a launch error. Codex reports incompatible native arguments.
+The wrapper and daemon observer coordinate each published revision at the socket. They request
+`config/batchWrite` with `reloadUserConfig: true`, then read `hooks/list` for each loaded thread.
+The adjacent `.tj-reload.json` receipt records the observed hook keys, source paths, hashes and trust
+states by thread. Agent checks expected plugin content against the project selection. The native TUI
+keeps its composer throughout refresh, and prior conversation history retains its original instructions.
+
+A replacement `tj` binary takes effect on the next launch. The running wrapper reports the pending
+change once and continues to process plugin publications through the current frontend.
 
 ## Acceptance checks
 
 - Merge a marketplace pin change with `tj claude` and `tj codex` sessions already open. Without a manual
-  update, observe the installation, each host's publication and the changed plugin behavior in each
-  same conversation. For Claude, observe the reload command when idle; for Codex, exercise changed
-  behavior in a later turn instead of relying on an RPC acknowledgement or completion list.
+  update, observe the installation and each host's publication. For Claude, keep an unsent draft,
+  observe the native completion receipt when idle, and exercise changed behavior in the same
+  conversation with the draft intact. For Codex, check the loaded thread's hooks and the skill
+  content in its next request. Publish a binary replacement with the plugins and verify the same
+  frontend PID, one pending notice and the original draft on submission.
 - Start and resume a Codex session in a selecting repository. Confirm its SessionStart hooks finish
   within their timeouts and its repository standards are available.
 - Exercise `tj claude`, `tj codex`, `tj plugins update`, `tj install`, `tj start`, `tj status`, `tj recover`,
