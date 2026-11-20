@@ -145,10 +145,20 @@ pub fn check(args: Args) -> Result<ExitCode> {
 
 pub fn admit(prior: &Predecessor, launch: &Launch, pid: u32, started_at: &str) -> Result<Value> {
     require_stopped(prior, agent::started_at)?;
-    if (prior.item.is_none() || prior.item != launch.item)
-        && super::closeout::journal::path(&prior.launch_id)?.try_exists()?
-    {
-        bail!("the predecessor has a pending cleanup journal; reconcile its cleanup before resuming");
+    if prior.item.is_none() || prior.item != launch.item {
+        let mut sources = vec![prior.launch_id.clone()];
+        if let Some(item) = prior.item.as_ref() {
+            sources.extend(
+                store::previous_launches(&prior.launch_id, launch.host, &prior.session, item)?
+                    .into_iter()
+                    .map(|row| row.launch.id),
+            );
+        }
+        for id in sources {
+            if super::closeout::journal::path(&id)?.try_exists()? {
+                bail!("launch {id} has a pending cleanup journal; reconcile its cleanup before resuming");
+            }
+        }
     }
     let response = store::call(&[
         "resume",
@@ -216,7 +226,6 @@ pub fn bind(args: BindArgs) -> Result<ExitCode> {
         item: store::item(row)?,
     };
     let session = admit(&prior, &launch, pid, started)?;
-    super::mark_open(&prior.launch_id, false);
     println!("{}", json!({"session":session}));
     Ok(ExitCode::SUCCESS)
 }

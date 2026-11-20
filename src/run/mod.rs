@@ -478,10 +478,9 @@ fn mark_closed(launch_id: &str) {
     let _ = store::set_open(launch_id, false);
 }
 
-fn track_tab_closure(launch_id: &str, admitted: &mut bool) {
+fn track_tab_closure(launch_id: &str) {
     let closed = launch_id.to_owned();
     agent::on_tab_closed(Box::new(move || mark_closed(&closed)));
-    *admitted = true;
 }
 
 pub fn run(args: Args) -> Result<ExitCode> {
@@ -557,7 +556,8 @@ fn supervise(args: &Args, launch: Launch, prebound: Option<&PreboundSession>, ad
     let upstream =
         if selected { update::upstream::start(launch.host, &launch.cwd, args.update_url.clone()) } else { None };
     if predecessor.is_none() {
-        track_tab_closure(&launch.id, admitted);
+        *admitted = true;
+        track_tab_closure(&launch.id);
         mark_open(&launch.id, true);
     }
     match upstream.map(std::thread::JoinHandle::join) {
@@ -568,14 +568,15 @@ fn supervise(args: &Args, launch: Launch, prebound: Option<&PreboundSession>, ad
         _ => {}
     }
     if let Some(predecessor) = predecessor.as_ref() {
-        let bound = recovery::inspect(&predecessor.session, &predecessor.launch_id)
-            .and_then(|prior| recovery::admit(&prior, &launch, pid, &started_at));
+        let bound = recovery::inspect(&predecessor.session, &predecessor.launch_id).and_then(|prior| {
+            let _record = OPEN_RECORD.lock().unwrap_or_else(PoisonError::into_inner);
+            track_tab_closure(&launch.id);
+            recovery::admit(&prior, &launch, pid, &started_at)
+        });
         if let Err(error) = bound {
             end_not_started(&launch, prebound, pid, &started_at);
             return Err(error);
         }
-        mark_open(&launch.id, true);
-        mark_open(&predecessor.launch_id, false);
     }
     let mut agent = match Agent::start(&args.agent, command_cwd, &environment)
         .with_context(|| format!("could not start {}", args.agent[0].to_string_lossy()))
@@ -589,9 +590,7 @@ fn supervise(args: &Args, launch: Launch, prebound: Option<&PreboundSession>, ad
             return Err(error);
         }
     };
-    if predecessor.is_some() {
-        track_tab_closure(&launch.id, admitted);
-    }
+    *admitted = true;
     if let Some(endpoint) = host.endpoint() {
         let record = agent::started_at(agent.pid()).map_err(anyhow::Error::from).and_then(|born| {
             if let Some(born) = born {

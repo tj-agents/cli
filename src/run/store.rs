@@ -270,16 +270,23 @@ pub fn predecessors(launch: &Launch, owner: &Ownership) -> Result<Vec<Row>> {
     let Some(current_item) = owner.item.as_ref() else {
         return Ok(Vec::new());
     };
+    previous_launches(&launch.id, launch.host, &owner.session, current_item)
+}
+
+pub(super) fn previous_launches(
+    launch_id: &str,
+    host: Host,
+    session: &str,
+    current_item: &item::Reference,
+) -> Result<Vec<Row>> {
     let data = call(&["launches"])?;
     let rows = data["launches"].as_array().context("agent-store launches returned no list")?;
     let mut predecessors: Vec<Row> = Vec::new();
     for value in rows {
-        if value["launch_id"].as_str() == Some(launch.id.as_str())
-            || value["session"].as_str() != Some(owner.session.as_str())
-        {
+        if value["launch_id"].as_str() == Some(launch_id) || value["session"].as_str() != Some(session) {
             continue;
         }
-        if value["host"].as_str() != Some(launch.host.name()) {
+        if value["host"].as_str() != Some(host.name()) {
             bail!("historical launch host does not match its session");
         }
         if item(value)?.as_ref() != Some(current_item) {

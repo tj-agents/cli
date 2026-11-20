@@ -1767,8 +1767,7 @@ fn recovery_keeps_the_new_owner_open_if_its_native_executable_cannot_spawn() {
     assert!(String::from_utf8_lossy(&output.stderr).contains("tj recover --open"));
     let log = log(&sandbox, "stubs/agent-store.log");
     assert!(log.contains("end --launch-id resumed --reason not_started"), "{log}");
-    assert!(log.contains("set-open --launch-id resumed --open true"), "{log}");
-    assert!(!log.contains("set-open --launch-id resumed --open false"), "{log}");
+    assert!(!log.contains("set-open"), "{log}");
 }
 
 #[test]
