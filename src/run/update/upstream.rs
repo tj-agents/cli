@@ -96,6 +96,16 @@ fn modified(path: &Path) -> Option<SystemTime> {
     path.metadata().and_then(|meta| meta.modified()).ok()
 }
 
+/// Marks now in the file's modified time. Windows leaves it unchanged when empty content replaces empty content.
+fn stamp(path: &Path) {
+    let _ = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(path)
+        .and_then(|file| file.set_modified(SystemTime::now()));
+}
+
 fn recent(at: SystemTime, now: SystemTime, window: Duration) -> bool {
     now.duration_since(at).is_ok_and(|age| age < window) || at > now
 }
@@ -308,7 +318,7 @@ fn check(
     if !available(state)? {
         return Ok(None);
     }
-    let _ = fs::write(&state.checked, "");
+    stamp(&state.checked);
     let published = fs::read_to_string(&state.published).unwrap_or_default();
     let answer = match request(url, converged(&published)) {
         Ok(answer) => answer,
@@ -351,6 +361,28 @@ pub(crate) fn start(host: Host, cwd: &Path, url: String) -> Option<JoinHandle<Re
             })
         })
     }))
+}
+
+/// Records a failed mid-session check in the updater log. The agent owns the console then, so nothing is printed.
+/// An unsettled updater is already logged once, when it is first found.
+pub(crate) fn record_failure(host: Host, error: CheckError) {
+    if let Ok(cache) = paths::cache_dir() {
+        append_failure(&State::new(&cache, host).log, error);
+    }
+}
+
+fn append_failure(log: &Path, error: CheckError) {
+    if matches!(error, CheckError::Unsettled(_)) {
+        return;
+    }
+    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(log) {
+        let _ = writeln!(
+            file,
+            "{} could not check for tj-agents updates: {:#}",
+            chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
+            anyhow::Error::from(error)
+        );
+    }
 }
 
 /// An updater supervised by the bounded helper; dropping it requests cleanup of its whole process tree.
@@ -412,10 +444,10 @@ pub(crate) fn start_owned(
 
 #[cfg(test)]
 mod tests {
-    use std::time::{Duration, UNIX_EPOCH};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use super::{
-        Answer, CheckError, OwnedUpdate, Running, State, TIMEOUT, check, converged, install, recent,
+        Answer, CheckError, OwnedUpdate, Running, State, TIMEOUT, append_failure, check, converged, install, recent,
         record_probe_failure, request,
     };
 
@@ -504,6 +536,31 @@ mod tests {
             assert!(super::available(&restarted).is_err());
             assert_eq!(std::fs::read(&restarted.log).unwrap(), diagnostic, "unchanged failures must not spam the log");
         }
+    }
+
+    #[test]
+    fn a_check_advances_the_throttle_stamp_even_when_the_file_is_empty() {
+        let root = tempfile::tempdir().unwrap();
+        let state = State::new(root.path(), crate::host::Host::Claude);
+        std::fs::create_dir_all(&state.folder).unwrap();
+        // A recent attempt makes the unreachable probe return before any real native updater can start.
+        std::fs::write(&state.started, "").unwrap();
+        std::fs::write(&state.checked, "").unwrap();
+        let old = SystemTime::now() - Duration::from_secs(3600);
+        std::fs::OpenOptions::new().write(true).open(&state.checked).unwrap().set_modified(old).unwrap();
+        assert!(check(&state, crate::host::Host::Claude, root.path(), "invalid://no-request").unwrap().is_none());
+        assert!(recent(super::modified(&state.checked).unwrap(), SystemTime::now(), super::CHECKED_FOR));
+    }
+
+    #[test]
+    fn a_failed_mid_session_check_is_logged_but_a_repeated_unsettled_state_is_not() {
+        let directory = tempfile::tempdir().unwrap();
+        let log = directory.path().join("claude.log");
+        append_failure(&log, CheckError::Status(403));
+        append_failure(&log, CheckError::Unsettled("reason".to_owned()));
+        let logged = std::fs::read_to_string(&log).unwrap();
+        assert_eq!(logged.lines().count(), 1, "{logged}");
+        assert!(logged.contains("could not check for tj-agents updates: GitHub answered 403"), "{logged}");
     }
 
     #[test]

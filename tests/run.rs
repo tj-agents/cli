@@ -3145,9 +3145,11 @@ fn a_running_tab_checks_again_and_starts_an_update() {
         log(&sandbox, "stubs/tj-plugins.log").contains("update --host claude")
     });
     assert_eq!(upstream.requests().len(), 1);
-    assert!(child.try_wait().unwrap().is_none(), "the agent exited during the update check");
+    // The supervisor collects the check on its next polls. Its result must not reach the agent's console.
+    still_running(&mut child, Duration::from_secs(3));
     child.kill().unwrap();
-    let _ = child.wait();
+    let stderr = String::from_utf8_lossy(&child.wait_with_output().unwrap().stderr).into_owned();
+    assert!(!stderr.contains("tj-agents"), "update text written over the running agent: {stderr}");
 }
 
 #[test]
