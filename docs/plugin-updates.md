@@ -15,6 +15,16 @@ commit starts `tj plugins update --host <host>` in the background; output goes t
 publish it. A recorded updater PID and start time prevent overlapping updater processes for the same
 host, including across wrapper exits. A failed updater is reported in that log with its retry policy.
 
+Each updater runs inside the existing `tj_hook` helper with a five-minute lifetime and a ten-second
+cleanup allowance. Timeout, observer shutdown and normal updater exit all terminate and reap remaining
+owned descendants before publishing a matching cleanup receipt. Windows uses the helper's Job Object;
+Linux uses the existing process-group and subreaper cleanup inside that dedicated helper. A timed-out
+update remains a failure and can retry after the same ten-minute window. Missing, mismatched or unsettled
+cleanup receipts persist `<cache>/update/<host>.unsettled`, report the reason in the update log and block
+further updater launches across wrapper restarts. A dead updater PID alone does not prove cleanup.
+Retries resume only when the matching receipt confirms that the owned process tree has settled; an
+unverified tree requires explicit inspection and cleanup before its failure state can be cleared.
+
 If the lightweight GitHub probe cannot connect, it hands verification to the existing native plugin
 updater in the background. The host still starts. These unverified attempts share the ten-minute retry
 window across tabs and wrapper restarts; a newly verified changed commit can start once the previous

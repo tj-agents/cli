@@ -2,6 +2,8 @@ use std::ffi::OsString;
 use std::io;
 use std::path::Path;
 
+pub mod bounded;
+
 #[allow(unsafe_code)]
 pub mod agent;
 #[cfg(windows)]

@@ -5,6 +5,9 @@ use std::os::windows::ffi::OsStrExt;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::process::Command;
 use std::ptr::{null, null_mut};
+use std::time::{Duration, Instant};
+
+use super::bounded::{CLEANUP_LIMIT, Outcome};
 
 use windows_sys::Win32::Foundation::{
     DUPLICATE_SAME_ACCESS, DuplicateHandle, ERROR_CANT_ACCESS_FILE, HANDLE, INVALID_HANDLE_VALUE, WAIT_FAILED,
@@ -14,8 +17,9 @@ use windows_sys::Win32::System::Console::{
     AllocConsole, GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
 };
 use windows_sys::Win32::System::JobObjects::{
-    CreateJobObjectW, IsProcessInJob, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-    JobObjectExtendedLimitInformation, SetInformationJobObject,
+    CreateJobObjectW, IsProcessInJob, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOBOBJECT_BASIC_ACCOUNTING_INFORMATION,
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectBasicAccountingInformation, JobObjectExtendedLimitInformation,
+    QueryInformationJobObject, SetInformationJobObject, TerminateJobObject,
 };
 use windows_sys::Win32::System::Threading::{
     CREATE_NEW_CONSOLE, CREATE_NO_WINDOW, CreateProcessW, DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT,
@@ -274,6 +278,81 @@ pub(super) fn batch_dispatch(arguments: &[OsString]) -> io::Result<u32> {
 }
 
 pub(super) fn run(arguments: &[OsString], preserve_descendants: bool) -> io::Result<u32> {
+    run_owned(arguments, preserve_descendants, None, || false).map(|outcome| outcome.code())
+}
+
+pub(super) fn run_bounded(arguments: &[OsString], lifetime: Duration, cancelled: impl Fn() -> bool) -> Outcome {
+    // Errors before the bounded wait are creation failures: no command was started.
+    run_owned(arguments, false, Some(lifetime), cancelled).unwrap_or_else(Outcome::Failed)
+}
+
+fn settle_job(process: &OwnedHandle, job: &OwnedHandle) -> io::Result<()> {
+    let deadline = Instant::now() + CLEANUP_LIMIT;
+    unsafe {
+        if TerminateJobObject(job.as_raw_handle(), 1) == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        loop {
+            let mut accounting: JOBOBJECT_BASIC_ACCOUNTING_INFORMATION = zeroed();
+            if QueryInformationJobObject(
+                job.as_raw_handle(),
+                JobObjectBasicAccountingInformation,
+                (&mut accounting as *mut JOBOBJECT_BASIC_ACCOUNTING_INFORMATION).cast(),
+                size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>() as u32,
+                null_mut(),
+            ) == 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            if accounting.ActiveProcesses == 0 && WaitForSingleObject(process.as_raw_handle(), 0) == WAIT_OBJECT_0 {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "owned job still contains processes after termination",
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+}
+
+fn bounded_wait(process: &OwnedHandle, job: &OwnedHandle, lifetime: Duration, cancelled: impl Fn() -> bool) -> Outcome {
+    let deadline = Instant::now() + lifetime;
+    let outcome = loop {
+        match unsafe { WaitForSingleObject(process.as_raw_handle(), 0) } {
+            WAIT_OBJECT_0 => {
+                let mut code = 127;
+                break if unsafe { GetExitCodeProcess(process.as_raw_handle(), &mut code) } == 0 {
+                    Outcome::Failed(io::Error::last_os_error())
+                } else {
+                    Outcome::Exited(code)
+                };
+            }
+            WAIT_TIMEOUT => {}
+            _ => break Outcome::Failed(io::Error::last_os_error()),
+        }
+        if cancelled() {
+            break Outcome::Cancelled;
+        }
+        if Instant::now() >= deadline {
+            break Outcome::TimedOut;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    match settle_job(process, job) {
+        Ok(()) => outcome,
+        Err(error) => Outcome::Unsettled(error),
+    }
+}
+
+fn run_owned(
+    arguments: &[OsString],
+    preserve_descendants: bool,
+    lifetime: Option<Duration>,
+    cancelled: impl Fn() -> bool,
+) -> io::Result<Outcome> {
     let executable = std::path::absolute(
         which::which(&arguments[0]).map_err(|error| io::Error::new(io::ErrorKind::NotFound, error))?,
     )?;
@@ -370,6 +449,9 @@ pub(super) fn run(arguments: &[OsString], preserve_descendants: bool) -> io::Res
         let child = OwnedHandle::from_raw_handle(process.hProcess);
         let thread = OwnedHandle::from_raw_handle(process.hThread);
         drop(thread);
+        if let Some(lifetime) = lifetime {
+            return Ok(bounded_wait(&child, &job, lifetime, cancelled));
+        }
         if WaitForSingleObject(child.as_raw_handle(), INFINITE) == WAIT_FAILED {
             return Err(io::Error::last_os_error());
         }
@@ -389,6 +471,6 @@ pub(super) fn run(arguments: &[OsString], preserve_descendants: bool) -> io::Res
                 return Err(io::Error::last_os_error());
             }
         }
-        Ok(code)
+        Ok(Outcome::Exited(code))
     }
 }

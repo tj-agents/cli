@@ -1,9 +1,11 @@
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::thread::JoinHandle;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
+
+use tj_cli::process::bounded;
 
 use crate::host::Host;
 use crate::paths;
@@ -13,6 +15,7 @@ const CHECKED_FOR: Duration = Duration::from_secs(120);
 const LOCK_STALE: Duration = Duration::from_secs(30);
 const RETRY_AFTER: Duration = Duration::from_secs(600);
 const TIMEOUT: Duration = Duration::from_secs(1);
+const UPDATE_LIFETIME: Duration = Duration::from_secs(300);
 
 #[derive(Debug, PartialEq, Eq)]
 enum Answer {
@@ -32,13 +35,18 @@ pub(crate) enum CheckError {
     Spawn(#[source] std::io::Error),
     #[error("could not record the background update check")]
     Record(#[source] std::io::Error),
+    #[error("updater cleanup is unverified; retries blocked: {0}")]
+    Unsettled(String),
 }
 
+#[derive(Clone)]
 struct State {
     folder: PathBuf,
     checked: PathBuf,
     started: PathBuf,
     running: PathBuf,
+    receipt: PathBuf,
+    unsettled: PathBuf,
     lock: PathBuf,
     log: PathBuf,
     published: PathBuf,
@@ -52,6 +60,8 @@ impl State {
             checked: file("checked"),
             started: file("started"),
             running: file("running"),
+            receipt: file("receipt"),
+            unsettled: file("unsettled"),
             lock: file("lock"),
             log: file("log"),
             published: cache.join("published").join(host.name()),
@@ -116,8 +126,8 @@ fn request(url: &str, etag: Option<&str>) -> Result<Answer, CheckError> {
 }
 
 struct Running {
-    pid: u32,
-    started_at: SystemTime,
+    attempt: String,
+    process: Option<(u32, SystemTime)>,
 }
 
 impl Running {
@@ -127,14 +137,21 @@ impl Running {
                 let value: serde_json::Value =
                     serde_json::from_slice(&bytes).map_err(|error| CheckError::Record(std::io::Error::other(error)))?;
                 let invalid = || CheckError::Record(std::io::Error::other("invalid updater process identity"));
-                let pid = value["pid"].as_u64().and_then(|pid| u32::try_from(pid).ok()).ok_or_else(invalid)?;
-                let started_at = value["started_at"]
-                    .as_str()
-                    .ok_or_else(invalid)?
-                    .parse::<chrono::DateTime<chrono::Utc>>()
-                    .map_err(|_| invalid())?
-                    .into();
-                Ok(Some(Self { pid, started_at }))
+                let attempt =
+                    value["attempt"].as_str().filter(|value| !value.is_empty()).ok_or_else(invalid)?.to_owned();
+                let process = if value["pid"].is_null() && value["started_at"].is_null() {
+                    None
+                } else {
+                    let pid = value["pid"].as_u64().and_then(|pid| u32::try_from(pid).ok()).ok_or_else(invalid)?;
+                    let started_at = value["started_at"]
+                        .as_str()
+                        .ok_or_else(invalid)?
+                        .parse::<chrono::DateTime<chrono::Utc>>()
+                        .map_err(|_| invalid())?
+                        .into();
+                    Some((pid, started_at))
+                };
+                Ok(Some(Self { attempt, process }))
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(error) => Err(CheckError::Record(error)),
@@ -142,50 +159,115 @@ impl Running {
     }
 
     fn live(&self) -> Result<bool, CheckError> {
-        tj_cli::process::agent::started_at(self.pid)
-            .map(|started| started == Some(self.started_at))
-            .map_err(CheckError::Record)
+        let Some((pid, started_at)) = self.process else { return Ok(false) };
+        tj_cli::process::agent::started_at(pid).map(|started| started == Some(started_at)).map_err(CheckError::Record)
     }
 
-    fn record(child: &Child, path: &Path) -> Result<(), CheckError> {
-        if let Some(started_at) = tj_cli::process::agent::started_at(child.id()).map_err(CheckError::Record)? {
-            let value = serde_json::json!({
-                "pid": child.id(),
-                "started_at": chrono::DateTime::<chrono::Utc>::from(started_at).to_rfc3339(),
-            });
-            fs::write(path, value.to_string()).map_err(CheckError::Record)?;
-        }
-        Ok(())
+    fn record(&self, path: &Path) -> Result<(), CheckError> {
+        let value = serde_json::json!({
+            "attempt": self.attempt,
+            "pid": self.process.map(|(pid, _)| pid),
+            "started_at": self.process.map(|(_, time)| chrono::DateTime::<chrono::Utc>::from(time).to_rfc3339()),
+        });
+        let staged = path.with_extension("running.tmp");
+        fs::write(&staged, value.to_string()).map_err(CheckError::Record)?;
+        fs::rename(staged, path).map_err(CheckError::Record)
     }
 }
 
-fn spawn(host: Host, cwd: &Path, state: &State) -> Result<Child, CheckError> {
+fn unsettled(state: &State, reason: impl Into<String>) -> CheckError {
+    let reason = reason.into();
+    if fs::read_to_string(&state.unsettled).ok().as_deref() != Some(&reason) {
+        let _ = fs::write(&state.unsettled, &reason);
+        if let Ok(mut log) = OpenOptions::new().create(true).append(true).open(&state.log) {
+            let _ = writeln!(log, "updater cleanup is unverified; retries blocked: {reason}");
+        }
+    }
+    CheckError::Unsettled(reason)
+}
+
+fn settled(state: &State, attempt: &str) -> Result<serde_json::Value, CheckError> {
+    let receipt: serde_json::Value = fs::read(&state.receipt)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .ok_or_else(|| unsettled(state, "missing or invalid process-tree cleanup receipt"))?;
+    if receipt["attempt"] != attempt
+        || receipt["settled"] != true
+        || !matches!(receipt["state"].as_str(), Some("exited" | "timed_out" | "cancelled" | "failed"))
+        || receipt["code"].as_u64().is_none()
+    {
+        return Err(unsettled(state, format!("no matching settled receipt for attempt {attempt}: {receipt}")));
+    }
+    let _ = fs::remove_file(&state.unsettled);
+    Ok(receipt)
+}
+
+fn available(state: &State) -> Result<bool, CheckError> {
+    if let Some(running) = Running::read(&state.running).map_err(|error| unsettled(state, error.to_string()))? {
+        if running.live().map_err(|error| unsettled(state, error.to_string()))? {
+            return Ok(false);
+        }
+        settled(state, &running.attempt)?;
+    } else if state.unsettled.exists() {
+        return Err(CheckError::Unsettled(fs::read_to_string(&state.unsettled).unwrap_or_default()));
+    }
+    Ok(true)
+}
+
+fn spawn(host: Host, cwd: &Path, state: &State) -> Result<OwnedUpdate, CheckError> {
     let log = OpenOptions::new().create(true).append(true).open(&state.log).map_err(CheckError::Spawn)?;
     let errors = log.try_clone().map_err(CheckError::Spawn)?;
-    let mut child = crate::run::hidden("tj-plugins")
-        .args(["update", "--host", host.name()])
+    let attempt = crate::run::generated_id().map_err(|error| CheckError::Record(std::io::Error::other(error)))?;
+    // Persist the attempt before creating any writer. A crash in spawn must never authorize a retry.
+    let mut running = Running { attempt: attempt.clone(), process: None };
+    running.record(&state.running)?;
+    let helper = std::env::current_exe()
+        .map_err(CheckError::Spawn)?
+        .with_file_name(format!("tj_hook{}", std::env::consts::EXE_SUFFIX));
+    let mut command = Command::new(helper);
+    command
+        .arg("--bounded")
+        .arg(UPDATE_LIFETIME.as_millis().to_string())
+        .arg(&state.receipt)
+        .arg(&attempt)
+        .args(["--", "tj-plugins", "update", "--host", host.name()])
         .current_dir(cwd)
         .stdin(Stdio::null())
         .stdout(log)
-        .stderr(errors)
-        .spawn()
-        .map_err(CheckError::Spawn)?;
-    if let Err(error) = Running::record(&child, &state.running) {
-        let _ = child.kill();
-        let _ = child.wait();
-        return Err(error);
+        .stderr(errors);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x0800_0000);
     }
-    Ok(child)
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    let child = command.spawn().map_err(|error| {
+        let outcome = bounded::Outcome::Failed(std::io::Error::new(error.kind(), error.to_string()));
+        let _ = outcome.record(&state.receipt, &attempt);
+        CheckError::Spawn(error)
+    })?;
+    let owned = OwnedUpdate { child, state: state.clone(), attempt, finished: false };
+    running.process = tj_cli::process::agent::started_at(owned.child.id())
+        .map_err(CheckError::Record)?
+        .map(|started| (owned.child.id(), started));
+    running.record(&state.running)?;
+    Ok(owned)
 }
 
-fn record_exit(log: &Path, status: &std::io::Result<std::process::ExitStatus>) {
-    let failure = match status {
-        Ok(status) if status.success() => return,
-        Ok(status) => status.to_string(),
-        Err(error) => error.to_string(),
-    };
-    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(log) {
-        let _ = writeln!(file, "native updater failed ({failure}); retry after ten minutes if still needed");
+fn record_exit(state: &State, attempt: &str) {
+    if let Ok(receipt) = settled(state, attempt)
+        && receipt["code"] != 0
+        && let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&state.log)
+    {
+        let _ = writeln!(
+            file,
+            "native updater failed ({}; code {}); process tree settled; ten-minute retry window: {}",
+            receipt["state"], receipt["code"], receipt["error"]
+        );
     }
 }
 
@@ -208,7 +290,12 @@ fn record_probe_failure(log: &Path, error: &ureq::Error) -> Result<(), CheckErro
     .map_err(CheckError::Record)
 }
 
-fn check(state: &State, host: Host, cwd: &Path, url: &str) -> Result<Option<(Option<String>, Child)>, CheckError> {
+fn check(
+    state: &State,
+    host: Host,
+    cwd: &Path,
+    url: &str,
+) -> Result<Option<(Option<String>, OwnedUpdate)>, CheckError> {
     let now = SystemTime::now();
     if modified(&state.checked).is_some_and(|at| recent(at, now, CHECKED_FOR)) {
         return Ok(None);
@@ -218,7 +305,7 @@ fn check(state: &State, host: Host, cwd: &Path, url: &str) -> Result<Option<(Opt
     if modified(&state.checked).is_some_and(|at| recent(at, now, CHECKED_FOR)) {
         return Ok(None);
     }
-    if Running::read(&state.running)?.map(|running| running.live()).transpose()?.unwrap_or(false) {
+    if !available(state)? {
         return Ok(None);
     }
     let _ = fs::write(&state.checked, "");
@@ -255,19 +342,40 @@ pub(crate) fn start(host: Host, cwd: &Path, url: String) -> Option<JoinHandle<Re
     Some(std::thread::spawn(move || {
         check(&state, host, &cwd, &url).map(|update| {
             update.and_then(|(message, mut child)| {
-                std::thread::spawn(move || record_exit(&state.log, &child.wait()));
+                std::thread::spawn(move || {
+                    while !child.finished() {
+                        std::thread::sleep(Duration::from_millis(100));
+                    }
+                });
                 message
             })
         })
     }))
 }
 
-/// An updater owned by the daemon observer; dropping it ends its whole process tree.
-pub(crate) struct OwnedUpdate(Child);
+/// An updater supervised by the bounded helper; dropping it requests cleanup of its whole process tree.
+pub(crate) struct OwnedUpdate {
+    child: Child,
+    state: State,
+    attempt: String,
+    finished: bool,
+}
 
 impl OwnedUpdate {
     pub(crate) fn finished(&mut self) -> bool {
-        self.0.try_wait().is_ok_and(|status| status.is_some())
+        if self.finished {
+            return true;
+        }
+        let exited = match self.child.try_wait() {
+            Ok(status) => status.is_some(),
+            // The session wrapper is also a subreaper. Its native wait may already have reaped this helper.
+            Err(_) => tj_cli::process::agent::started_at(self.child.id()).is_ok_and(|started| started.is_none()),
+        };
+        if exited {
+            record_exit(&self.state, &self.attempt);
+            self.finished = true;
+        }
+        exited
     }
 }
 
@@ -276,14 +384,19 @@ impl Drop for OwnedUpdate {
         if self.finished() {
             return;
         }
-        #[cfg(unix)]
-        if let Ok(raw) = i32::try_from(self.0.id())
-            && let Some(group) = rustix::process::Pid::from_raw(raw)
-        {
-            let _ = rustix::process::kill_process_group(group, rustix::process::Signal::KILL);
+        let _ = fs::write(bounded::cancel_path(&self.state.receipt), &self.attempt);
+        let deadline = Instant::now() + bounded::CLEANUP_LIMIT + Duration::from_secs(2);
+        while !self.finished() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
         }
-        let _ = self.0.kill();
-        let _ = self.0.wait();
+        if !self.finished {
+            let _ = self.child.kill();
+            let reap_deadline = Instant::now() + Duration::from_secs(2);
+            while self.child.try_wait().is_ok_and(|status| status.is_none()) && Instant::now() < reap_deadline {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            let _ = unsettled(&self.state, "bounded updater helper did not confirm cleanup after cancellation");
+        }
     }
 }
 
@@ -294,9 +407,7 @@ pub(crate) fn start_owned(
 ) -> Option<JoinHandle<Result<Option<OwnedUpdate>, CheckError>>> {
     let state = State::new(&paths::cache_dir().ok()?, host);
     let cwd = cwd.to_path_buf();
-    Some(std::thread::spawn(move || {
-        check(&state, host, &cwd, &url).map(|update| update.map(|(_, child)| OwnedUpdate(child)))
-    }))
+    Some(std::thread::spawn(move || check(&state, host, &cwd, &url).map(|update| update.map(|(_, child)| child))))
 }
 
 #[cfg(test)]
@@ -311,18 +422,25 @@ mod tests {
     const SHA: &str = "e555013e5e7bab455193e79be12a15e588bdd221";
 
     #[test]
-    fn owned_updater_is_terminated_when_the_observer_exits() {
+    fn observer_shutdown_asks_the_owned_helper_to_settle_before_returning() {
+        let root = tempfile::tempdir().unwrap();
+        let state = State::new(root.path(), crate::host::Host::Claude);
+        std::fs::create_dir_all(&state.folder).unwrap();
         let python = if cfg!(windows) { "python" } else { "python3" };
         let child = std::process::Command::new(python)
-            .args(["-c", "import time; time.sleep(60)"])
+            .args(["-c", "import pathlib,sys,time; p=pathlib.Path(sys.argv[1]);\nwhile not p.exists(): time.sleep(.01)\npathlib.Path(sys.argv[2]).write_text(sys.argv[3])"])
+            .arg(tj_cli::process::bounded::cancel_path(&state.receipt)).arg(&state.receipt)
+            .arg(r#"{"attempt":"cancel-test","settled":true,"state":"cancelled","code":125}"#)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .spawn()
             .unwrap();
         let pid = child.id();
-        drop(OwnedUpdate(child));
+        drop(OwnedUpdate { child, state: state.clone(), attempt: "cancel-test".into(), finished: false });
         assert!(tj_cli::process::agent::started_at(pid).unwrap().is_none());
+        assert!(!state.unsettled.exists());
+        assert!(super::settled(&state, "cancel-test").is_ok());
     }
 
     #[test]
@@ -340,16 +458,52 @@ mod tests {
             .stderr(std::process::Stdio::null())
             .spawn()
             .unwrap();
-        let owned = OwnedUpdate(child);
-        Running::record(&owned.0, &state.running).unwrap();
+        let mut owned = OwnedUpdate { child, state: state.clone(), attempt: "live-test".into(), finished: false };
+        let started_at = tj_cli::process::agent::started_at(owned.child.id()).unwrap().unwrap();
+        Running { attempt: "live-test".into(), process: Some((owned.child.id(), started_at)) }
+            .record(&state.running)
+            .unwrap();
         let running = Running::read(&state.running).unwrap().unwrap();
         assert!(running.live().unwrap());
         assert!(check(&state, crate::host::Host::Claude, root.path(), "invalid://no-request").unwrap().is_none());
         assert!(!state.checked.exists(), "an active updater must not consume the next check");
-        let reused = Running { pid: running.pid, started_at: running.started_at + Duration::from_secs(1) };
+        let reused = Running {
+            attempt: "reused".into(),
+            process: Some((owned.child.id(), started_at + Duration::from_secs(1))),
+        };
         assert!(!reused.live().unwrap(), "a reused PID is not the recorded updater");
-        drop(owned);
+        owned.child.kill().unwrap();
+        owned.child.wait().unwrap();
+        assert!(owned.finished());
         assert!(!running.live().unwrap());
+        assert!(state.unsettled.exists());
+        assert!(super::available(&state).is_err(), "a dead root alone cannot authorize another writer");
+        tj_cli::process::bounded::Outcome::TimedOut.record(&state.receipt, "live-test").unwrap();
+        assert!(super::available(&state).unwrap());
+        assert!(!state.unsettled.exists());
+    }
+
+    #[test]
+    fn absent_mismatched_or_unsettled_receipts_block_retry_across_watchers() {
+        let root = tempfile::tempdir().unwrap();
+        let state = State::new(root.path(), crate::host::Host::Claude);
+        std::fs::create_dir_all(&state.folder).unwrap();
+        Running { attempt: "attempt".into(), process: None }.record(&state.running).unwrap();
+        for receipt in [
+            None,
+            Some(serde_json::json!({"attempt":"older","settled":true,"state":"exited","code":0})),
+            Some(serde_json::json!({"attempt":"attempt","settled":false,"state":"unsettled","code":127})),
+        ] {
+            if let Some(receipt) = receipt {
+                std::fs::write(&state.receipt, receipt.to_string()).unwrap();
+            }
+            let restarted = State::new(root.path(), crate::host::Host::Claude);
+            assert!(super::available(&restarted).is_err());
+            assert!(restarted.unsettled.exists());
+            let diagnostic = std::fs::read(&restarted.log).unwrap();
+            assert!(super::available(&restarted).is_err());
+            assert_eq!(std::fs::read(&restarted.log).unwrap(), diagnostic, "unchanged failures must not spam the log");
+        }
     }
 
     #[test]
