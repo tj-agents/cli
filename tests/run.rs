@@ -2069,9 +2069,40 @@ impl Drop for NativeAdapter {
 
 fn native_records(sandbox: &Sandbox) -> Vec<serde_json::Value> {
     let path = sandbox.root.join("state/native").join(native_session(sandbox).replace(':', "-")).join("requests.jsonl");
-    let text = std::fs::read_to_string(path).unwrap_or_default();
+    let mut file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+        Err(error) => panic!("cannot open native request journal: {error}"),
+    };
+    fs4::FileExt::lock_shared(&file).unwrap();
+    let mut text = String::new();
+    file.read_to_string(&mut text).unwrap();
     let Some((complete, _)) = text.rsplit_once('\n') else { return Vec::new() };
     complete.lines().map(|line| serde_json::from_str(line).unwrap()).collect()
+}
+
+#[test]
+fn native_record_snapshots_wait_for_the_journal_writer() {
+    let sandbox = sandbox();
+    set_reply(&sandbox, "agent-store-show.json", r#"{"data":{"session":{"session":"claude:locked"}}}"#);
+    let path = sandbox.root.join("state/native/claude-locked/requests.jsonl");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let mut writer = std::fs::File::create(&path).unwrap();
+    writeln!(writer, "{{\"kind\":\"request\"}}").unwrap();
+    fs4::FileExt::lock(&writer).unwrap();
+    let (ready, started) = mpsc::channel();
+    let (send, received) = mpsc::channel();
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            ready.send(()).unwrap();
+            send.send(native_records(&sandbox)).unwrap();
+        });
+        started.recv_timeout(Duration::from_secs(5)).unwrap();
+        let early = received.recv_timeout(Duration::from_millis(100));
+        drop(writer);
+        assert!(matches!(early, Err(mpsc::RecvTimeoutError::Timeout)), "snapshot ignored the writer lock: {early:?}");
+        assert_eq!(received.recv_timeout(Duration::from_secs(5)).unwrap(), [serde_json::json!({"kind":"request"})]);
+    });
 }
 
 #[test]
