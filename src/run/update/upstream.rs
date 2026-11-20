@@ -38,6 +38,7 @@ struct State {
     folder: PathBuf,
     checked: PathBuf,
     started: PathBuf,
+    running: PathBuf,
     lock: PathBuf,
     log: PathBuf,
     published: PathBuf,
@@ -50,6 +51,7 @@ impl State {
         Self {
             checked: file("checked"),
             started: file("started"),
+            running: file("running"),
             lock: file("lock"),
             log: file("log"),
             published: cache.join("published").join(host.name()),
@@ -113,10 +115,54 @@ fn request(url: &str, etag: Option<&str>) -> Result<Answer, CheckError> {
     }
 }
 
-fn spawn(host: Host, cwd: &Path, log: &Path) -> Result<Child, CheckError> {
-    let log = OpenOptions::new().create(true).append(true).open(log).map_err(CheckError::Spawn)?;
+struct Running {
+    pid: u32,
+    started_at: SystemTime,
+}
+
+impl Running {
+    fn read(path: &Path) -> Result<Option<Self>, CheckError> {
+        match fs::read(path) {
+            Ok(bytes) => {
+                let value: serde_json::Value =
+                    serde_json::from_slice(&bytes).map_err(|error| CheckError::Record(std::io::Error::other(error)))?;
+                let invalid = || CheckError::Record(std::io::Error::other("invalid updater process identity"));
+                let pid = value["pid"].as_u64().and_then(|pid| u32::try_from(pid).ok()).ok_or_else(invalid)?;
+                let started_at = value["started_at"]
+                    .as_str()
+                    .ok_or_else(invalid)?
+                    .parse::<chrono::DateTime<chrono::Utc>>()
+                    .map_err(|_| invalid())?
+                    .into();
+                Ok(Some(Self { pid, started_at }))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(CheckError::Record(error)),
+        }
+    }
+
+    fn live(&self) -> Result<bool, CheckError> {
+        tj_cli::process::agent::started_at(self.pid)
+            .map(|started| started == Some(self.started_at))
+            .map_err(CheckError::Record)
+    }
+
+    fn record(child: &Child, path: &Path) -> Result<(), CheckError> {
+        if let Some(started_at) = tj_cli::process::agent::started_at(child.id()).map_err(CheckError::Record)? {
+            let value = serde_json::json!({
+                "pid": child.id(),
+                "started_at": chrono::DateTime::<chrono::Utc>::from(started_at).to_rfc3339(),
+            });
+            fs::write(path, value.to_string()).map_err(CheckError::Record)?;
+        }
+        Ok(())
+    }
+}
+
+fn spawn(host: Host, cwd: &Path, state: &State) -> Result<Child, CheckError> {
+    let log = OpenOptions::new().create(true).append(true).open(&state.log).map_err(CheckError::Spawn)?;
     let errors = log.try_clone().map_err(CheckError::Spawn)?;
-    let child = crate::run::hidden("tj-plugins")
+    let mut child = crate::run::hidden("tj-plugins")
         .args(["update", "--host", host.name()])
         .current_dir(cwd)
         .stdin(Stdio::null())
@@ -124,7 +170,23 @@ fn spawn(host: Host, cwd: &Path, log: &Path) -> Result<Child, CheckError> {
         .stderr(errors)
         .spawn()
         .map_err(CheckError::Spawn)?;
+    if let Err(error) = Running::record(&child, &state.running) {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(error);
+    }
     Ok(child)
+}
+
+fn record_exit(log: &Path, status: &std::io::Result<std::process::ExitStatus>) {
+    let failure = match status {
+        Ok(status) if status.success() => return,
+        Ok(status) => status.to_string(),
+        Err(error) => error.to_string(),
+    };
+    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(log) {
+        let _ = writeln!(file, "native updater failed ({failure}); retry after ten minutes if still needed");
+    }
 }
 
 /// Exceptions can contain credentials or proxy URLs; record only a safe transport category.
@@ -156,6 +218,9 @@ fn check(state: &State, host: Host, cwd: &Path, url: &str) -> Result<Option<(Opt
     if modified(&state.checked).is_some_and(|at| recent(at, now, CHECKED_FOR)) {
         return Ok(None);
     }
+    if Running::read(&state.running)?.map(|running| running.live()).transpose()?.unwrap_or(false) {
+        return Ok(None);
+    }
     let _ = fs::write(&state.checked, "");
     let published = fs::read_to_string(&state.published).unwrap_or_default();
     let answer = match request(url, converged(&published)) {
@@ -167,7 +232,7 @@ fn check(state: &State, host: Host, cwd: &Path, url: &str) -> Result<Option<(Opt
                 return Ok(None);
             }
             record_probe_failure(&state.log, &error)?;
-            let child = spawn(host, cwd, &state.log)?;
+            let child = spawn(host, cwd, state)?;
             // Empty means an unverified attempt, not a requested or successfully installed SHA.
             let _ = fs::write(&state.started, "");
             return Ok(Some((None, child)));
@@ -177,7 +242,7 @@ fn check(state: &State, host: Host, cwd: &Path, url: &str) -> Result<Option<(Opt
     let previous = fs::read_to_string(&state.started).unwrap_or_default();
     let started = modified(&state.started).map(|at| (previous.trim(), at));
     let Some(sha) = install(answer, started, now) else { return Ok(None) };
-    let child = spawn(host, cwd, &state.log)?;
+    let child = spawn(host, cwd, state)?;
     let _ = fs::write(&state.started, &sha);
     Ok(Some((Some(format!("tj-agents changed upstream; updating {} plugins in the background", host.name())), child)))
 }
@@ -190,7 +255,7 @@ pub(crate) fn start(host: Host, cwd: &Path, url: String) -> Option<JoinHandle<Re
     Some(std::thread::spawn(move || {
         check(&state, host, &cwd, &url).map(|update| {
             update.and_then(|(message, mut child)| {
-                std::thread::spawn(move || child.wait());
+                std::thread::spawn(move || record_exit(&state.log, &child.wait()));
                 message
             })
         })
@@ -238,7 +303,10 @@ pub(crate) fn start_owned(
 mod tests {
     use std::time::{Duration, UNIX_EPOCH};
 
-    use super::{Answer, CheckError, OwnedUpdate, TIMEOUT, converged, install, recent, record_probe_failure, request};
+    use super::{
+        Answer, CheckError, OwnedUpdate, Running, State, TIMEOUT, check, converged, install, recent,
+        record_probe_failure, request,
+    };
 
     const SHA: &str = "e555013e5e7bab455193e79be12a15e588bdd221";
 
@@ -255,6 +323,33 @@ mod tests {
         let pid = child.id();
         drop(OwnedUpdate(child));
         assert!(tj_cli::process::agent::started_at(pid).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_live_updater_blocks_checks_until_its_exact_process_exits() {
+        let root = tempfile::tempdir().unwrap();
+        let state = State::new(root.path(), crate::host::Host::Claude);
+        std::fs::create_dir_all(&state.folder).unwrap();
+        // A regression must never fall through to a real native updater in this test.
+        std::fs::write(&state.started, "").unwrap();
+        let python = if cfg!(windows) { "python" } else { "python3" };
+        let child = std::process::Command::new(python)
+            .args(["-c", "import time; time.sleep(60)"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let owned = OwnedUpdate(child);
+        Running::record(&owned.0, &state.running).unwrap();
+        let running = Running::read(&state.running).unwrap().unwrap();
+        assert!(running.live().unwrap());
+        assert!(check(&state, crate::host::Host::Claude, root.path(), "invalid://no-request").unwrap().is_none());
+        assert!(!state.checked.exists(), "an active updater must not consume the next check");
+        let reused = Running { pid: running.pid, started_at: running.started_at + Duration::from_secs(1) };
+        assert!(!reused.live().unwrap(), "a reused PID is not the recorded updater");
+        drop(owned);
+        assert!(!running.live().unwrap());
     }
 
     #[test]
@@ -281,6 +376,13 @@ mod tests {
         assert!(recent(now - Duration::from_secs(59), now, Duration::from_secs(60)));
         assert!(!recent(now - Duration::from_secs(60), now, Duration::from_secs(60)));
         assert!(recent(now + Duration::from_secs(5), now, Duration::from_secs(60)));
+    }
+
+    #[test]
+    fn marketplace_checks_become_due_at_two_minutes() {
+        let checked = UNIX_EPOCH + Duration::from_secs(100);
+        assert!(recent(checked, checked + Duration::from_secs(119), super::CHECKED_FOR));
+        assert!(!recent(checked, checked + Duration::from_secs(120), super::CHECKED_FOR));
     }
 
     #[test]

@@ -81,6 +81,26 @@ pub fn for_launch(launch: &str) -> Result<Store> {
     Ok(Store::open(paths::state_dir()?.join("completion"), binding(launch, &data, true)?))
 }
 
+fn startup_binding(
+    launch: &super::Launch,
+    data: &Value,
+    wrapper_pid: u32,
+    started_at: &str,
+) -> Result<Option<Identity>> {
+    if data.get("session") == Some(&Value::Null) && data["launch"].get("session") == Some(&Value::Null) {
+        store::exact_launch(data, launch, wrapper_pid, started_at)?;
+        return Ok(None);
+    }
+    binding(&launch.id, data, true).map(Some)
+}
+
+/// Only an explicitly unbound launch owned by this wrapper is still awaiting SessionStart.
+pub(super) fn for_startup(launch: &super::Launch, started_at: &str) -> Result<Option<Store>> {
+    let data = store::call(&["show", "--launch-id", &launch.id])?;
+    let Some(identity) = startup_binding(launch, &data, std::process::id(), started_at)? else { return Ok(None) };
+    Ok(Some(Store::open(paths::state_dir()?.join("completion"), identity)))
+}
+
 pub fn for_recovery(launch: &str) -> Result<Option<Store>> {
     let data = store::call(&["show", "--launch-id", launch])?;
     let identity = binding(launch, &data, false)?;
@@ -401,6 +421,54 @@ pub fn native_event() -> Result<ExitCode> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn registration_pending_requires_explicit_nulls_and_the_exact_active_wrapper() {
+        for host in [crate::host::Host::Claude, crate::host::Host::Codex] {
+            let root = tempfile::tempdir().unwrap();
+            let launch = super::super::Launch {
+                id: "launch".into(),
+                host,
+                title: "Tab".into(),
+                cwd: root.path().to_path_buf(),
+                item: None,
+            };
+            let started = "2026-11-18T10:00:00Z";
+            let pending = json!({"session":null, "launch":{
+                "launch_id":"launch", "session":null, "host":host.name(), "state":"active",
+                "title":"Tab", "cwd":root.path(), "wrapper":{"pid":42, "started_at":started}
+            }});
+            assert!(startup_binding(&launch, &pending, 42, started).unwrap().is_none());
+            assert!(binding("launch", &pending, true).is_err(), "strict completion accepted an unbound launch");
+            for (pointer, value) in [
+                ("/session", json!({})),
+                ("/launch/session", json!(format!("{}:native", host.name()))),
+                ("/launch/launch_id", json!("another-launch")),
+                ("/launch/host", json!("other-host")),
+                ("/launch/state", json!("ended")),
+                ("/launch/title", json!("another-title")),
+                ("/launch/cwd", json!("another-directory")),
+                ("/launch/wrapper/pid", json!(43)),
+                ("/launch/wrapper/started_at", json!("another-start")),
+            ] {
+                let mut invalid = pending.clone();
+                *invalid.pointer_mut(pointer).unwrap() = value;
+                assert!(startup_binding(&launch, &invalid, 42, started).is_err(), "accepted {pointer}: {invalid}");
+            }
+            for pointer in ["", "/launch"] {
+                let mut invalid = pending.clone();
+                invalid.pointer_mut(pointer).unwrap().as_object_mut().unwrap().remove("session");
+                assert!(startup_binding(&launch, &invalid, 42, started).is_err(), "accepted absent {pointer}/session");
+            }
+            let mut bound = pending;
+            let handle = format!("{}:native", host.name());
+            bound["launch"]["session"] = json!(handle);
+            bound["session"] = json!({"session":handle,"native_id":"native","host":host.name(),"launch_id":"launch"});
+            assert_eq!(startup_binding(&launch, &bound, 42, started).unwrap().unwrap().session_handle(), handle);
+            bound["session"]["launch_id"] = json!("another-launch");
+            assert!(startup_binding(&launch, &bound, 42, started).is_err());
+        }
+    }
 
     #[test]
     fn interrupted_resumes_preserve_the_last_recorded_hold_decision() {

@@ -10,6 +10,7 @@ mod host;
 mod init;
 mod item_cli;
 mod message;
+mod native_bridge;
 mod paths;
 mod run;
 
@@ -65,10 +66,10 @@ enum Command {
     Closeout(run::closeout::Args),
     /// Message another session through its supported native or feed route
     Message(message::Args),
-    #[command(name = "_message-host", hide = true)]
-    MessageHost(message::bridge::HostArgs),
-    #[command(name = "_message-receipt", hide = true)]
-    MessageReceipt(message::bridge::ReceiptArgs),
+    #[command(name = "_native-host", hide = true)]
+    NativeHost(native_bridge::HostArgs),
+    #[command(name = "_native-receipt", hide = true)]
+    NativeReceipt(native_bridge::ReceiptArgs),
     /// Read this session's unread feed messages, optionally waiting for the next one
     Feed(feed::Args),
     /// Draws cr's preview pane (run by fzf, not by hand)
@@ -98,8 +99,8 @@ fn main() -> ExitCode {
         Command::Launch => Ok(run::owner::print()),
         Command::Closeout(args) => run::closeout::run(args),
         Command::Message(args) => message::run(&args),
-        Command::MessageHost(args) => message::bridge::host(args),
-        Command::MessageReceipt(args) => message::bridge::receipt(args),
+        Command::NativeHost(args) => native_bridge::host(args),
+        Command::NativeReceipt(args) => native_bridge::receipt(args),
         Command::Feed(args) => feed::run(&args),
         Command::CrPreview(args) => cr::preview(args),
         Command::External(arguments) => external::run(arguments),

@@ -1,14 +1,12 @@
-use std::time::{Duration, SystemTime};
-
-use tj_cli::process::agent;
+use std::time::SystemTime;
 
 use super::gate::Activity;
 use super::{ApplyError, Update};
+use crate::native_bridge;
 use crate::run::turn::{self, Turn};
+use crate::run::{Launch, lifecycle};
 
-const COMMAND: &str = "/reload-plugins";
-
-/// Types `/reload-plugins` into the console Claude shares with the wrapper.
+/// Requests reload through the native adapter without editing the composer.
 pub(crate) struct Claude;
 
 fn activity(turn: Option<Turn>, now: SystemTime, background: u32) -> Activity {
@@ -25,10 +23,9 @@ impl Update for Claude {
         activity(turn::claude(agent), SystemTime::now(), turn::shells(agent))
     }
 
-    fn apply(&self) -> Result<(), ApplyError> {
-        agent::type_text(COMMAND).map_err(ApplyError::Typing)?;
-        std::thread::sleep(Duration::from_millis(300));
-        agent::press_enter().map_err(ApplyError::Typing)
+    fn apply(&self, launch: &Launch, revision: &str) -> Result<bool, ApplyError> {
+        let completion = lifecycle::for_launch(&launch.id).map_err(ApplyError::Session)?;
+        native_bridge::reload(completion.identity().session_handle(), revision).map_err(ApplyError::Native)
     }
 }
 

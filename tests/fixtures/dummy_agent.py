@@ -50,6 +50,11 @@ def run_commands() -> None:
     lines = commands.read_text(encoding="utf-8").splitlines()
     for number, line in enumerate(lines[done:], start=done):
         command = json.loads(line)
+        if command == ["exit-native"]:
+            ran.write_text(str(number + 1), encoding="utf-8")
+            note(f"ran {number} 0 ")
+            note("native exit")
+            sys.exit(0)
         if isinstance(command, list) and command[0] == "shell":
             shell(command[1] == "start")
             ran.write_text(str(number + 1), encoding="utf-8")

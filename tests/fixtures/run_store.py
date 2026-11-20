@@ -62,14 +62,15 @@ def prebound_reply(
     if command != "show":
         return None
     launch = json.loads(launch_file.read_text(encoding="utf-8"))
-    handle = f"codex:{session}"
+    host = configuration_data.get("host", "codex")
+    handle = f"{host}:{session}"
     bound = bound_file.exists()
     launch.update({"session": handle if bound else None, "state": "active"})
     native = (
         {
             "session": handle,
             "native_id": session,
-            "host": "codex",
+            "host": host,
             "launch_id": launch["launch_id"],
             "state": "active",
         }

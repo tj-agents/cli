@@ -12,11 +12,13 @@ checks are spaced by two minutes, limiting the two hosts' normal combined rate t
 hour. A one-second network timeout keeps the check off the session's supervision loop. A changed
 commit starts `tj plugins update --host <host>` in the background; output goes to
 `<cache>/update/<host>.log`. The same commit is retried after ten minutes if convergence did not
-publish it.
+publish it. A recorded updater PID and start time prevent overlapping updater processes for the same
+host, including across wrapper exits. A failed updater is reported in that log with its retry policy.
 
 If the lightweight GitHub probe cannot connect, it hands verification to the existing native plugin
 updater in the background. The host still starts. These unverified attempts share the ten-minute retry
-window across tabs and wrapper restarts; a newly verified changed commit can still start immediately.
+window across tabs and wrapper restarts; a newly verified changed commit can start once the previous
+updater exits.
 Only a successful native convergence publishes an installed revision. The update log records a safe
 transport category and the native updater's result, rather than a repeated terminal warning.
 
@@ -42,14 +44,17 @@ failed native installation. Explicit repository adoption and install reconciliat
 changes. See [Agent's installation and scope rules](https://github.com/tj-agents/agent#install).
 
 Each running wrapper watches its host's publication file. Claude waits until its turn and input are
-idle, then types `/reload-plugins` and Enter into the shared console. Unsubmitted text in the console
-is not visible to the wrapper and the command can be appended to it. Codex requests
-`config/batchWrite` with `reloadUserConfig: true` over WebSocket through the shared app-server proxy. This reaches
-sessions using that daemon; an embedded Codex session, such as one started with `--no-daemon`, is not
-addressed by this request. The server
-refreshes loaded threads' runtime configuration; it retains some session settings and does not rewrite
-instructions already delivered in previous turns. A successful request alone does not prove that each
-thread refreshed successfully. Codex's completion lists may require a restart to reflect changes.
+idle, then sends a durable `reload_plugins` request through Agent's native adapter. It marks the
+publication applied only after a matching completion receipt. The adapter invokes the native command
+without editing or submitting the user's composer. Missing adapters, failed reloads and missing
+receipts leave activation unverified. Adapter replacement can reconcile a reload once; message
+requests are never replayed.
+
+Managed Codex uses an embedded `--no-daemon` engine. The wrapper reports that plugin activation remains
+unverified until a native restart; it cannot refresh that engine through an unrelated shared daemon.
+The external daemon observer still requests `config/batchWrite` with `reloadUserConfig: true` for its
+own daemon. That request alone does not prove each loaded thread refreshed successfully or replace
+instructions delivered in earlier turns. Neither path types into or submits a draft.
 
 The wrapper separately detects a replacement `tj` binary. It can resume an idle Claude session under
 the new binary with the same conversation; Codex currently takes the new binary on its next start.
@@ -57,9 +62,11 @@ the new binary with the same conversation; Codex currently takes the new binary 
 ## Acceptance checks
 
 - Merge a marketplace pin change with `tj claude` and `tj codex` sessions already open. Without a manual
-  update, observe the installation, each host's publication and the changed plugin behavior in each
-  same conversation. For Claude, observe the reload command when idle; for Codex, exercise changed
-  behavior in a later turn instead of relying on an RPC acknowledgement or completion list.
+  update, observe the installation and each host's publication. For Claude, keep an unsent draft,
+  observe the native completion receipt when idle, and exercise changed behavior in the same
+  conversation with the draft intact. Managed Codex must report activation as unverified until a
+  native restart. For external daemon sessions, exercise changed behavior in a later turn instead of
+  relying on an RPC acknowledgement or completion list.
 - Start and resume a Codex session in a selecting repository. Confirm its SessionStart hooks finish
   within their timeouts and its repository standards are available.
 - Exercise `tj claude`, `tj codex`, `tj plugins update`, `tj install`, `tj start`, `tj status`, `tj recover`,

@@ -3,7 +3,7 @@ use std::time::Duration;
 /// What the host says it is doing, as far as the wrapper can see from outside it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Activity {
-    /// The host exposes no turn state; it takes updates through its own server, so they never wait.
+    /// The host exposes no turn state; its update handler must avoid composer input.
     Unknown,
     Busy,
     Idle {

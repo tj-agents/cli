@@ -255,8 +255,18 @@ fn prebound_session(args: &Args, launch: &Launch) -> Result<Option<PreboundSessi
             remaining = rest;
         }
     }
-    if let [option, endpoint, rest @ ..] = remaining {
-        if option == "--remote" && endpoint == "unix://" {
+    let embedded = if let [option, rest @ ..] = remaining {
+        if option == "--no-daemon" {
+            remaining = rest;
+            true
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+    if let [option, rest @ ..] = remaining {
+        if option == "--dangerously-bypass-hook-trust" {
             remaining = rest;
         }
     }
@@ -265,9 +275,10 @@ fn prebound_session(args: &Args, launch: &Launch) -> Result<Option<PreboundSessi
         [delimiter, _] => delimiter == OsStr::new("--"),
         _ => false,
     };
-    if !prompt_is_delimited || args.agent.iter().take(expected.len()).map(OsString::as_os_str).ne(expected) {
+    if !embedded || !prompt_is_delimited || args.agent.iter().take(expected.len()).map(OsString::as_os_str).ne(expected)
+    {
         bail!(
-            "--session requires `codex --cd <cwd> resume <UUID> [--model <model>] [-c model_reasoning_effort=<effort>] [--remote unix://] [-- <prompt>]`"
+            "--session requires `codex --cd <cwd> resume <UUID> [--model <model>] [-c model_reasoning_effort=<effort>] --no-daemon [--dangerously-bypass-hook-trust] [-- <prompt>]`"
         );
     }
     Ok(Some(PreboundSession { handle: handle.clone() }))
@@ -279,6 +290,8 @@ fn end_not_started(launch: &Launch, prebound: &PreboundSession, wrapper_pid: u32
     }
 }
 
+const REGISTRATION_REPORT_GRACE: Duration = Duration::from_secs(300);
+
 struct Watch {
     launch: Launch,
     marks: PathBuf,
@@ -288,6 +301,8 @@ struct Watch {
     next_poll: Instant,
     reported: HashSet<String>,
     completion: Option<Store>,
+    wrapper_started_at: String,
+    registration_report_at: Instant,
     revision: Option<u64>,
     ready_since: Option<Instant>,
     pinned: Option<turn::Turn>,
@@ -319,10 +334,29 @@ impl Watch {
 
     fn record(&mut self) -> Result<Option<Record>> {
         if self.completion.is_none() {
-            self.completion = Some(lifecycle::for_launch(&self.launch.id)?);
+            self.completion = lifecycle::for_startup(&self.launch, &self.wrapper_started_at)?;
+            if self.completion.is_none() {
+                self.awaiting_registration(Instant::now());
+                return Ok(None);
+            }
         }
         let store = self.completion.as_ref().context("completion store not bound")?;
         store.load()?.map(|record| lifecycle::deliver(store, record)).transpose()
+    }
+
+    fn awaiting_registration(&mut self, now: Instant) {
+        if now >= self.registration_report_at {
+            self.report("still awaiting native session registration".into());
+        }
+    }
+
+    fn exited(&mut self, agent: u32, code: i32) -> Result<Option<Record>> {
+        if self.completion.is_none() {
+            self.completion = Some(
+                lifecycle::for_launch(&self.launch.id).context("native exited without a verified session binding")?,
+            );
+        }
+        if code == 0 { self.natural_exit(agent) } else { Ok(None) }
     }
 
     fn ready(&mut self) -> Result<Option<Record>> {
@@ -590,6 +624,8 @@ fn supervise(args: &Args, launch: Launch, prebound: Option<&PreboundSession>) ->
         next_poll: Instant::now() + poll,
         reported: HashSet::new(),
         completion: None,
+        wrapper_started_at: started_at,
+        registration_report_at: Instant::now() + REGISTRATION_REPORT_GRACE,
         revision: None,
         ready_since: None,
         pinned: None,
@@ -608,16 +644,12 @@ fn supervise(args: &Args, launch: Launch, prebound: Option<&PreboundSession>) ->
                 wait_for_enter();
             }
             // A clean process exit is not a final result. Only the exact native receipt can close.
-            let ready = if code == 0 {
-                match watch.natural_exit(agent.pid()) {
-                    Ok(ready) => ready,
-                    Err(error) => {
-                        watch.report(format!("completion remains unverified: {error:#}"));
-                        None
-                    }
+            let ready = match watch.exited(agent.pid(), code) {
+                Ok(ready) => ready,
+                Err(error) => {
+                    watch.report(format!("completion remains unverified: {error:#}"));
+                    None
                 }
-            } else {
-                None
             };
             if let Some(record) = ready {
                 let store = watch.completion.as_ref().context("completion store not bound")?.clone();
@@ -715,9 +747,16 @@ fn supervise(args: &Args, launch: Launch, prebound: Option<&PreboundSession>) ->
         match due {
             Some(update::gate::Apply::Plugins) => {
                 let revision = watcher.revision();
-                match host.apply() {
-                    Ok(()) => watcher.applied(revision),
-                    Err(error) => watch.report(format!("could not update {}: {error}", watch.launch.host.name())),
+                if let Some(revision) = revision {
+                    match host.apply(&watch.launch, &revision) {
+                        Ok(true) => watcher.applied(Some(revision)),
+                        Ok(false) => {}
+                        Err(error) => watch.report(format!(
+                            "could not update {}: {:#}",
+                            watch.launch.host.name(),
+                            anyhow::Error::new(error)
+                        )),
+                    }
                 }
             }
             Some(update::gate::Apply::Binary) => {
@@ -777,6 +816,37 @@ mod tests {
     }
 
     #[test]
+    fn registration_waiting_is_reported_once_only_after_its_grace() {
+        let start = std::time::Instant::now();
+        let deadline = start + super::REGISTRATION_REPORT_GRACE;
+        let mut watch = super::Watch {
+            launch: launch(),
+            marks: PathBuf::new(),
+            poll: std::time::Duration::ZERO,
+            idle: std::time::Duration::ZERO,
+            input_idle: std::time::Duration::ZERO,
+            next_poll: start,
+            reported: std::collections::HashSet::new(),
+            completion: None,
+            wrapper_started_at: String::new(),
+            registration_report_at: deadline,
+            revision: None,
+            ready_since: None,
+            pinned: None,
+            rollout: None,
+            next_lookup: start,
+        };
+        watch.awaiting_registration(start);
+        watch.awaiting_registration(deadline - std::time::Duration::from_nanos(1));
+        assert!(watch.reported.is_empty());
+        watch.awaiting_registration(deadline);
+        watch.awaiting_registration(deadline + super::REGISTRATION_REPORT_GRACE);
+        assert_eq!(watch.reported.len(), 1);
+        assert!(watch.reported.contains("still awaiting native session registration"));
+        assert!(watch.completion.is_none());
+    }
+
+    #[test]
     fn item_reference_survives_handover_with_the_entire_resume_command() {
         let mut launch = launch();
         launch.item = Some(crate::domain::item::Reference::parse("azure-devops:dev.azure.com/contoso:461").unwrap());
@@ -815,6 +885,7 @@ mod tests {
             launch.cwd.clone().into_os_string(),
             OsString::from("resume"),
             OsString::from("123e4567-e89b-12d3-a456-426614174000"),
+            OsString::from("--no-daemon"),
         ]);
         assert_eq!(
             prebound_session(&without_prompt, &launch).unwrap().unwrap().handle,
@@ -827,6 +898,8 @@ mod tests {
             launch.cwd.clone().into_os_string(),
             OsString::from("resume"),
             OsString::from("123e4567-e89b-12d3-a456-426614174000"),
+            OsString::from("--no-daemon"),
+            OsString::from("--dangerously-bypass-hook-trust"),
             OsString::from("--"),
             OsString::from("Prompt"),
         ]);
@@ -840,8 +913,7 @@ mod tests {
             vec!["--model", "chosen"],
             vec!["-c", "model_reasoning_effort=xhigh"],
             vec!["--model", "chosen", "-c", "model_reasoning_effort=high"],
-            vec!["--model", "chosen", "-c", "model_reasoning_effort=high", "--remote", "unix://"],
-            vec!["--remote", "unix://"],
+            vec![],
         ] {
             let mut agent = vec![
                 executable(),
@@ -851,7 +923,7 @@ mod tests {
                 "123e4567-e89b-12d3-a456-426614174000".into(),
             ];
             agent.extend(overrides.into_iter().map(OsString::from));
-            agent.extend(["--".into(), "--model=literal-prompt".into()]);
+            agent.extend(["--no-daemon".into(), "--".into(), "--model=literal-prompt".into()]);
             assert!(prebound_session(&prebound_args(agent), &launch).is_ok());
         }
         for overrides in [
@@ -861,6 +933,7 @@ mod tests {
             vec!["-c", "approval_policy=never"],
             vec!["--last"],
             vec!["--model", "chosen", "--model", "other"],
+            vec!["--remote", "unix://"],
             vec!["--remote", "ws://localhost:9000"],
             vec!["--remote", "unix:///another-daemon.sock"],
         ] {
@@ -872,6 +945,7 @@ mod tests {
                 "123e4567-e89b-12d3-a456-426614174000".into(),
             ];
             agent.extend(overrides.into_iter().map(OsString::from));
+            agent.push("--no-daemon".into());
             assert!(prebound_session(&prebound_args(agent), &launch).is_err());
         }
     }
@@ -886,6 +960,7 @@ mod tests {
                 launch.cwd.clone().into_os_string(),
                 OsString::from("resume"),
                 OsString::from("123e4567-e89b-12d3-a456-426614174000"),
+                OsString::from("--no-daemon"),
                 OsString::from("--"),
                 OsString::from(prompt),
             ]);
@@ -896,12 +971,21 @@ mod tests {
     #[test]
     fn prebound_session_rejects_undelimited_or_extra_arguments() {
         let launch = launch();
+        let missing_embedded = prebound_args(vec![
+            executable(),
+            "--cd".into(),
+            launch.cwd.clone().into_os_string(),
+            "resume".into(),
+            "123e4567-e89b-12d3-a456-426614174000".into(),
+        ]);
+        assert!(prebound_session(&missing_embedded, &launch).is_err());
         let bare_prompt = prebound_args(vec![
             executable(),
             OsString::from("--cd"),
             launch.cwd.clone().into_os_string(),
             OsString::from("resume"),
             OsString::from("123e4567-e89b-12d3-a456-426614174000"),
+            OsString::from("--no-daemon"),
             OsString::from("Prompt"),
         ]);
         assert!(prebound_session(&bare_prompt, &launch).is_err());
@@ -912,6 +996,7 @@ mod tests {
             launch.cwd.clone().into_os_string(),
             OsString::from("resume"),
             OsString::from("123e4567-e89b-12d3-a456-426614174000"),
+            OsString::from("--no-daemon"),
             OsString::from("--model=other"),
         ]);
         assert!(prebound_session(&bare_option, &launch).is_err());
@@ -922,6 +1007,7 @@ mod tests {
             launch.cwd.clone().into_os_string(),
             OsString::from("resume"),
             OsString::from("123e4567-e89b-12d3-a456-426614174000"),
+            OsString::from("--no-daemon"),
             OsString::from("--"),
         ]);
         assert!(prebound_session(&bare_delimiter, &launch).is_err());
@@ -932,6 +1018,7 @@ mod tests {
             launch.cwd.clone().into_os_string(),
             OsString::from("resume"),
             OsString::from("123e4567-e89b-12d3-a456-426614174000"),
+            OsString::from("--no-daemon"),
             OsString::from("--"),
             OsString::from("Prompt"),
             OsString::from("extra"),

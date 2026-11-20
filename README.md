@@ -224,6 +224,11 @@ defaults to the repository or worktree folder name, with a numeric suffix while 
 it. Only the managed session's own agent can change its completion state; inherited environment variables
 alone do not establish ownership.
 
+Initial registration is pending while the native host starts. If TJ reports that it is still awaiting
+native session registration, check that Agent is enabled and its SessionStart hook succeeded. Invalid
+bindings and Store errors are reported immediately. Exiting without a verified binding leaves managed
+completion unverified and preserves the provider's exit code.
+
 In a repository selecting TJ plugins, startup invokes `tj prepare` to check selected plugins and the
 standards index before the host reads instructions. Startup and refresh leave authored instructions and
 repository settings untouched. Drift reports an explicit `tj prepare --host <host> --cwd <path> --write`

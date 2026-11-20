@@ -68,7 +68,7 @@ fn active(value: &Value, subject: &str) -> Result<()> {
     Ok(())
 }
 
-fn exact_launch(data: &Value, launch: &Launch, wrapper_pid: u32, wrapper_started_at: &str) -> Result<()> {
+pub(super) fn exact_launch(data: &Value, launch: &Launch, wrapper_pid: u32, wrapper_started_at: &str) -> Result<()> {
     let row = &data["launch"];
     let cwd = launch.cwd.to_str().context("launch cwd is not UTF-8")?;
     if text(row, "launch_id")? != launch.id
