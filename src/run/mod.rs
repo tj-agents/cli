@@ -129,12 +129,6 @@ fn preparation(launch: &Launch, directory: &Path, arguments: &[OsString]) -> Res
     Ok(())
 }
 
-fn prepare(launch: &Launch, directory: &Path, arguments: &[OsString]) {
-    if let Err(error) = preparation(launch, directory, arguments) {
-        eprintln!("TJ: repository standards preparation failed: {error:#}");
-    }
-}
-
 /// The agent's SessionStart registers against this row, so it must exist before the agent starts.
 fn record_launch(launch: &Launch, parent: Option<&str>, wrapper_pid: u32, wrapper_started_at: &str) -> Result<()> {
     let mut failure = None;
@@ -263,8 +257,12 @@ fn prebound_session(args: &Args, launch: &Launch) -> Result<Option<PreboundSessi
     Ok(Some(PreboundSession { handle: handle.clone() }))
 }
 
-fn end_not_started(launch: &Launch, prebound: &PreboundSession, wrapper_pid: u32, wrapper_started_at: &str) {
-    if let Err(error) = store::end_not_started(launch, &prebound.handle, wrapper_pid, wrapper_started_at) {
+fn end_not_started(launch: &Launch, prebound: Option<&PreboundSession>, wrapper_pid: u32, wrapper_started_at: &str) {
+    let result = match prebound {
+        Some(session) => store::end_not_started(launch, &session.handle, wrapper_pid, wrapper_started_at),
+        None => store::end_not_started_unbound(launch, wrapper_pid, wrapper_started_at),
+    };
+    if let Err(error) = result {
         eprintln!("TJ: could not mark unstarted launch {}: {error:#}", launch.id);
     }
 }
@@ -498,19 +496,22 @@ fn supervise(args: &Args, launch: Launch, prebound: Option<&PreboundSession>) ->
     }
     if let Err(error) = record_launch(&launch, args.parent.as_deref(), pid, &started_at) {
         if let Some(prebound) = prebound {
-            end_not_started(&launch, prebound, pid, &started_at);
+            end_not_started(&launch, Some(prebound), pid, &started_at);
             return Err(error);
         }
         return Err(error).context("managed launch was not recorded; the native host was not started");
     }
     if let Some(prebound) = prebound {
         if let Err(error) = store::prebind(&launch, &prebound.handle, pid, &started_at) {
-            end_not_started(&launch, prebound, pid, &started_at);
+            end_not_started(&launch, Some(prebound), pid, &started_at);
             return Err(error);
         }
     }
     // Ensure the native service before Linux adopts or Windows owns TUI descendants.
     let prepare_host = || {
+        if selected {
+            preparation(&launch, command_cwd, &args.agent).context("repository standards preparation failed")?;
+        }
         let host = update::host(launch.host, &args.agent, command_cwd)?;
         agent::prepare_wrapper().context("could not prepare the console")?;
         Ok(host)
@@ -518,20 +519,13 @@ fn supervise(args: &Args, launch: Launch, prebound: Option<&PreboundSession>) ->
     let host = match prepare_host() {
         Ok(host) => host,
         Err(error) => {
-            if let Some(prebound) = prebound {
-                end_not_started(&launch, prebound, pid, &started_at);
-            } else {
-                let _ = store::end_not_started_unbound(&launch, pid, &started_at);
-            }
+            end_not_started(&launch, prebound, pid, &started_at);
             return Err(error);
         }
     };
     let upstream =
         if selected { update::upstream::start(launch.host, &launch.cwd, args.update_url.clone()) } else { None };
     mark_open(&launch.id, true);
-    if selected {
-        prepare(&launch, command_cwd, &args.agent);
-    }
     match upstream.map(std::thread::JoinHandle::join) {
         Some(Ok(Ok(Some(line)))) => eprintln!("TJ: {line}"),
         Some(Ok(Err(error))) => {
@@ -544,9 +538,7 @@ fn supervise(args: &Args, launch: Launch, prebound: Option<&PreboundSession>) ->
     {
         Ok(agent) => agent,
         Err(error) => {
-            if let Some(prebound) = prebound {
-                end_not_started(&launch, prebound, pid, &started_at);
-            }
+            end_not_started(&launch, prebound, pid, &started_at);
             return Err(error);
         }
     };

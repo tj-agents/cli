@@ -1582,15 +1582,32 @@ fn repository_preparation_finishes_before_the_agent_starts() {
 }
 
 #[test]
-fn repository_preparation_failure_warns_and_still_starts_the_agent() {
-    let sandbox = sandbox();
-    select_tj_agents_checked(&sandbox);
-    std::fs::write(sandbox.stubs.join("prepare-failure"), "failed").unwrap();
-    let child = start(&sandbox, "prepare-failed", "claude", "exit", "10");
-    let output = finish(child, Duration::from_secs(30));
-    assert_eq!(output.status.code(), Some(3));
-    assert!(String::from_utf8_lossy(&output.stderr).contains("standards preparation failed"));
-    assert!(log(&sandbox, "dummy.log").contains("agent prepare-failed"));
+fn repository_preparation_failure_ends_the_launch_before_starting_either_host() {
+    for host in ["claude", "codex"] {
+        let sandbox = sandbox();
+        select_tj_agents_checked(&sandbox);
+        std::fs::write(sandbox.stubs.join("prepare-failure"), "failed").unwrap();
+        let launch = "prepare-failed";
+        // Before SessionStart the ordinary launch has a wrapper but no session binding.
+        let setup = serde_json::json!({"host":host, "session":PREBOUND});
+        std::fs::write(sandbox.stubs.join("agent-store-prebind.json"), setup.to_string()).unwrap();
+        let args = if host == "codex" {
+            prebound_arguments_with_prompt(&sandbox, launch, "hold receipt fixture")
+        } else {
+            run_arguments(&sandbox, launch, host, "exit", "10")
+        };
+        let output = finish(spawn(&sandbox, &args, &sandbox.root), Duration::from_secs(30));
+        assert!(!output.status.success());
+        let error = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            error.contains("repository standards preparation failed")
+                && error.contains("simulated preparation failure"),
+            "{error}"
+        );
+        assert!(log(&sandbox, "dummy.log").is_empty());
+        assert!(log(&sandbox, "maintenance.jsonl").is_empty());
+        assert!(log(&sandbox, "stubs/agent-store.log").contains("end --launch-id prepare-failed --reason not_started"));
+    }
 }
 
 #[test]

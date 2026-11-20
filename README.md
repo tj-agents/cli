@@ -235,7 +235,7 @@ completion unverified and preserves the provider's exit code.
 In a repository selecting TJ plugins, startup invokes `tj prepare` to check selected plugins and the
 standards index before the host reads instructions. Startup and refresh leave authored instructions and
 repository settings untouched. Drift reports an explicit `tj prepare --host <host> --cwd <path> --write`
-command. Preparation failures warn and allow the provider to start, but missing lifecycle evidence leaves
+command. Preparation failures end the managed launch before the provider starts. Missing lifecycle evidence leaves
 completion unverified. Install and enable Agent in that repository for managed completion.
 
 Work-item launches accept a full tracker reference or URL. A bare id such as `461` or `#461` is resolved
