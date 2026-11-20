@@ -255,7 +255,54 @@ def draft(
         assert ui.pid() == pid
 
 
-def run(native: Path, root: Path, port: int, environment: dict[str, str]) -> None:
+def prepare(root: Path, native: Path | None) -> tuple[Path, Path]:
+    if native is None:
+        package = root / "npm"
+        subprocess.run(
+            [
+                shutil.which("npm") or "npm",
+                "install",
+                "--prefix",
+                str(package),
+                "--ignore-scripts",
+                "--no-audit",
+                "--no-fund",
+                f"@openai/codex@{VERSION}",
+            ],
+            check=True,
+            timeout=120,
+        )
+        (native,) = package.glob(
+            "node_modules/**/vendor/*/bin/codex.exe"
+            if os.name == "nt"
+            else "node_modules/**/vendor/*/bin/codex"
+        )
+    # Cargo's Windows child Job prevents a new native daemon from detaching.
+    build = subprocess.check_output(
+        [
+            "cargo",
+            "test",
+            "--locked",
+            "--bin",
+            "tj",
+            "--no-run",
+            "--message-format=json",
+        ],
+        text=True,
+        timeout=240,
+    )
+    (driver,) = [
+        row["executable"]
+        for line in build.splitlines()
+        if (row := json.loads(line)).get("executable") and row["target"]["name"] == "tj"
+    ]
+
+    return native.resolve(strict=True), Path(driver).resolve(strict=True)
+
+
+def run(
+    native: Path, driver: Path, root: Path, port: int, environment: dict[str, str]
+) -> None:
     version = subprocess.check_output(
         [native, "--version"], text=True, timeout=10
     ).strip()
@@ -324,26 +371,6 @@ trust_level = "trusted"
         timeout=60,
     )
     try:
-        # Cargo's Windows child Job prevents a new native daemon from detaching.
-        build = subprocess.check_output(
-            [
-                "cargo",
-                "test",
-                "--locked",
-                "--bin",
-                "tj",
-                "--no-run",
-                "--message-format=json",
-            ],
-            text=True,
-            timeout=240,
-        )
-        (driver,) = [
-            row["executable"]
-            for line in build.splitlines()
-            if (row := json.loads(line)).get("executable")
-            and row["target"]["name"] == "tj"
-        ]
 
         def check(test: str) -> None:
             subprocess.run(
@@ -387,8 +414,23 @@ trust_level = "trusted"
 def main() -> None:
     parser = argparse.ArgumentParser(__doc__)
     parser.add_argument("--native", type=Path)
+    parser.add_argument(
+        "--stage",
+        type=Path,
+        help="Prepare the pinned package and test driver for CI",
+    )
+    parser.add_argument(
+        "--assets", type=Path, help="Read prepared native package and driver paths"
+    )
     parser.add_argument("--install", choices=["1.0.0", "2.0.0", "3.0.0"])
     args = parser.parse_args()
+    if args.stage:
+        native, driver = prepare(args.stage, args.native)
+        write(
+            args.stage / "assets.json",
+            json.dumps({"native": str(native), "driver": str(driver)}),
+        )
+        return
     if args.install:
         install(
             Path(os.environ["TJ_FIXTURE_CODEX"]),
@@ -401,33 +443,17 @@ def main() -> None:
         http.server.ThreadingHTTPServer(("127.0.0.1", 0), Provider) as provider,
     ):
         root = Path(scratch).resolve()
-        native = args.native
-        if native is None:
-            package = root / "npm"
-            subprocess.run(
-                [
-                    shutil.which("npm") or "npm",
-                    "install",
-                    "--prefix",
-                    str(package),
-                    "--ignore-scripts",
-                    "--no-audit",
-                    "--no-fund",
-                    f"@openai/codex@{VERSION}",
-                ],
-                check=True,
-                timeout=120,
-            )
-            (native,) = package.glob(
-                "node_modules/**/vendor/*/bin/codex.exe"
-                if os.name == "nt"
-                else "node_modules/**/vendor/*/bin/codex"
-            )
+        if args.assets:
+            assets = json.loads(args.assets.read_text(encoding="utf-8"))
+            native, driver = Path(assets["native"]), Path(assets["driver"])
+        else:
+            native, driver = prepare(root, args.native)
         worker = threading.Thread(target=provider.serve_forever, daemon=True)
         worker.start()
         try:
             run(
                 native.resolve(strict=True),
+                driver,
                 root,
                 provider.server_port,
                 dict(os.environ),
