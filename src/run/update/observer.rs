@@ -2,6 +2,7 @@ use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
@@ -18,6 +19,7 @@ use crate::host::Host;
 const POLL: Duration = Duration::from_secs(5);
 const UPSTREAM: Duration = Duration::from_secs(120);
 const START_TIMEOUT: Duration = Duration::from_secs(12);
+static WITHDRAWAL: AtomicU64 = AtomicU64::new(0);
 
 #[derive(clap::Args)]
 pub struct Args {
@@ -291,22 +293,22 @@ fn cycles<T>(
     }
 }
 
-fn withdraw(marker: &Path) -> Result<()> {
-    match fs::remove_file(marker) {
-        Ok(()) => Ok(()),
+fn withdraw(marker: &Path, remove: impl FnOnce(PathBuf) -> std::io::Result<()>) -> Result<()> {
+    // Retire the name before unlinking. On Windows a handle that outlives unlinking
+    // can leave the old name inaccessible until the last reader closes it.
+    let serial = WITHDRAWAL.fetch_add(1, Ordering::Relaxed);
+    let withdrawn = marker.with_extension(format!("withdrawn-{}-{serial}", std::process::id()));
+    match fs::rename(marker, &withdrawn) {
+        Ok(()) => remove(withdrawn).context("could not remove withdrawn observer readiness"),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error.into()),
+        Err(error) => Err(error).context("could not withdraw observer readiness"),
     }
 }
 
 fn foreground(args: &Args) -> Result<ExitCode> {
     let Some(_lock) = lock(&args.socket, true)? else { return Ok(ExitCode::from(1)) };
     let marker = ready_path(&args.socket)?;
-    match fs::remove_file(&marker) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e.into()),
-    }
+    withdraw(&marker, fs::remove_file)?;
     let socket_guard = SocketGuard::open(&args.socket)?;
     let socket = socket_guard.identity()?;
     let mut server =
@@ -343,7 +345,7 @@ fn foreground(args: &Args) -> Result<ExitCode> {
                 watcher,
                 (POLL, true),
                 || Ok(socket_identity(&args.socket)? == socket),
-                || withdraw(&marker),
+                || withdraw(&marker, fs::remove_file),
                 None,
             )
         },
@@ -417,6 +419,37 @@ mod tests {
         drop(owner);
         assert!(!owner_ready(&socket).unwrap());
         assert!(lock(&socket, true).unwrap().is_some());
+    }
+
+    #[test]
+    fn readiness_can_be_replaced_while_a_reader_holds_the_withdrawn_record() {
+        use std::io::Read;
+
+        let directory = tempfile::tempdir().unwrap();
+        let marker = ready_path(&directory.path().join("daemon.sock")).unwrap();
+        let mut retired_paths = Vec::new();
+        let mut verify_then_remove = |path: PathBuf| {
+            assert_eq!(fs::read(&marker).unwrap_err().kind(), std::io::ErrorKind::NotFound);
+            assert!(path.is_file());
+            fs::remove_file(&path)?;
+            retired_paths.push(path);
+            Ok(())
+        };
+        fs::write(&marker, "old").unwrap();
+        let mut reader = File::open(&marker).unwrap();
+        withdraw(&marker, &mut verify_then_remove).unwrap();
+        fs::write(&marker, "new").unwrap();
+        let mut second = File::open(&marker).unwrap();
+        withdraw(&marker, &mut verify_then_remove).unwrap();
+        fs::write(&marker, "current").unwrap();
+        assert_ne!(retired_paths[0], retired_paths[1]);
+        let mut prior = String::new();
+        reader.read_to_string(&mut prior).unwrap();
+        assert_eq!(prior, "old");
+        let mut next = String::new();
+        second.read_to_string(&mut next).unwrap();
+        assert_eq!(next, "new");
+        assert_eq!(fs::read_to_string(marker).unwrap(), "current");
     }
 
     #[test]
@@ -547,7 +580,7 @@ mod tests {
                         (Duration::from_millis(20), false),
                         || Ok(true),
                         || {
-                            withdraw(&marker_for_worker)?;
+                            withdraw(&marker_for_worker, fs::remove_file)?;
                             withdrawn_tx.send(()).unwrap();
                             Ok(())
                         },
