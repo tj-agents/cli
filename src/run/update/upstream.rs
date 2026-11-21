@@ -331,7 +331,7 @@ fn check(
             record_probe_failure(&state.log, &error)?;
             let child = spawn(host, cwd, state)?;
             // Empty means an unverified attempt, not a requested or successfully installed SHA.
-            let _ = fs::write(&state.started, "");
+            stamp(&state.started);
             return Ok(Some((None, child)));
         }
         Err(error) => return Err(error),
