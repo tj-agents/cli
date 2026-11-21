@@ -506,7 +506,7 @@ fn supervise(args: &Args, launch: Launch, prebound: Option<&PreboundSession>, ad
         .transpose()?;
     let command_cwd = args.command_cwd.as_deref().unwrap_or(&launch.cwd);
     let exe = std::env::current_exe().context("could not locate the tj executable")?;
-    let mut watcher = update::Watcher::new(exe, update::published(launch.host)?);
+    let mut watcher = update::Watcher::new(exe, update::publication::Publication::of(launch.host)?);
     let selected = tj_agents::selected(&launch.cwd);
     let marks = marks(&launch.id)?;
     let _ = std::fs::remove_dir_all(&marks);
@@ -721,10 +721,9 @@ fn supervise(args: &Args, launch: Launch, prebound: Option<&PreboundSession>, ad
             }
         }
         if upstream.as_ref().is_some_and(std::thread::JoinHandle::is_finished) {
-            match upstream.take().map(std::thread::JoinHandle::join) {
-                Some(Ok(Ok(Some(line)))) => eprintln!("TJ: {line}"),
-                Some(Ok(Err(error))) => watch.report(format!("could not check for tj-agents updates: {error}")),
-                _ => {}
+            // The agent owns the console now. The background updater logs its own outcome.
+            if let Some(Ok(Err(error))) = upstream.take().map(std::thread::JoinHandle::join) {
+                update::upstream::record_failure(watch.launch.host, error);
             }
         }
         if selected && upstream.is_none() && Instant::now() >= next_upstream {
