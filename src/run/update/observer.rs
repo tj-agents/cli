@@ -293,13 +293,13 @@ fn cycles<T>(
     }
 }
 
-fn withdraw(marker: &Path) -> Result<()> {
+fn withdraw(marker: &Path, remove: impl FnOnce(PathBuf) -> std::io::Result<()>) -> Result<()> {
     // Retire the name before unlinking. On Windows a handle that outlives unlinking
     // can leave the old name inaccessible until the last reader closes it.
     let serial = WITHDRAWAL.fetch_add(1, Ordering::Relaxed);
     let withdrawn = marker.with_extension(format!("withdrawn-{}-{serial}", std::process::id()));
     match fs::rename(marker, &withdrawn) {
-        Ok(()) => fs::remove_file(&withdrawn).context("could not remove withdrawn observer readiness"),
+        Ok(()) => remove(withdrawn).context("could not remove withdrawn observer readiness"),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error).context("could not withdraw observer readiness"),
     }
@@ -308,7 +308,7 @@ fn withdraw(marker: &Path) -> Result<()> {
 fn foreground(args: &Args) -> Result<ExitCode> {
     let Some(_lock) = lock(&args.socket, true)? else { return Ok(ExitCode::from(1)) };
     let marker = ready_path(&args.socket)?;
-    withdraw(&marker)?;
+    withdraw(&marker, fs::remove_file)?;
     let socket_guard = SocketGuard::open(&args.socket)?;
     let socket = socket_guard.identity()?;
     let mut server =
@@ -345,7 +345,7 @@ fn foreground(args: &Args) -> Result<ExitCode> {
                 watcher,
                 (POLL, true),
                 || Ok(socket_identity(&args.socket)? == socket),
-                || withdraw(&marker),
+                || withdraw(&marker, fs::remove_file),
                 None,
             )
         },
@@ -427,14 +427,21 @@ mod tests {
 
         let directory = tempfile::tempdir().unwrap();
         let marker = ready_path(&directory.path().join("daemon.sock")).unwrap();
+        let mut pending_removals = Vec::new();
+        let mut defer_remove = |path: PathBuf| {
+            assert_eq!(fs::read(&marker).unwrap_err().kind(), std::io::ErrorKind::NotFound);
+            assert!(path.is_file());
+            pending_removals.push(path);
+            Ok(())
+        };
         fs::write(&marker, "old").unwrap();
         let mut reader = File::open(&marker).unwrap();
-        withdraw(&marker).unwrap();
-        assert_eq!(fs::read(&marker).unwrap_err().kind(), std::io::ErrorKind::NotFound);
+        withdraw(&marker, &mut defer_remove).unwrap();
         fs::write(&marker, "new").unwrap();
         let mut second = File::open(&marker).unwrap();
-        withdraw(&marker).unwrap();
+        withdraw(&marker, &mut defer_remove).unwrap();
         fs::write(&marker, "current").unwrap();
+        assert_ne!(pending_removals[0], pending_removals[1]);
         let mut prior = String::new();
         reader.read_to_string(&mut prior).unwrap();
         assert_eq!(prior, "old");
@@ -572,7 +579,7 @@ mod tests {
                         (Duration::from_millis(20), false),
                         || Ok(true),
                         || {
-                            withdraw(&marker_for_worker)?;
+                            withdraw(&marker_for_worker, fs::remove_file)?;
                             withdrawn_tx.send(()).unwrap();
                             Ok(())
                         },
