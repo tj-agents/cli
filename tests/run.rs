@@ -520,6 +520,25 @@ fn publish(sandbox: &Sandbox, host: &str, revision: &str) {
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
 }
 
+#[test]
+fn an_if_stale_publish_rewrites_only_a_record_behind_its_revision() {
+    let cache = tempfile::tempdir().unwrap();
+    let record = cache.path().join("published").join("claude");
+    let publish = |revision: &str| {
+        let output = Command::new(env!("CARGO_BIN_EXE_tj"))
+            .args(["update", "--host", "claude", "--revision", revision, "--if-stale"])
+            .env("TJ_CACHE_DIR", cache.path())
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        std::fs::read_to_string(&record).unwrap()
+    };
+    let first = publish("a");
+    assert!(first.starts_with("a\n"), "{first}");
+    assert_eq!(publish("a"), first, "an up-to-date record was republished, reloading every tab");
+    assert!(publish("b").starts_with("b\n"));
+}
+
 fn set_store_list(stubs: &Path, command: &str, rows: serde_json::Value) {
     std::fs::write(
         stubs.join(format!("agent-store-{command}.json")),

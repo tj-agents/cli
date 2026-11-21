@@ -65,10 +65,21 @@ pub struct Args {
     /// What was installed, such as the plugin pins. Every publish is a new update, even of the same revision.
     #[arg(long)]
     revision: String,
+    /// Publish only when the recorded revision differs, as after an update that converged without changes.
+    #[arg(long)]
+    if_stale: bool,
+}
+
+/// The revision last published for a host: the first line of its record.
+fn recorded(published: &std::path::Path) -> Option<String> {
+    std::fs::read_to_string(published).ok()?.lines().next().map(|line| line.trim().to_owned())
 }
 
 pub fn publish(args: Args) -> Result<ExitCode> {
     let published = published(args.host)?;
+    if args.if_stale && recorded(&published).as_deref() == Some(args.revision.as_str()) {
+        return Ok(ExitCode::SUCCESS);
+    }
     let folder = published.parent().context("the published update has no folder")?;
     std::fs::create_dir_all(folder).context("could not create the published updates folder")?;
     let stamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos();
