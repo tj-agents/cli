@@ -96,14 +96,20 @@ fn modified(path: &Path) -> Option<SystemTime> {
     path.metadata().and_then(|meta| meta.modified()).ok()
 }
 
-/// Marks now in the file's modified time. Windows leaves it unchanged when empty content replaces empty content.
-fn stamp(path: &Path) {
-    let _ = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(path)
-        .and_then(|file| file.set_modified(SystemTime::now()));
+trait PathExt {
+    /// Marks now in the file's modified time. Windows leaves it unchanged when empty content replaces empty content.
+    fn stamp(&self);
+}
+
+impl PathExt for Path {
+    fn stamp(&self) {
+        let _ = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(self)
+            .and_then(|file| file.set_modified(SystemTime::now()));
+    }
 }
 
 fn recent(at: SystemTime, now: SystemTime, window: Duration) -> bool {
@@ -318,7 +324,7 @@ fn check(
     if !available(state)? {
         return Ok(None);
     }
-    stamp(&state.checked);
+    state.checked.stamp();
     let published = fs::read_to_string(&state.published).unwrap_or_default();
     let answer = match request(url, converged(&published)) {
         Ok(answer) => answer,
@@ -331,7 +337,7 @@ fn check(
             record_probe_failure(&state.log, &error)?;
             let child = spawn(host, cwd, state)?;
             // Empty means an unverified attempt, not a requested or successfully installed SHA.
-            stamp(&state.started);
+            state.started.stamp();
             return Ok(Some((None, child)));
         }
         Err(error) => return Err(error),
