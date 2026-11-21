@@ -427,21 +427,22 @@ mod tests {
 
         let directory = tempfile::tempdir().unwrap();
         let marker = ready_path(&directory.path().join("daemon.sock")).unwrap();
-        let mut pending_removals = Vec::new();
-        let mut defer_remove = |path: PathBuf| {
+        let mut retired_paths = Vec::new();
+        let mut verify_then_remove = |path: PathBuf| {
             assert_eq!(fs::read(&marker).unwrap_err().kind(), std::io::ErrorKind::NotFound);
             assert!(path.is_file());
-            pending_removals.push(path);
+            fs::remove_file(&path)?;
+            retired_paths.push(path);
             Ok(())
         };
         fs::write(&marker, "old").unwrap();
         let mut reader = File::open(&marker).unwrap();
-        withdraw(&marker, &mut defer_remove).unwrap();
+        withdraw(&marker, &mut verify_then_remove).unwrap();
         fs::write(&marker, "new").unwrap();
         let mut second = File::open(&marker).unwrap();
-        withdraw(&marker, &mut defer_remove).unwrap();
+        withdraw(&marker, &mut verify_then_remove).unwrap();
         fs::write(&marker, "current").unwrap();
-        assert_ne!(pending_removals[0], pending_removals[1]);
+        assert_ne!(retired_paths[0], retired_paths[1]);
         let mut prior = String::new();
         reader.read_to_string(&mut prior).unwrap();
         assert_eq!(prior, "old");
