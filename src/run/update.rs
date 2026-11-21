@@ -5,20 +5,18 @@ pub(crate) mod gate;
 #[cfg(test)]
 mod native_tests;
 pub(crate) mod observer;
+pub(crate) mod publication;
 mod refresh;
 pub(crate) mod upstream;
 mod watch;
 
-use std::path::PathBuf;
 use std::process::ExitCode;
-use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use tj_cli::process::agent;
 
 use crate::host::Host;
 use crate::native_bridge;
-use crate::paths;
 use crate::run::Launch;
 pub(crate) use watch::Watcher;
 
@@ -49,10 +47,6 @@ pub(crate) fn host(host: Host, arguments: &[std::ffi::OsString], cwd: &std::path
     })
 }
 
-pub(crate) fn published(host: Host) -> Result<PathBuf> {
-    Ok(paths::cache_dir()?.join("published").join(host.name()))
-}
-
 pub(crate) fn plugins_due(host: &dyn Update, agent: u32, graces: gate::Graces) -> bool {
     gate::decide(host.activity(agent), agent::input_idle(), graces)
 }
@@ -70,30 +64,10 @@ pub struct Args {
     if_stale: bool,
 }
 
-/// The revision last published for a host: the first line of its record.
-fn recorded(published: &std::path::Path) -> Option<String> {
-    std::fs::read_to_string(published).ok()?.lines().next().map(|line| line.trim().to_owned())
-}
-
 pub fn publish(args: Args) -> Result<ExitCode> {
-    let published = published(args.host)?;
-    if args.if_stale && recorded(&published).as_deref() == Some(args.revision.as_str()) {
-        return Ok(ExitCode::SUCCESS);
+    let publication = publication::Publication::of(args.host)?;
+    if !(args.if_stale && publication.revision().as_deref() == Some(args.revision.as_str())) {
+        publication.announce(&args.revision)?;
     }
-    let folder = published.parent().context("the published update has no folder")?;
-    std::fs::create_dir_all(folder).context("could not create the published updates folder")?;
-    let stamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos();
-    let staged = folder.join(format!("{}.{}", args.host.name(), std::process::id()));
-    std::fs::write(
-        &staged,
-        format!(
-            "{}
-{stamp}.{}",
-            args.revision,
-            std::process::id()
-        ),
-    )
-    .context("could not stage the published update")?;
-    std::fs::rename(&staged, &published).context("could not publish the update")?;
     Ok(ExitCode::SUCCESS)
 }

@@ -7,6 +7,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use tj_cli::process::bounded;
 
+use super::publication::{Commit, Publication};
 use crate::host::Host;
 use crate::paths;
 
@@ -20,7 +21,17 @@ const UPDATE_LIFETIME: Duration = Duration::from_secs(300);
 #[derive(Debug, PartialEq, Eq)]
 enum Answer {
     Unchanged,
-    Changed(String),
+    Changed(Commit),
+}
+
+impl Answer {
+    /// The commit to install, unless an install of it already started within the retry window.
+    fn install(self, started: Option<(&str, SystemTime)>, now: SystemTime) -> Option<Commit> {
+        let Self::Changed(commit) = self else { return None };
+        let retrying =
+            started.is_some_and(|(previous, at)| previous == commit.as_str() && at.is_recent(now, RETRY_AFTER));
+        (!retrying).then_some(commit)
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -49,7 +60,7 @@ struct State {
     unsettled: PathBuf,
     lock: PathBuf,
     log: PathBuf,
-    published: PathBuf,
+    publication: Publication,
 }
 
 impl State {
@@ -64,7 +75,7 @@ impl State {
             unsettled: file("unsettled"),
             lock: file("lock"),
             log: file("log"),
-            published: cache.join("published").join(host.name()),
+            publication: Publication::new(cache, host),
             folder,
         }
     }
@@ -74,7 +85,7 @@ struct Lock(PathBuf);
 
 impl Lock {
     fn take(path: &Path, now: SystemTime) -> Option<Self> {
-        if modified(path).is_some_and(|at| !recent(at, now, LOCK_STALE)) {
+        if path.modified().is_some_and(|at| !at.is_recent(now, LOCK_STALE)) {
             let _ = fs::remove_file(path);
         }
         OpenOptions::new().write(true).create_new(true).open(path).ok().map(|_| Self(path.to_path_buf()))
@@ -87,21 +98,17 @@ impl Drop for Lock {
     }
 }
 
-/// The marketplace commit this host's plugins last converged to, as published by `tj update`.
-fn converged(published: &str) -> Option<&str> {
-    published.lines().next().map(str::trim).filter(|sha| sha.len() == 40 && sha.bytes().all(|b| b.is_ascii_hexdigit()))
-}
-
-fn modified(path: &Path) -> Option<SystemTime> {
-    path.metadata().and_then(|meta| meta.modified()).ok()
-}
-
 trait PathExt {
+    fn modified(&self) -> Option<SystemTime>;
     /// Marks now in the file's modified time. Windows leaves it unchanged when empty content replaces empty content.
     fn stamp(&self);
 }
 
 impl PathExt for Path {
+    fn modified(&self) -> Option<SystemTime> {
+        self.metadata().and_then(|meta| meta.modified()).ok()
+    }
+
     fn stamp(&self) {
         let _ = OpenOptions::new()
             .write(true)
@@ -112,30 +119,30 @@ impl PathExt for Path {
     }
 }
 
-fn recent(at: SystemTime, now: SystemTime, window: Duration) -> bool {
-    now.duration_since(at).is_ok_and(|age| age < window) || at > now
+trait SystemTimeExt {
+    /// Within `window` before `now`. A time after `now`, from a clock that moved back, also counts.
+    fn is_recent(&self, now: SystemTime, window: Duration) -> bool;
 }
 
-/// The commit to install, unless an install of it already started within the retry window.
-fn install(answer: Answer, started: Option<(&str, SystemTime)>, now: SystemTime) -> Option<String> {
-    let Answer::Changed(sha) = answer else { return None };
-    let retrying = started.is_some_and(|(previous, at)| previous == sha && recent(at, now, RETRY_AFTER));
-    (!retrying).then_some(sha)
+impl SystemTimeExt for SystemTime {
+    fn is_recent(&self, now: SystemTime, window: Duration) -> bool {
+        now.duration_since(*self).is_ok_and(|age| age < window) || *self > now
+    }
 }
 
-fn request(url: &str, etag: Option<&str>) -> Result<Answer, CheckError> {
+fn request(url: &str, etag: Option<&Commit>) -> Result<Answer, CheckError> {
     let agent: ureq::Agent =
         ureq::Agent::config_builder().timeout_global(Some(TIMEOUT)).http_status_as_error(false).build().into();
     let mut request = agent.get(url).header("Accept", "application/vnd.github.sha").header("User-Agent", "tj");
-    if let Some(sha) = etag {
-        request = request.header("If-None-Match", format!("\"{sha}\""));
+    if let Some(commit) = etag {
+        request = request.header("If-None-Match", format!("\"{}\"", commit.as_str()));
     }
     let mut response = request.call().map_err(|error| CheckError::Request(Box::new(error)))?;
     match response.status().as_u16() {
         304 => Ok(Answer::Unchanged),
         200 => {
             let body = response.body_mut().read_to_string().map_err(|error| CheckError::Request(Box::new(error)))?;
-            converged(&body).map(|sha| Answer::Changed(sha.to_owned())).ok_or(CheckError::Commit)
+            Commit::parse(&body).map(Answer::Changed).map_err(|_| CheckError::Commit)
         }
         status => Err(CheckError::Status(status)),
     }
@@ -191,163 +198,172 @@ impl Running {
     }
 }
 
-fn unsettled(state: &State, reason: impl Into<String>) -> CheckError {
-    let reason = reason.into();
-    if fs::read_to_string(&state.unsettled).ok().as_deref() != Some(&reason) {
-        let _ = fs::write(&state.unsettled, &reason);
-        if let Ok(mut log) = OpenOptions::new().create(true).append(true).open(&state.log) {
-            let _ = writeln!(log, "updater cleanup is unverified; retries blocked: {reason}");
+impl State {
+    /// Appends one line to the updater log; diagnostics there never reach the agent's console.
+    fn log(&self, line: &str) -> std::io::Result<()> {
+        let mut file = OpenOptions::new().create(true).append(true).open(&self.log)?;
+        writeln!(file, "{line}")
+    }
+
+    fn unsettle(&self, reason: impl Into<String>) -> CheckError {
+        let reason = reason.into();
+        if fs::read_to_string(&self.unsettled).ok().as_deref() != Some(&reason) {
+            let _ = fs::write(&self.unsettled, &reason);
+            let _ = self.log(&format!("updater cleanup is unverified; retries blocked: {reason}"));
         }
+        CheckError::Unsettled(reason)
     }
-    CheckError::Unsettled(reason)
-}
 
-fn settled(state: &State, attempt: &str) -> Result<serde_json::Value, CheckError> {
-    let receipt: serde_json::Value = fs::read(&state.receipt)
-        .ok()
-        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-        .ok_or_else(|| unsettled(state, "missing or invalid process-tree cleanup receipt"))?;
-    if receipt["attempt"] != attempt
-        || receipt["settled"] != true
-        || !matches!(receipt["state"].as_str(), Some("exited" | "timed_out" | "cancelled" | "failed"))
-        || receipt["code"].as_u64().is_none()
-    {
-        return Err(unsettled(state, format!("no matching settled receipt for attempt {attempt}: {receipt}")));
-    }
-    let _ = fs::remove_file(&state.unsettled);
-    Ok(receipt)
-}
-
-fn available(state: &State) -> Result<bool, CheckError> {
-    if let Some(running) = Running::read(&state.running).map_err(|error| unsettled(state, error.to_string()))? {
-        if running.live().map_err(|error| unsettled(state, error.to_string()))? {
-            return Ok(false);
+    fn settled(&self, attempt: &str) -> Result<serde_json::Value, CheckError> {
+        let receipt: serde_json::Value = fs::read(&self.receipt)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .ok_or_else(|| self.unsettle("missing or invalid process-tree cleanup receipt"))?;
+        if receipt["attempt"] != attempt
+            || receipt["settled"] != true
+            || !matches!(receipt["state"].as_str(), Some("exited" | "timed_out" | "cancelled" | "failed"))
+            || receipt["code"].as_u64().is_none()
+        {
+            return Err(self.unsettle(format!("no matching settled receipt for attempt {attempt}: {receipt}")));
         }
-        settled(state, &running.attempt)?;
-    } else if state.unsettled.exists() {
-        return Err(CheckError::Unsettled(fs::read_to_string(&state.unsettled).unwrap_or_default()));
+        let _ = fs::remove_file(&self.unsettled);
+        Ok(receipt)
     }
-    Ok(true)
-}
 
-fn spawn(host: Host, cwd: &Path, state: &State) -> Result<OwnedUpdate, CheckError> {
-    let log = OpenOptions::new().create(true).append(true).open(&state.log).map_err(CheckError::Spawn)?;
-    let errors = log.try_clone().map_err(CheckError::Spawn)?;
-    let attempt = crate::run::generated_id().map_err(|error| CheckError::Record(std::io::Error::other(error)))?;
-    // Persist the attempt before creating any writer. A crash in spawn must never authorize a retry.
-    let mut running = Running { attempt: attempt.clone(), process: None };
-    running.record(&state.running)?;
-    let helper = std::env::current_exe()
-        .map_err(CheckError::Spawn)?
-        .with_file_name(format!("tj_hook{}", std::env::consts::EXE_SUFFIX));
-    let mut command = Command::new(helper);
-    command
-        .arg("--bounded")
-        .arg(UPDATE_LIFETIME.as_millis().to_string())
-        .arg(&state.receipt)
-        .arg(&attempt)
-        .args(["--", "tj-plugins", "update", "--host", host.name()])
-        .current_dir(cwd)
-        .stdin(Stdio::null())
-        .stdout(log)
-        .stderr(errors);
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        command.creation_flags(0x0800_0000);
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        command.process_group(0);
-    }
-    let child = command.spawn().map_err(|error| {
-        let outcome = bounded::Outcome::Failed(std::io::Error::new(error.kind(), error.to_string()));
-        let _ = outcome.record(&state.receipt, &attempt);
-        CheckError::Spawn(error)
-    })?;
-    let owned = OwnedUpdate { child, state: state.clone(), attempt, finished: false };
-    running.process = tj_cli::process::agent::started_at(owned.child.id())
-        .map_err(CheckError::Record)?
-        .map(|started| (owned.child.id(), started));
-    running.record(&state.running)?;
-    Ok(owned)
-}
-
-fn record_exit(state: &State, attempt: &str) {
-    if let Ok(receipt) = settled(state, attempt)
-        && receipt["code"] != 0
-        && let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&state.log)
-    {
-        let _ = writeln!(
-            file,
-            "native updater failed ({}; code {}); process tree settled; ten-minute retry window: {}",
-            receipt["state"], receipt["code"], receipt["error"]
-        );
-    }
-}
-
-/// Exceptions can contain credentials or proxy URLs; record only a safe transport category.
-fn record_probe_failure(log: &Path, error: &ureq::Error) -> Result<(), CheckError> {
-    let category = match error {
-        ureq::Error::Timeout(_) => "timeout",
-        ureq::Error::HostNotFound => "DNS",
-        ureq::Error::Tls(_) | ureq::Error::Rustls(_) => "TLS",
-        ureq::Error::Io(_) | ureq::Error::ConnectionFailed => "connection",
-        ureq::Error::InvalidProxyUrl | ureq::Error::ConnectProxyFailed(_) => "proxy",
-        _ => "request",
-    };
-    let mut file = OpenOptions::new().create(true).append(true).open(log).map_err(CheckError::Record)?;
-    writeln!(
-        file,
-        "{} GitHub probe unavailable ({category}); delegating verification to the native updater",
-        chrono::Local::now().format("%Y-%m-%d %H:%M:%S")
-    )
-    .map_err(CheckError::Record)
-}
-
-fn check(
-    state: &State,
-    host: Host,
-    cwd: &Path,
-    url: &str,
-) -> Result<Option<(Option<String>, OwnedUpdate)>, CheckError> {
-    let now = SystemTime::now();
-    if modified(&state.checked).is_some_and(|at| recent(at, now, CHECKED_FOR)) {
-        return Ok(None);
-    }
-    let _ = fs::create_dir_all(&state.folder);
-    let Some(_lock) = Lock::take(&state.lock, now) else { return Ok(None) };
-    if modified(&state.checked).is_some_and(|at| recent(at, now, CHECKED_FOR)) {
-        return Ok(None);
-    }
-    if !available(state)? {
-        return Ok(None);
-    }
-    state.checked.stamp();
-    let published = fs::read_to_string(&state.published).unwrap_or_default();
-    let answer = match request(url, converged(&published)) {
-        Ok(answer) => answer,
-        Err(CheckError::Request(error)) => {
-            // The native updater already handles unknown freshness through its configured credentials
-            // and native marketplace refresh. A failed fast probe must not prevent that recovery.
-            if modified(&state.started).is_some_and(|at| recent(at, now, RETRY_AFTER)) {
-                return Ok(None);
+    fn available(&self) -> Result<bool, CheckError> {
+        if let Some(running) = Running::read(&self.running).map_err(|error| self.unsettle(error.to_string()))? {
+            if running.live().map_err(|error| self.unsettle(error.to_string()))? {
+                return Ok(false);
             }
-            record_probe_failure(&state.log, &error)?;
-            let child = spawn(host, cwd, state)?;
-            // Empty means an unverified attempt, not a requested or successfully installed SHA.
-            state.started.stamp();
-            return Ok(Some((None, child)));
+            self.settled(&running.attempt)?;
+        } else if self.unsettled.exists() {
+            return Err(CheckError::Unsettled(fs::read_to_string(&self.unsettled).unwrap_or_default()));
         }
-        Err(error) => return Err(error),
-    };
-    let previous = fs::read_to_string(&state.started).unwrap_or_default();
-    let started = modified(&state.started).map(|at| (previous.trim(), at));
-    let Some(sha) = install(answer, started, now) else { return Ok(None) };
-    let child = spawn(host, cwd, state)?;
-    let _ = fs::write(&state.started, &sha);
-    Ok(Some((Some(format!("tj-agents changed upstream; updating {} plugins in the background", host.name())), child)))
+        Ok(true)
+    }
+
+    fn spawn(&self, host: Host, cwd: &Path) -> Result<OwnedUpdate, CheckError> {
+        let log = OpenOptions::new().create(true).append(true).open(&self.log).map_err(CheckError::Spawn)?;
+        let errors = log.try_clone().map_err(CheckError::Spawn)?;
+        let attempt = crate::run::generated_id().map_err(|error| CheckError::Record(std::io::Error::other(error)))?;
+        // Persist the attempt before creating any writer. A crash in spawn must never authorize a retry.
+        let mut running = Running { attempt: attempt.clone(), process: None };
+        running.record(&self.running)?;
+        let helper = std::env::current_exe()
+            .map_err(CheckError::Spawn)?
+            .with_file_name(format!("tj_hook{}", std::env::consts::EXE_SUFFIX));
+        let mut command = Command::new(helper);
+        command
+            .arg("--bounded")
+            .arg(UPDATE_LIFETIME.as_millis().to_string())
+            .arg(&self.receipt)
+            .arg(&attempt)
+            .args(["--", "tj-plugins", "update", "--host", host.name()])
+            .current_dir(cwd)
+            .stdin(Stdio::null())
+            .stdout(log)
+            .stderr(errors);
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            command.creation_flags(0x0800_0000);
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            command.process_group(0);
+        }
+        let child = command.spawn().map_err(|error| {
+            let outcome = bounded::Outcome::Failed(std::io::Error::new(error.kind(), error.to_string()));
+            let _ = outcome.record(&self.receipt, &attempt);
+            CheckError::Spawn(error)
+        })?;
+        let owned = OwnedUpdate { child, state: self.clone(), attempt, finished: false };
+        running.process = tj_cli::process::agent::started_at(owned.child.id())
+            .map_err(CheckError::Record)?
+            .map(|started| (owned.child.id(), started));
+        running.record(&self.running)?;
+        Ok(owned)
+    }
+
+    fn record_exit(&self, attempt: &str) {
+        if let Ok(receipt) = self.settled(attempt)
+            && receipt["code"] != 0
+        {
+            let _ = self.log(&format!(
+                "native updater failed ({}; code {}); process tree settled; ten-minute retry window: {}",
+                receipt["state"], receipt["code"], receipt["error"]
+            ));
+        }
+    }
+
+    /// Exceptions can contain credentials or proxy URLs; record only a safe transport category.
+    fn log_probe_failure(&self, error: &ureq::Error) -> Result<(), CheckError> {
+        let category = match error {
+            ureq::Error::Timeout(_) => "timeout",
+            ureq::Error::HostNotFound => "DNS",
+            ureq::Error::Tls(_) | ureq::Error::Rustls(_) => "TLS",
+            ureq::Error::Io(_) | ureq::Error::ConnectionFailed => "connection",
+            ureq::Error::InvalidProxyUrl | ureq::Error::ConnectProxyFailed(_) => "proxy",
+            _ => "request",
+        };
+        self.log(&format!(
+            "{} GitHub probe unavailable ({category}); delegating verification to the native updater",
+            chrono::Local::now().format("%Y-%m-%d %H:%M:%S")
+        ))
+        .map_err(CheckError::Record)
+    }
+
+    /// A failed mid-session check. An unsettled updater is already logged once, when it is first found.
+    fn log_check_failure(&self, error: CheckError) {
+        if matches!(error, CheckError::Unsettled(_)) {
+            return;
+        }
+        let _ = self.log(&format!(
+            "{} could not check for tj-agents updates: {:#}",
+            chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
+            anyhow::Error::from(error)
+        ));
+    }
+
+    fn check(&self, host: Host, cwd: &Path, url: &str) -> Result<Option<(Option<String>, OwnedUpdate)>, CheckError> {
+        let now = SystemTime::now();
+        let checked = || self.checked.modified().is_some_and(|at| at.is_recent(now, CHECKED_FOR));
+        if checked() {
+            return Ok(None);
+        }
+        let _ = fs::create_dir_all(&self.folder);
+        let Some(_lock) = Lock::take(&self.lock, now) else { return Ok(None) };
+        if checked() || !self.available()? {
+            return Ok(None);
+        }
+        self.checked.stamp();
+        let answer = match request(url, self.publication.commit().as_ref()) {
+            Ok(answer) => answer,
+            Err(CheckError::Request(error)) => {
+                // The native updater already handles unknown freshness through its configured credentials
+                // and native marketplace refresh. A failed fast probe must not prevent that recovery.
+                if self.started.modified().is_some_and(|at| at.is_recent(now, RETRY_AFTER)) {
+                    return Ok(None);
+                }
+                self.log_probe_failure(&error)?;
+                let child = self.spawn(host, cwd)?;
+                // Empty means an unverified attempt, not a requested or successfully installed SHA.
+                self.started.stamp();
+                return Ok(Some((None, child)));
+            }
+            Err(error) => return Err(error),
+        };
+        let previous = fs::read_to_string(&self.started).unwrap_or_default();
+        let started = self.started.modified().map(|at| (previous.trim(), at));
+        let Some(commit) = answer.install(started, now) else { return Ok(None) };
+        let child = self.spawn(host, cwd)?;
+        let _ = fs::write(&self.started, commit.as_str());
+        Ok(Some((
+            Some(format!("tj-agents changed upstream; updating {} plugins in the background", host.name())),
+            child,
+        )))
+    }
 }
 
 /// Checks once, off the launch's critical path, whether tj-agents moved past what this host last installed, and
@@ -356,7 +372,7 @@ pub(crate) fn start(host: Host, cwd: &Path, url: String) -> Option<JoinHandle<Re
     let state = State::new(&paths::cache_dir().ok()?, host);
     let cwd = cwd.to_path_buf();
     Some(std::thread::spawn(move || {
-        check(&state, host, &cwd, &url).map(|update| {
+        state.check(host, &cwd, &url).map(|update| {
             update.and_then(|(message, mut child)| {
                 std::thread::spawn(move || {
                     while !child.finished() {
@@ -370,24 +386,9 @@ pub(crate) fn start(host: Host, cwd: &Path, url: String) -> Option<JoinHandle<Re
 }
 
 /// Records a failed mid-session check in the updater log. The agent owns the console then, so nothing is printed.
-/// An unsettled updater is already logged once, when it is first found.
 pub(crate) fn record_failure(host: Host, error: CheckError) {
     if let Ok(cache) = paths::cache_dir() {
-        append_failure(&State::new(&cache, host).log, error);
-    }
-}
-
-fn append_failure(log: &Path, error: CheckError) {
-    if matches!(error, CheckError::Unsettled(_)) {
-        return;
-    }
-    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(log) {
-        let _ = writeln!(
-            file,
-            "{} could not check for tj-agents updates: {:#}",
-            chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
-            anyhow::Error::from(error)
-        );
+        State::new(&cache, host).log_check_failure(error);
     }
 }
 
@@ -410,7 +411,7 @@ impl OwnedUpdate {
             Err(_) => tj_cli::process::agent::started_at(self.child.id()).is_ok_and(|started| started.is_none()),
         };
         if exited {
-            record_exit(&self.state, &self.attempt);
+            self.state.record_exit(&self.attempt);
             self.finished = true;
         }
         exited
@@ -433,7 +434,7 @@ impl Drop for OwnedUpdate {
             while self.child.try_wait().is_ok_and(|status| status.is_none()) && Instant::now() < reap_deadline {
                 std::thread::sleep(Duration::from_millis(50));
             }
-            let _ = unsettled(&self.state, "bounded updater helper did not confirm cleanup after cancellation");
+            let _ = self.state.unsettle("bounded updater helper did not confirm cleanup after cancellation");
         }
     }
 }
@@ -445,17 +446,14 @@ pub(crate) fn start_owned(
 ) -> Option<JoinHandle<Result<Option<OwnedUpdate>, CheckError>>> {
     let state = State::new(&paths::cache_dir().ok()?, host);
     let cwd = cwd.to_path_buf();
-    Some(std::thread::spawn(move || check(&state, host, &cwd, &url).map(|update| update.map(|(_, child)| child))))
+    Some(std::thread::spawn(move || state.check(host, &cwd, &url).map(|update| update.map(|(_, child)| child))))
 }
 
 #[cfg(test)]
 mod tests {
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-    use super::{
-        Answer, CheckError, OwnedUpdate, Running, State, TIMEOUT, append_failure, check, converged, install, recent,
-        record_probe_failure, request,
-    };
+    use super::{Answer, CheckError, Commit, OwnedUpdate, PathExt, Running, State, SystemTimeExt, TIMEOUT, request};
 
     const SHA: &str = "e555013e5e7bab455193e79be12a15e588bdd221";
 
@@ -478,7 +476,7 @@ mod tests {
         drop(OwnedUpdate { child, state: state.clone(), attempt: "cancel-test".into(), finished: false });
         assert!(tj_cli::process::agent::started_at(pid).unwrap().is_none());
         assert!(!state.unsettled.exists());
-        assert!(super::settled(&state, "cancel-test").is_ok());
+        assert!(state.settled("cancel-test").is_ok());
     }
 
     #[test]
@@ -503,7 +501,7 @@ mod tests {
             .unwrap();
         let running = Running::read(&state.running).unwrap().unwrap();
         assert!(running.live().unwrap());
-        assert!(check(&state, crate::host::Host::Claude, root.path(), "invalid://no-request").unwrap().is_none());
+        assert!(state.check(crate::host::Host::Claude, root.path(), "invalid://no-request").unwrap().is_none());
         assert!(!state.checked.exists(), "an active updater must not consume the next check");
         let reused = Running {
             attempt: "reused".into(),
@@ -515,9 +513,9 @@ mod tests {
         assert!(owned.finished());
         assert!(!running.live().unwrap());
         assert!(state.unsettled.exists());
-        assert!(super::available(&state).is_err(), "a dead root alone cannot authorize another writer");
+        assert!(state.available().is_err(), "a dead root alone cannot authorize another writer");
         tj_cli::process::bounded::Outcome::TimedOut.record(&state.receipt, "live-test").unwrap();
-        assert!(super::available(&state).unwrap());
+        assert!(state.available().unwrap());
         assert!(!state.unsettled.exists());
     }
 
@@ -536,10 +534,10 @@ mod tests {
                 std::fs::write(&state.receipt, receipt.to_string()).unwrap();
             }
             let restarted = State::new(root.path(), crate::host::Host::Claude);
-            assert!(super::available(&restarted).is_err());
+            assert!(restarted.available().is_err());
             assert!(restarted.unsettled.exists());
             let diagnostic = std::fs::read(&restarted.log).unwrap();
-            assert!(super::available(&restarted).is_err());
+            assert!(restarted.available().is_err());
             assert_eq!(std::fs::read(&restarted.log).unwrap(), diagnostic, "unchanged failures must not spam the log");
         }
     }
@@ -554,52 +552,47 @@ mod tests {
         std::fs::write(&state.checked, "").unwrap();
         let old = SystemTime::now() - Duration::from_secs(3600);
         std::fs::OpenOptions::new().write(true).open(&state.checked).unwrap().set_modified(old).unwrap();
-        assert!(check(&state, crate::host::Host::Claude, root.path(), "invalid://no-request").unwrap().is_none());
-        assert!(recent(super::modified(&state.checked).unwrap(), SystemTime::now(), super::CHECKED_FOR));
+        assert!(state.check(crate::host::Host::Claude, root.path(), "invalid://no-request").unwrap().is_none());
+        assert!(state.checked.modified().unwrap().is_recent(SystemTime::now(), super::CHECKED_FOR));
     }
 
     #[test]
     fn a_failed_mid_session_check_is_logged_but_a_repeated_unsettled_state_is_not() {
-        let directory = tempfile::tempdir().unwrap();
-        let log = directory.path().join("claude.log");
-        append_failure(&log, CheckError::Status(403));
-        append_failure(&log, CheckError::Unsettled("reason".to_owned()));
-        let logged = std::fs::read_to_string(&log).unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let state = State::new(root.path(), crate::host::Host::Claude);
+        std::fs::create_dir_all(&state.folder).unwrap();
+        state.log_check_failure(CheckError::Status(403));
+        state.log_check_failure(CheckError::Unsettled("reason".to_owned()));
+        let logged = std::fs::read_to_string(&state.log).unwrap();
         assert_eq!(logged.lines().count(), 1, "{logged}");
         assert!(logged.contains("could not check for tj-agents updates: GitHub answered 403"), "{logged}");
     }
 
     #[test]
-    fn the_converged_commit_is_the_published_revision_when_it_is_a_sha() {
-        assert_eq!(converged(&format!("{SHA}\n123.4")), Some(SHA));
-        assert_eq!(converged(r#"{"agent":"abc"}"#), None);
-        assert_eq!(converged(""), None);
-    }
-
-    #[test]
     fn a_change_installs_once_per_retry_window_per_commit() {
         let now = UNIX_EPOCH + Duration::from_secs(10_000);
-        let changed = || Answer::Changed(SHA.to_owned());
-        assert_eq!(install(Answer::Unchanged, None, now), None);
-        assert_eq!(install(changed(), None, now).as_deref(), Some(SHA));
-        assert_eq!(install(changed(), Some((SHA, now - Duration::from_secs(599))), now), None);
-        assert_eq!(install(changed(), Some((SHA, now - Duration::from_secs(600))), now).as_deref(), Some(SHA));
-        assert_eq!(install(changed(), Some(("other", now)), now).as_deref(), Some(SHA));
+        let changed = || Answer::Changed(Commit::parse(SHA).unwrap());
+        let installed = |answer: Answer, started| answer.install(started, now).map(|commit| commit.as_str().to_owned());
+        assert_eq!(installed(Answer::Unchanged, None), None);
+        assert_eq!(installed(changed(), None).as_deref(), Some(SHA));
+        assert_eq!(installed(changed(), Some((SHA, now - Duration::from_secs(599)))), None);
+        assert_eq!(installed(changed(), Some((SHA, now - Duration::from_secs(600)))).as_deref(), Some(SHA));
+        assert_eq!(installed(changed(), Some(("other", now))).as_deref(), Some(SHA));
     }
 
     #[test]
     fn a_stamp_from_the_future_still_counts_as_recent() {
         let now = UNIX_EPOCH + Duration::from_secs(100);
-        assert!(recent(now - Duration::from_secs(59), now, Duration::from_secs(60)));
-        assert!(!recent(now - Duration::from_secs(60), now, Duration::from_secs(60)));
-        assert!(recent(now + Duration::from_secs(5), now, Duration::from_secs(60)));
+        assert!((now - Duration::from_secs(59)).is_recent(now, Duration::from_secs(60)));
+        assert!(!(now - Duration::from_secs(60)).is_recent(now, Duration::from_secs(60)));
+        assert!((now + Duration::from_secs(5)).is_recent(now, Duration::from_secs(60)));
     }
 
     #[test]
     fn marketplace_checks_become_due_at_two_minutes() {
         let checked = UNIX_EPOCH + Duration::from_secs(100);
-        assert!(recent(checked, checked + Duration::from_secs(119), super::CHECKED_FOR));
-        assert!(!recent(checked, checked + Duration::from_secs(120), super::CHECKED_FOR));
+        assert!(checked.is_recent(checked + Duration::from_secs(119), super::CHECKED_FOR));
+        assert!(!checked.is_recent(checked + Duration::from_secs(120), super::CHECKED_FOR));
     }
 
     #[test]
@@ -607,7 +600,7 @@ mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}/", listener.local_addr().unwrap());
         let started = std::time::Instant::now();
-        let result = request(&url, Some(SHA));
+        let result = request(&url, Some(&Commit::parse(SHA).unwrap()));
         assert!(matches!(result, Err(CheckError::Request(_))), "{result:?}");
         assert!(started.elapsed() < TIMEOUT + Duration::from_millis(500), "{:?}", started.elapsed());
         drop(listener);
@@ -615,11 +608,12 @@ mod tests {
 
     #[test]
     fn probe_diagnostics_do_not_record_credentials_from_transport_errors() {
-        let directory = tempfile::tempdir().unwrap();
-        let log = directory.path().join("update.log");
+        let root = tempfile::tempdir().unwrap();
+        let state = State::new(root.path(), crate::host::Host::Claude);
+        std::fs::create_dir_all(&state.folder).unwrap();
         let error = ureq::Error::ConnectProxyFailed("Authorization: secret-token".to_owned());
-        record_probe_failure(&log, &error).unwrap();
-        let diagnostic = std::fs::read_to_string(log).unwrap();
+        state.log_probe_failure(&error).unwrap();
+        let diagnostic = std::fs::read_to_string(&state.log).unwrap();
         assert!(diagnostic.contains("proxy"));
         assert!(!diagnostic.contains("secret-token"));
         assert!(!diagnostic.contains("Authorization"));

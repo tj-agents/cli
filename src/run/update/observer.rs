@@ -10,7 +10,8 @@ use fs4::FileExt;
 use serde_json::{Value, json};
 use tj_cli::process::{self, agent};
 
-use super::{Watcher, published, refresh, upstream};
+use super::publication::Publication;
+use super::{Watcher, refresh, upstream};
 use crate::app_server::Server;
 use crate::host::Host;
 
@@ -321,7 +322,7 @@ fn foreground(args: &Args) -> Result<ExitCode> {
     cycles(
         &mut server,
         |server| {
-            let watcher = Watcher::new(std::env::current_exe()?, published(Host::Codex)?);
+            let watcher = Watcher::new(std::env::current_exe()?, Publication::of(Host::Codex)?);
             loop {
                 let loaded = refresh::threads(server)?;
                 if loaded.is_empty() {
@@ -374,6 +375,14 @@ pub(crate) fn run(args: Args) -> Result<ExitCode> {
 mod tests {
     use super::*;
 
+    /// Codex's publication record under `directory`, already announcing an old revision.
+    fn announced(directory: &Path) -> (Publication, PathBuf) {
+        let record = directory.join("published").join("codex");
+        fs::create_dir_all(record.parent().unwrap()).unwrap();
+        fs::write(&record, "old-revision").unwrap();
+        (Publication::new(directory, Host::Codex), record)
+    }
+
     fn fake(log: &Path, publication: &Path, scenario: &str) -> Server {
         let python = if cfg!(windows) { "python" } else { "python3" };
         let mut command = crate::app_server::host_command(python).unwrap();
@@ -414,12 +423,11 @@ mod tests {
     fn observer_reloads_changed_publication_and_exits_with_last_thread() {
         let directory = tempfile::tempdir().unwrap();
         let log = directory.path().join("daemon.jsonl");
-        let publication = directory.path().join("published");
-        fs::write(&publication, "old-revision").unwrap();
+        let (watched, publication) = announced(directory.path());
         let socket = directory.path().join("daemon.sock");
         fs::write(&socket, "socket").unwrap();
         let mut server = fake(&log, &publication, "observer");
-        let watcher = Watcher::new(std::env::current_exe().unwrap(), publication.clone());
+        let watcher = Watcher::new(std::env::current_exe().unwrap(), watched);
         observe(
             &mut server,
             Location { cwd: directory.path(), socket: &socket, identity: socket_identity(&socket).unwrap() },
@@ -440,12 +448,11 @@ mod tests {
     fn observer_exits_when_daemon_disconnects() {
         let directory = tempfile::tempdir().unwrap();
         let log = directory.path().join("daemon.jsonl");
-        let publication = directory.path().join("published");
-        fs::write(&publication, "old-revision").unwrap();
+        let (watched, publication) = announced(directory.path());
         let socket = directory.path().join("daemon.sock");
         fs::write(&socket, "socket").unwrap();
         let mut server = fake(&log, &publication, "observer-disconnect");
-        let watcher = Watcher::new(std::env::current_exe().unwrap(), publication.clone());
+        let watcher = Watcher::new(std::env::current_exe().unwrap(), watched);
         assert!(
             observe(
                 &mut server,
@@ -496,9 +503,8 @@ mod tests {
         let socket = directory.path().join("daemon.sock");
         let marker = ready_path(&socket).unwrap();
         let log = directory.path().join("daemon.jsonl");
-        let publication = directory.path().join("published");
+        let (watched, publication) = announced(directory.path());
         fs::write(&socket, "socket").unwrap();
-        fs::write(&publication, "old-revision").unwrap();
         let owner = lock(&socket, true).unwrap().unwrap();
         let pid = std::process::id();
         let identity = socket_identity(&socket).unwrap();
@@ -529,7 +535,7 @@ mod tests {
                         resume_rx.recv_timeout(Duration::from_secs(5)).unwrap();
                         Ok(None)
                     });
-                    let watcher = Watcher::new(std::env::current_exe()?, publication.clone());
+                    let watcher = Watcher::new(std::env::current_exe()?, watched.clone());
                     observe(
                         server,
                         Location {

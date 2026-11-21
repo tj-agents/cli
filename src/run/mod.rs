@@ -506,7 +506,7 @@ fn supervise(args: &Args, launch: Launch, prebound: Option<&PreboundSession>, ad
         .transpose()?;
     let command_cwd = args.command_cwd.as_deref().unwrap_or(&launch.cwd);
     let exe = std::env::current_exe().context("could not locate the tj executable")?;
-    let mut watcher = update::Watcher::new(exe, update::published(launch.host)?);
+    let mut watcher = update::Watcher::new(exe, update::publication::Publication::of(launch.host)?);
     let selected = tj_agents::selected(&launch.cwd);
     let marks = marks(&launch.id)?;
     let _ = std::fs::remove_dir_all(&marks);
