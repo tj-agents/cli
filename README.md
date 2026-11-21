@@ -325,7 +325,14 @@ sweeps interrupted closeout work. It skips live wrappers and cannot replace miss
 override a hold. Resume an incomplete session to finish its work. `tj recover --open` reopens launches
 recorded as open whose native agent is no longer running. Logoff, shutdown or a crash can leave that mark;
 on Windows an ordinary tab close records it closed. On Linux a tab hangup can arrive before the wrapper
-records the close. See [Agent's recovery details](https://github.com/tj-agents/agent#lifecycle).
+records the close. Recovery verifies both native and wrapper liveness and atomically moves the exact
+predecessor's claims when binding the replacement launch. Unknown liveness or a competing recovery
+refuses admission before the provider starts; holds and historical completion records remain intact.
+This requires Agent Store v0.6.1 and the matching Agent launch adapters, installed by `tj install`.
+Public Claude resume also transfers
+the selected conversation's claims: its startup hook must prove that the replacement is the only live
+native process for that conversation and that the previous wrapper has stopped.
+See [Agent's recovery details](https://github.com/tj-agents/agent#lifecycle).
 
 A merged PR never completes a session. Every two minutes the wrapper checks a linked item's PRs and
 records a feed notification when all have merged. The item and sorted PR URLs identify the event durably,
